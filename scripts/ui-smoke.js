@@ -19,6 +19,8 @@ fs.writeFileSync(path.join(project, "fixture.txt"), "workspace fixture\n");
 fs.writeFileSync(path.join(project, "ignored.log"), "ignored\n");
 fs.writeFileSync(path.join(project, ".gitignore"), "*.log\n");
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+const gif = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
+const webp = Buffer.from("UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoCAAIAAgA0JaACdLoB+AADsAD+8Oj3/yC5YXXI1/8gP+MqfGVP+PIAAAA=", "base64");
 const pickedImage = path.join(project, "picked.png");
 fs.writeFileSync(pickedImage, png);
 git(project, "init", "-q", "-b", "ui-smoke");
@@ -34,6 +36,10 @@ const secretSentinel = "UI_SMOKE_SECRET_MUST_NOT_RENDER";
 fs.writeFileSync(path.join(primeDir, "models.json"), JSON.stringify({ providers: { fixture: { baseUrl: "http://127.0.0.1.invalid", apiKey: secretSentinel, models: [{ id: "offline-model" }] } } }));
 const privateDir = path.join(home, ".ssh"); fs.mkdirSync(privateDir);
 const privateFile = path.join(privateDir, "id_rsa"); fs.writeFileSync(privateFile, "PRIVATE_UI_SMOKE_SENTINEL\n");
+const sessionsDir = path.join(primeDir, "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
+const unsafeSession = path.join(sessionsDir, "unsafe-cwd.jsonl");
+const unsafeCwd = fs.realpathSync("/usr");
+fs.writeFileSync(unsafeSession, JSON.stringify({ type: "session", version: 1, id: "unsafe-cwd", cwd: unsafeCwd }) + "\n");
 
 const waitSource = `(predicate, label, timeout = 12000) => new Promise((resolve, reject) => { const started = Date.now(); const tick = () => { let value = false; try { value = predicate(); } catch {} if (value) return resolve(value); if (Date.now() - started > timeout) return reject(new Error('Timed out: ' + label)); setTimeout(tick, 50); }; tick(); })`;
 const evalSource = `(async () => {
@@ -76,6 +82,21 @@ const evalSource = `(async () => {
   await wait(() => inPane('.attachment-strip').querySelectorAll('.attachment-chip.image').length === 0, 'remove image');
   results.remove = true;
 
+  const pasteFormat = async (base64, name, type) => {
+    const formatBytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    const file = new File([formatBytes], name, { type });
+    const formatPaste = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(formatPaste, 'clipboardData', { value: { items: [{ kind: 'file', type, getAsFile: () => file }] } });
+    inPane('.input').dispatchEvent(formatPaste);
+    await wait(() => inPane('.attachment-strip').querySelectorAll('.attachment-chip.image').length === 1, name + ' normalize');
+    const normalized = inPane('.attachment-chip.image').textContent.includes('image/png') && !!inPane('.attachment-chip.image img');
+    inPane('.attachment-chip.image .attachment-remove').click();
+    await wait(() => inPane('.attachment-strip').querySelectorAll('.attachment-chip.image').length === 0, name + ' remove');
+    return normalized;
+  };
+  results.gifPaste = await pasteFormat('${gif.toString("base64")}', 'fixture.gif', 'image/gif');
+  results.webpPaste = await pasteFormat('${webp.toString("base64")}', 'fixture.webp', 'image/webp');
+
   key('a', { metaKey: true, shiftKey: true });
   await wait(() => inPane('.attachment-strip').querySelectorAll('.attachment-chip.image').length === 1, 'Cmd+Shift+A picker');
   results.cmdShiftA = true;
@@ -114,6 +135,22 @@ const evalSource = `(async () => {
   await splitWithSession(firstSession);
   await wait(() => G.panes.length === 2 && G.focused.ready, 'second pane');
   const second = G.focused;
+  first.inputEl.value = '__HOLD__';
+  first.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+  await first.send();
+  await wait(() => first.isStreaming && second.isStreaming, 'same-session event fan-out');
+  await second.stop();
+  await wait(() => !first.isStreaming && !second.isStreaming, 'same-session abort fan-out');
+  results.sameSessionFanoutAbort = first.key === second.key;
+  const hudPrompt = await window.prime.hudPrompt({ key: first.key, text: '__HOLD__' });
+  await wait(() => first.isStreaming && second.isStreaming, 'HUD prompt fan-out');
+  const hudAbort = await window.prime.hudAbort();
+  await wait(() => !first.isStreaming && !second.isStreaming, 'HUD abort fan-out');
+  results.hudSharedClient = hudPrompt.ok === true && hudAbort.ok === true;
+  const automation = await window.prime.automationCommand(second.key, { type: 'list_schedules', includeInactive: true });
+  const genericAutomation = await window.prime.command(second.key, { type: 'list_schedules', includeInactive: true });
+  results.automationRoute = automation.success === true && genericAutomation.success === false;
+
   await openProjectSurface(second);
   await wait(() => [...document.querySelectorAll('#project-choice-list .project-choice')].some((button) => button.textContent.includes('worktree-fixture') || button.textContent.includes('ui-smoke-linked')), 'worktree choice');
   const worktreeChoice = [...document.querySelectorAll('#project-choice-list .project-choice')].find((button) => button.textContent.includes('worktree-fixture') || button.textContent.includes('ui-smoke-linked'));
@@ -126,7 +163,7 @@ const evalSource = `(async () => {
   Object.defineProperty(drop, 'dataTransfer', { value: { files: [synthetic], types: ['Files'], getData: () => '' } });
   second.inputEl.dispatchEvent(drop);
   await wait(() => !second.attachmentError.classList.contains('hidden'), 'invalid synthetic drop rejected');
-  results.dropRejected = second.draftState.items.length === 0;
+  results.syntheticDropRejected = second.draftState.items.length === 0;
 
   const config = await window.prime.readConfig();
   results.redacted = !JSON.stringify(config).includes('${secretSentinel}') && config.modelsJson.providers.fixture.hasApiKey === true;
@@ -135,6 +172,23 @@ const evalSource = `(async () => {
   await new Promise((resolve) => setTimeout(resolve, 150));
   const security = await window.prime.getSecurityEvents();
   results.navigationDenied = security.events.some((event) => event.type === 'window-open-denied') && security.events.some((event) => event.type === 'navigation-denied');
+
+  second.inputEl.value = 'retain on failed activation';
+  const failedActivation = await second.activate('${path.join(base, "missing-session.jsonl")}');
+  const retainedOnFailure = failedActivation === false && second.inputEl.value === 'retain on failed activation';
+  second.inputEl.value = 'clear on successful activation';
+  const unsafeActivation = second.activate('${unsafeSession}');
+  const bindingControlsLocked = second.sendBtn.disabled && second.attachBtn.disabled && !second.inputEl.disabled;
+  const concurrentActivation = await second.activate(firstSession);
+  const unsafeOpened = await unsafeActivation;
+  const clients = await window.prime.listClients();
+  const unsafeClient = clients.find((client) => client.key === second.key);
+  results.savedUnsafeCwdDegrades = unsafeOpened === true && !second.workspace.selected && second.bannerEl.textContent.includes('saved project is unavailable') && unsafeClient && unsafeClient.cwd === '${unsafeCwd}';
+  results.activationTextLifecycle = retainedOnFailure && second.inputEl.value === '';
+  results.concurrentActivationGuard = concurrentActivation === false && bindingControlsLocked;
+  await restartAllAgents();
+  const restartedClients = await window.prime.listClients();
+  results.restartRecovery = G.panes.every((pane) => pane.ready && pane.key && pane.bindingEpoch && restartedClients.some((client) => client.key === pane.key && client.alive));
   results.noRealHome = !document.documentElement.outerHTML.includes('${os.homedir().replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');
   results.sandboxSurface = typeof window.require === 'undefined' && typeof window.process === 'undefined';
   results.controls = !!document.querySelector('.attach-btn') && !!document.querySelector('.pane-folder') && !!document.querySelector('#tree-toggle');
@@ -177,8 +231,10 @@ child.on("exit", (code, signal) => {
     const result = JSON.parse(line.slice("EVAL_RESULT ".length));
     console.log("UI-SMOKE project/worktree + multi-pane: PASS");
     console.log("UI-SMOKE lazy tree + file chip: PASS");
-    console.log("UI-SMOKE paste/picker/reject/attachment-only: PASS");
-    console.log("UI-SMOKE streaming transition guard + drop policy: PASS");
+    console.log("UI-SMOKE PNG/GIF/WebP paste + picker/reject/attachment-only: PASS");
+    console.log("UI-SMOKE streaming guard + same-session/HUD fan-out/abort + automation route: PASS");
+    console.log("UI-SMOKE synthetic pathless drop rejection (real outside-drop policy is unit-tested): PASS");
+    console.log("UI-SMOKE saved unsafe cwd degrade + activation/concurrent/restart lifecycle: PASS");
     console.log("UI-SMOKE navigation/sandbox/redaction: PASS");
     console.log("UI-SMOKE OK", JSON.stringify(result));
   } catch (error) {

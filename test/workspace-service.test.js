@@ -6,8 +6,11 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
+const { EventEmitter } = require("events");
 const {
   WorkspaceService,
+  activateWorkspaceForClient,
+  SESSION_WORKSPACE_WARNING,
   isWithin,
   parseWorktreePorcelain,
   parseIgnoreFile,
@@ -177,12 +180,16 @@ test("home is an intentional no-project boundary", async (t) => {
 });
 
 
-test("filesystem roots, home ancestors, and unreasonably broad directories are rejected", async (t) => {
-  const { base, home } = createRepo(t);
+test("filesystem roots, direct system roots, home ancestors, and broad directories are rejected", async (t) => {
+  const { base, home, repo } = createRepo(t);
   const service = new WorkspaceService({ homeDir: home, statePath: path.join(base, "state.json"), watchFactory: null, maxRootEntries: 100 });
   t.after(() => service.dispose());
   await assert.rejects(service.inspectPath(path.parse(home).root), /filesystem or user root/);
   await assert.rejects(service.inspectPath(path.dirname(home)), /filesystem or user root/);
+  for (const systemRoot of ["/usr", "/Applications", "/private/var"]) {
+    if (fs.existsSync(systemRoot)) await assert.rejects(service.inspectPath(systemRoot), /filesystem or user root/);
+  }
+  assert.equal((await service.inspectPath(repo)).root, fs.realpathSync(repo), "normal project subdirectories remain selectable");
   const privateRoot = path.join(home, ".ssh"); fs.mkdirSync(privateRoot);
   await assert.rejects(service.inspectPath(privateRoot), /private credential directory/);
   const broad = path.join(base, "broad"); fs.mkdirSync(broad);
@@ -225,4 +232,59 @@ test("workspace activation restores the prior state when watcher setup fails", a
   assert.equal(after.workspaceId, before.workspaceId);
   assert.equal(after.cwd, before.cwd);
   assert.equal(after.generation, before.generation);
+});
+
+
+test("saved-session workspace setup degrades rejected and unwatchable cwd to no-project", async (t) => {
+  const { base, home, repo } = createRepo(t);
+  const rejected = new WorkspaceService({ homeDir: home, statePath: path.join(base, "rejected-state.json"), watchFactory: null });
+  t.after(() => rejected.dispose());
+  const rejectedResult = await activateWorkspaceForClient(rejected, path.dirname(home), { degradeOnFailure: true });
+  assert.deepEqual(rejectedResult.workspace, { selected: false, generation: 1 });
+  assert.equal(rejectedResult.warning, SESSION_WORKSPACE_WARNING);
+  await assert.rejects(
+    activateWorkspaceForClient(rejected, path.dirname(home), { degradeOnFailure: false }),
+    /filesystem or user root/,
+    "project-picker activation must remain fatal and transactional",
+  );
+
+  const unwatchable = new WorkspaceService({
+    homeDir: home,
+    statePath: path.join(base, "unwatchable-state.json"),
+    watchFactory: () => { throw new Error("synthetic watcher failure"); },
+  });
+  t.after(() => unwatchable.dispose());
+  const unwatchableResult = await activateWorkspaceForClient(unwatchable, repo, { degradeOnFailure: true });
+  assert.equal(unwatchableResult.workspace.selected, false);
+  assert.equal(unwatchableResult.warning, SESSION_WORKSPACE_WARNING);
+});
+
+
+test("asynchronous watcher errors close once and emit bounded degraded invalidation", async (t) => {
+  const { base, home, repo } = createRepo(t);
+  const watcher = new EventEmitter();
+  let closes = 0;
+  watcher.close = () => { closes += 1; };
+  const invalidations = [];
+  let changed = null;
+  const service = new WorkspaceService({
+    homeDir: home,
+    statePath: path.join(base, "watch-error-state.json"),
+    watchFactory: (...args) => { changed = args.at(-1); return watcher; },
+    onInvalidated: (event) => invalidations.push(event),
+  });
+  t.after(() => service.dispose());
+  const workspace = await service.activatePath(repo);
+  await listRoot(service, workspace);
+  assert.ok(service.directoryCache.size > 0);
+  changed();
+  assert.doesNotThrow(() => watcher.emit("error", new Error("synthetic async watch failure")));
+  assert.equal(closes, 1);
+  assert.equal(service.watcher, null);
+  assert.equal(service.directoryCache.size, 0);
+  assert.deepEqual(invalidations, [{ workspaceId: workspace.workspaceId, generation: workspace.generation, reason: "watcher-error", degraded: true }]);
+  watcher.emit("error", new Error("duplicate"));
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.equal(closes, 1);
+  assert.equal(invalidations.length, 1);
 });

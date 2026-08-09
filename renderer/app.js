@@ -92,6 +92,10 @@ class Pane {
     this.index = index;
     this.key = null;            // client key (sessionFile once mapped)
     this.paneId = null;         // opaque main-issued pane/draft scope
+    this.bindingEpoch = null;    // changes on every main-owned pane binding
+    this.activationRequest = 0;
+    this.bindingChangePending = false;
+    this.composerRevision = 0;
     this.sessionFile = null;
     this.cwd = null;
     this.workspace = { selected: false, generation: 0 };
@@ -121,6 +125,7 @@ class Pane {
     this.attachBtn = $('.attach-btn', this.el);
     this.attachmentStrip = $('.attachment-strip', this.el);
     this.attachmentError = $('.attachment-error', this.el);
+    this.attachmentPending = $('.attachment-pending', this.el);
     this.composerPopover = $('.composer-popover', this.el);
     this.sendBtn = $('.send-btn', this.el);
     this.stopBtn = $('.stop-btn', this.el);
@@ -141,7 +146,7 @@ class Pane {
     this.el.addEventListener('dragover', (e) => this.handlePaneDragOver(e));
     this.el.addEventListener('dragleave', (e) => { if (!this.el.contains(e.relatedTarget)) this.el.classList.remove('drag-target'); });
     this.el.addEventListener('drop', (e) => this.handlePaneDrop(e));
-    this.inputEl.addEventListener('input', () => { this.autoSize(); this.updateComposer(); this.updateSuggestions(); });
+    this.inputEl.addEventListener('input', () => { this.composerRevision += 1; this.autoSize(); this.updateComposer(); this.updateSuggestions(); });
     this.inputEl.addEventListener('paste', (e) => this.handlePaste(e));
     this.inputEl.addEventListener('dragover', (e) => { if (e.dataTransfer && e.dataTransfer.files.length) e.preventDefault(); });
     this.inputEl.addEventListener('drop', (e) => this.handleFileDrop(e));
@@ -173,6 +178,13 @@ class Pane {
     this.attachmentError.classList.toggle('hidden', !message);
   }
 
+  beginAttachmentIngest() {
+    if (this.bindingChangePending || this.draftState.sending) return null;
+    const receipt = this.draftState.beginIngest();
+    this.updateComposer();
+    return receipt;
+  }
+
   async applyIngest(receipt, promise) {
     let response;
     try { response = await promise; }
@@ -185,8 +197,9 @@ class Pane {
   async pickAttachments() {
     if (!this.key || !this.paneId || !this.draftState.id || this.draftState.sending) return;
     this.setAttachmentError(null);
-    const receipt = this.draftState.beginIngest();
-    await this.applyIngest(receipt, prime.pickAttachments(this.key, this.paneId, receipt.draftId));
+    const receipt = this.beginAttachmentIngest();
+    if (!receipt) return;
+    await this.applyIngest(receipt, prime.pickAttachments(this.key, this.paneId, this.bindingEpoch, receipt.draftId));
   }
 
   renderAttachments() {
@@ -202,9 +215,10 @@ class Pane {
         : `<b class="attachment-file-icon">${item.kind === 'image' ? 'IMG' : item.kind === 'session' ? 'CHAT' : item.kind === 'folder' ? 'DIR' : 'DOC'}</b>`;
       chip.innerHTML = `${visual}<span class="attachment-chip-copy"><strong>${esc(item.name)}</strong><small>${esc(item.mimeType || item.kind)} · ${formatBytes(item.size)}${item.external ? ' · External' : ''}</small></span><button class="attachment-remove" aria-label="Remove ${esc(item.name)}" title="Remove attachment">✕</button>`;
       chip.querySelector('.attachment-remove').onclick = async () => {
-        const response = await prime.removeAttachment(this.key, this.paneId, this.draftState.id, item.id);
+        if (this.bindingChangePending || this.draftState.sending) return;
+        const response = await prime.removeAttachment(this.key, this.paneId, this.bindingEpoch, this.draftState.id, item.id);
         if (response.ok && response.draft) {
-          this.draftState.reset(response.draft);
+          this.draftState.applySnapshot(response.draft);
           this.renderAttachments();
           this.inputEl.focus();
         } else this.setAttachmentError(response.error || 'That attachment could not be removed');
@@ -225,10 +239,11 @@ class Pane {
       const file = imageItem.getAsFile();
       if (!file) { this.setAttachmentError('The pasted image could not be read'); continue; }
       if (file.size > 20_000_000) { this.setAttachmentError('Images must be 20 MB or smaller'); continue; }
-      const receipt = this.draftState.beginIngest();
+      const receipt = this.beginAttachmentIngest();
+      if (!receipt) continue;
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
-        await this.applyIngest(receipt, prime.pasteImage(this.key, this.paneId, receipt.draftId, bytes, file.name || 'Pasted image'));
+        await this.applyIngest(receipt, prime.pasteImage(this.key, this.paneId, this.bindingEpoch, receipt.draftId, bytes, file.name || 'Pasted image'));
       } catch {
         this.draftState.applyIngest(receipt, { error: 'The pasted image could not be read' });
         this.renderAttachments();
@@ -242,20 +257,23 @@ class Pane {
     event.preventDefault();
     event.stopPropagation();
     this.setAttachmentError(null);
-    const receipt = this.draftState.beginIngest();
-    await this.applyIngest(receipt, prime.dropAttachments(this.key, this.paneId, receipt.draftId, files));
+    const receipt = this.beginAttachmentIngest();
+    if (!receipt) return;
+    await this.applyIngest(receipt, prime.dropAttachments(this.key, this.paneId, this.bindingEpoch, receipt.draftId, files));
   }
 
   async addTreeAttachment(nodeId) {
     if (!this.draftState.id) return false;
-    const receipt = this.draftState.beginIngest();
-    return this.applyIngest(receipt, prime.addTreeAttachment(this.key, this.paneId, receipt.draftId, nodeId));
+    const receipt = this.beginAttachmentIngest();
+    if (!receipt) return false;
+    return this.applyIngest(receipt, prime.addTreeAttachment(this.key, this.paneId, this.bindingEpoch, receipt.draftId, nodeId));
   }
 
   async addSessionAttachment(session) {
     if (!session || !this.draftState.id) return false;
-    const receipt = this.draftState.beginIngest();
-    return this.applyIngest(receipt, prime.addSessionAttachment(this.key, this.paneId, receipt.draftId, session.path, session.name || session.preview || session.id));
+    const receipt = this.beginAttachmentIngest();
+    if (!receipt) return false;
+    return this.applyIngest(receipt, prime.addSessionAttachment(this.key, this.paneId, this.bindingEpoch, receipt.draftId, session.path, session.name || session.preview || session.id));
   }
 
   handlePaneDragOver(e) {
@@ -306,7 +324,7 @@ class Pane {
       }));
       let files = [];
       if (this.workspace.selected) {
-        const response = await prime.searchWorkspace(this.key, this.paneId, {
+        const response = await prime.searchWorkspace(this.key, this.paneId, this.bindingEpoch, {
           workspaceId: this.workspace.workspaceId,
           generation: this.workspace.generation,
           query,
@@ -378,34 +396,76 @@ class Pane {
   }
 
   // ---------- activation ----------
-  async applyActivation(response, sessionPath) {
+  canChangeBinding(action = 'changing sessions') {
+    if (this.bindingChangePending) {
+      this.setBanner(`Wait for the current project or session change before ${action}.`, true);
+      return false;
+    }
+    if (this.isStreaming) {
+      this.setBanner(`Stop the current response before ${action}.`, true);
+      return false;
+    }
+    if (this.sending || this.draftState.sending) {
+      this.setBanner(`Wait for the current message before ${action}.`, true);
+      return false;
+    }
+    if (this.draftState.pending.size > 0) {
+      this.setBanner(`Wait for attachments to finish before ${action}.`, true);
+      return false;
+    }
+    return true;
+  }
+
+  async applyActivation(response, sessionPath, requestId) {
+    if (requestId !== this.activationRequest) return false;
     this.key = response.key;
     this.paneId = response.paneId;
+    this.bindingEpoch = response.bindingEpoch;
     this.sessionFile = response.sessionFile || sessionPath || null;
     this.workspace = response.workspace || { selected: false, generation: 0 };
     this.cwd = this.workspace.selected ? this.workspace.cwd : null;
     this.draftState.reset(response.draft || null);
     this.renderAttachments();
+    this.setBanner(null);
+    // The new main-owned binding is current now. Clear the prior binding's
+    // composer before async sync/history work so new-session typing is retained.
+    this.inputEl.value = '';
+    this.composerRevision += 1;
+    this.autoSize();
+    this.hideSuggestions();
     await this.syncState();
+    if (requestId !== this.activationRequest || this.bindingEpoch !== response.bindingEpoch) return false;
     const messages = await prime.command(this.key, { type: 'get_messages' });
+    if (requestId !== this.activationRequest || this.bindingEpoch !== response.bindingEpoch) return false;
     if (messages.success) this.renderHistory(messages.data.messages, { dropInFlight: this.isStreaming });
     this.ready = true;
     renderSidebar();
     if (treeVisible && G.focused === this) await renderTreeRoot();
+    if (response.warning) this.setBanner(response.warning, false);
     return true;
   }
 
   async activate(sessionPath) {
-    this.setBanner(null);
-    this.commandCache = null;
-    this.hideSuggestions();
-    const response = await prime.activate({
-      sessionPath: sessionPath || undefined,
-      paneId: this.paneId || undefined,
-      sourceKey: this.key || undefined,
-    });
-    if (!response.ok) { this.setBanner('Could not start session: ' + (response.error || 'unknown'), true); return false; }
-    return this.applyActivation(response, sessionPath);
+    if (!this.canChangeBinding('changing sessions')) return false;
+    this.bindingChangePending = true;
+    this.updateComposer();
+    const requestId = ++this.activationRequest;
+    try {
+      this.setBanner(null);
+      this.commandCache = null;
+      const response = await prime.activate({
+        sessionPath: sessionPath || undefined,
+        paneId: this.paneId || undefined,
+        bindingEpoch: this.bindingEpoch || undefined,
+        sourceKey: this.key || undefined,
+      });
+      if (requestId !== this.activationRequest) return false;
+      if (!response.ok) { this.setBanner('Could not start session: ' + (response.error || 'unknown'), true); return false; }
+      return this.applyActivation(response, sessionPath, requestId);
+    } finally {
+      this.bindingChangePending = false;
+      this.updateComposer();
+    }
   }
 
   async newChat() {
@@ -463,8 +523,12 @@ class Pane {
   updateComposer() {
     this.stopBtn.classList.toggle('hidden', !this.isStreaming);
     const sending = this.sending || this.draftState.sending;
-    this.sendBtn.disabled = sending || (!this.inputEl.value.trim() && this.draftState.items.length === 0) || !this.key;
-    this.attachBtn.disabled = sending || !this.draftState.id;
+    const bindingPending = this.bindingChangePending;
+    const attachmentPending = this.draftState.pending.size > 0;
+    this.sendBtn.disabled = bindingPending || sending || attachmentPending || (!this.inputEl.value.trim() && this.draftState.items.length === 0) || !this.key;
+    this.attachBtn.disabled = bindingPending || sending || !this.draftState.id;
+    for (const button of this.attachmentStrip.querySelectorAll('.attachment-remove')) button.disabled = bindingPending || sending;
+    this.attachmentPending.classList.toggle('hidden', !attachmentPending);
     this.inputEl.placeholder = this.isStreaming
       ? 'Agent is working - type to steer it…'
       : 'Message Prime Agent…  (Enter to send, Shift+Enter for newline)';
@@ -489,28 +553,39 @@ class Pane {
 
   // ---------- sending ----------
   async send() {
-    const text = this.inputEl.value.trim();
-    if (this.sending || this.draftState.sending || (!text && this.draftState.items.length === 0) || !this.key || !this.paneId) return;
+    const inputAtSend = this.inputEl.value;
+    const inputRevisionAtSend = this.composerRevision;
+    const text = inputAtSend.trim();
+    if (this.bindingChangePending || this.sending || this.draftState.sending || this.draftState.pending.size > 0 || (!text && this.draftState.items.length === 0) || !this.key || !this.paneId || !this.bindingEpoch) return;
     const receipt = this.draftState.beginSend();
     if (!receipt) return;
+    const sendBinding = { key: this.key, paneId: this.paneId, bindingEpoch: this.bindingEpoch };
+    const fallbackAttachments = [...this.draftState.items];
     this.sending = true;
     this.hideSuggestions();
     this.setAttachmentError(null);
     this.updateComposer();
     try {
       const behavior = this.isStreaming ? 'steer' : 'prompt';
-      const response = await prime.sendChat(this.key, this.paneId, receipt.draftId, text, behavior).catch(() => ({ ok: false, error: 'The message could not be sent' }));
+      const response = await prime.sendChat(sendBinding.key, sendBinding.paneId, sendBinding.bindingEpoch, receipt.draftId, text, behavior).catch(() => ({ ...sendBinding, ok: false, error: 'The message could not be sent' }));
+      const currentBinding = PrimeDraftState.sameBinding(sendBinding, { key: this.key, paneId: this.paneId, bindingEpoch: this.bindingEpoch })
+        && PrimeDraftState.sameBinding(sendBinding, response);
+      if (!currentBinding) return;
       if (!response.ok || !response.accepted) {
-        this.draftState.rejected(receipt, response.error || 'Prompt rejected');
-        this.setBanner('Prompt rejected: ' + (response.error || 'unknown'), true);
-        this.renderAttachments();
+        if (this.draftState.rejected(receipt, response.error || 'Prompt rejected')) {
+          this.setBanner('Prompt rejected: ' + (response.error || 'unknown'), true);
+          this.renderAttachments();
+        }
         return;
       }
-      const rendered = response.rendered || { text, attachments: [...this.draftState.items] };
+      const rendered = response.rendered || { text, attachments: fallbackAttachments };
+      if (!this.draftState.accepted(receipt, response.draft)) return;
       this.addUserBubble(rendered.text, rendered.attachments || []);
-      this.inputEl.value = '';
-      this.autoSize();
-      this.draftState.accepted(receipt, response.draft);
+      if (this.composerRevision === inputRevisionAtSend && this.inputEl.value === inputAtSend) {
+        this.inputEl.value = '';
+        this.composerRevision += 1;
+        this.autoSize();
+      }
       this.renderAttachments();
       this.setBanner(null);
     } finally {
@@ -882,9 +957,13 @@ async function createPane(index, sessionPath) {
 }
 
 async function closePane(pane) {
-  if (G.panes.length <= 1) return;
+  if (G.panes.length <= 1 || !pane.canChangeBinding('closing this pane')) return;
+  if (pane.key && pane.paneId) {
+    const released = await prime.releasePane(pane.key, pane.paneId, pane.bindingEpoch);
+    if (!released.ok) { pane.setBanner(released.error || 'This pane could not be closed', true); return; }
+  }
   G.panes = G.panes.filter((p) => p !== pane);
-  if (pane.key && pane.paneId) await prime.releasePane(pane.key, pane.paneId);
+  pane.activationRequest += 1;
   pane.el.remove();
   if (!G.panes.some((p) => p.index > 0)) document.body.classList.remove('split');
   setFocusedPane(G.panes[G.panes.length - 1]);
@@ -1130,9 +1209,9 @@ function closeProjectSurface() {
   }
   projectSurfacePane = null;
 }
-async function adoptWorkspaceActivation(pane, response) {
-  if (!response.ok) return false;
-  await pane.applyActivation(response, null);
+async function adoptWorkspaceActivation(pane, response, requestId) {
+  if (!response.ok || requestId !== pane.activationRequest) return false;
+  if (!await pane.applyActivation(response, null, requestId)) return false;
   await refreshSessions();
   setFocusedPane(pane);
   return true;
@@ -1148,15 +1227,19 @@ function renderProjectChoices(pane, choices) {
     button.onclick = async () => {
       if (choice.current) { closeProjectSurface(); return; }
       setProjectError(null);
+      if (!pane.canChangeBinding('changing projects')) { setProjectError(pane.isStreaming ? 'Stop the current response before changing projects' : 'Wait for the current draft before changing projects'); return; }
+      const requestId = ++pane.activationRequest;
+      pane.bindingChangePending = true;
+      pane.updateComposer();
       button.disabled = true;
       try {
-        const response = await prime.activateWorkspace(pane.key, pane.paneId, choice.id);
+        const response = await prime.activateWorkspace(pane.key, pane.paneId, pane.bindingEpoch, choice.id);
         if (!response.ok) { setProjectError(response.error || 'That project could not be opened'); return; }
-        await adoptWorkspaceActivation(pane, response);
+        if (!await adoptWorkspaceActivation(pane, response, requestId)) return;
         closeProjectSurface();
         pane.inputEl.focus();
       } catch { setProjectError('That project could not be opened'); }
-      finally { button.disabled = false; }
+      finally { pane.bindingChangePending = false; pane.updateComposer(); button.disabled = false; }
     };
     host.appendChild(button);
   }
@@ -1166,7 +1249,7 @@ async function openProjectSurface(pane = G.focused) {
   if (!pane || !pane.key || !pane.paneId) return;
   projectSurfacePane = pane;
   setProjectError(null);
-  const response = await prime.getWorkspace(pane.key, pane.paneId).catch(() => ({ ok: false }));
+  const response = await prime.getWorkspace(pane.key, pane.paneId, pane.bindingEpoch).catch(() => ({ ok: false }));
   if (response.ok) {
     pane.workspace = response.workspace || { selected: false, generation: 0 };
     pane.cwd = pane.workspace.selected ? pane.workspace.cwd : null;
@@ -1182,16 +1265,20 @@ async function chooseFolderForProjectSurface() {
   if (!pane) return;
   const button = $('#choose-folder-btn');
   setProjectError(null);
+  if (!pane.canChangeBinding('changing projects')) { setProjectError(pane.isStreaming ? 'Stop the current response before changing projects' : 'Wait for the current draft before changing projects'); return; }
+  const requestId = ++pane.activationRequest;
+  pane.bindingChangePending = true;
+  pane.updateComposer();
   button.disabled = true;
   try {
-    const response = await prime.pickWorkspace(pane.key, pane.paneId);
+    const response = await prime.pickWorkspace(pane.key, pane.paneId, pane.bindingEpoch);
     if (response.canceled) return;
     if (!response.ok) { setProjectError(response.error || 'That project could not be opened'); return; }
-    await adoptWorkspaceActivation(pane, response);
+    if (!await adoptWorkspaceActivation(pane, response, requestId)) return;
     closeProjectSurface();
     pane.inputEl.focus();
   } catch { setProjectError('That project could not be opened'); }
-  finally { button.disabled = false; }
+  finally { pane.bindingChangePending = false; pane.updateComposer(); button.disabled = false; }
 }
 $('#project-surface-close').onclick = closeProjectSurface;
 $('#choose-folder-btn').onclick = chooseFolderForProjectSurface;
@@ -1222,7 +1309,7 @@ async function renderTreeRoot() {
 async function renderTreeLevel(pane, container, nodeId, epoch, cursor = null, append = false) {
   if (!append) container.innerHTML = '<div class="tree-loading"><span></span> Loading…</div>';
   const workspaceSnapshot = pane.workspace;
-  const response = await prime.listWorkspaceDirectory(pane.key, pane.paneId, {
+  const response = await prime.listWorkspaceDirectory(pane.key, pane.paneId, pane.bindingEpoch, {
     workspaceId: workspaceSnapshot.workspaceId,
     generation: workspaceSnapshot.generation,
     nodeId,
@@ -1249,10 +1336,10 @@ async function renderTreeLevel(pane, container, nodeId, epoch, cursor = null, ap
     row.setAttribute('role', 'button');
     row.setAttribute('aria-label', entry.type === 'dir' ? `Toggle folder ${entry.name}` : `Add ${entry.name} to chat`);
     row.innerHTML = `<span class="tree-icon">${entry.type === 'dir' ? '▸' : '·'}</span><span class="tree-name">${esc(entry.name)}</span>${entry.symlink ? '<span class="tree-symlink">↗</span>' : ''}${entry.type === 'file' ? '<button class="tree-preview" title="Preview file" aria-label="Preview ' + esc(entry.name) + '">⌕</button>' : ''}`;
-    row.oncontextmenu = (event) => { event.preventDefault(); prime.showWorkspaceContextMenu(pane.key, pane.paneId, entry.nodeId); };
+    row.oncontextmenu = (event) => { event.preventDefault(); prime.showWorkspaceContextMenu(pane.key, pane.paneId, pane.bindingEpoch, entry.nodeId); };
     row.onkeydown = (event) => {
       if ((event.key === 'Enter' || event.key === ' ') && !event.target.closest('.tree-preview')) { event.preventDefault(); row.click(); }
-      if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); prime.showWorkspaceContextMenu(pane.key, pane.paneId, entry.nodeId); }
+      if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); prime.showWorkspaceContextMenu(pane.key, pane.paneId, pane.bindingEpoch, entry.nodeId); }
     };
     if (entry.type === 'dir') {
       row.onclick = async () => {
@@ -1295,7 +1382,7 @@ async function openWorkspaceFileViewer(pane, nodeId, name) {
   const body = $('#viewer-body');
   body.innerHTML = '<p class="s-help">Loading…</p>';
   $('#viewer-backdrop').classList.remove('hidden');
-  const response = await prime.readWorkspaceFile(pane.key, pane.paneId, nodeId, 200000);
+  const response = await prime.readWorkspaceFile(pane.key, pane.paneId, pane.bindingEpoch, nodeId, 200000);
   if (!response.ok) {
     body.innerHTML = response.binary
       ? '<div class="tree-state"><strong>Preview unavailable</strong><span>This binary file can still be added to chat or revealed from its context menu.</span></div>'
@@ -1810,7 +1897,7 @@ $('#sf-save').onclick = async () => {
 
 $('#tree-close').onclick = () => toggleTree(false);
 $('#tree-refresh').onclick = async () => {
-  if (G.focused && G.focused.key) await prime.refreshWorkspace(G.focused.key, G.focused.paneId);
+  if (G.focused && G.focused.key) await prime.refreshWorkspace(G.focused.key, G.focused.paneId, G.focused.bindingEpoch);
   if (treeVisible) await renderTreeRoot();
 };
 $('#viewer-add-chat').onclick = async () => {
@@ -1889,19 +1976,22 @@ prime.onRpcEvent(({ key, event }) => {
   for (const pane of G.panes.filter((p) => p.key === key)) pane.handleEvent(event);
 });
 prime.onSessionsChanged((list) => refreshSessions(list));
-prime.onWorkspaceInvalidated(({ key }) => {
+prime.onWorkspaceInvalidated(({ key, degraded }) => {
+  if (degraded) {
+    for (const pane of G.panes.filter((candidate) => candidate.key === key)) pane.setBanner('Automatic project watching stopped. Refresh Files manually to see later changes.', false);
+  }
   if (treeVisible && G.focused && G.focused.key === key) void renderTreeRoot();
 });
-prime.onWorkspaceChanged(({ key, paneId, workspace }) => {
-  const pane = G.panes.find((candidate) => candidate.paneId === paneId && candidate.key === key);
+prime.onWorkspaceChanged(({ key, paneId, bindingEpoch, workspace }) => {
+  const pane = G.panes.find((candidate) => candidate.paneId === paneId && candidate.key === key && candidate.bindingEpoch === bindingEpoch);
   if (!pane || !workspace) return;
   pane.workspace = workspace;
   pane.cwd = workspace.selected ? workspace.cwd : null;
   pane.updateTopbar();
 });
-prime.onAttachmentsReset(({ paneId, draft }) => {
-  const pane = G.panes.find((candidate) => candidate.paneId === paneId);
-  if (!pane || !draft) return;
+prime.onAttachmentsReset(({ key, paneId, bindingEpoch, draft }) => {
+  const pane = G.panes.find((candidate) => candidate.paneId === paneId && candidate.key === key && candidate.bindingEpoch === bindingEpoch);
+  if (!pane || !draft || pane.draftState.sending) return;
   pane.draftState.reset(draft);
   pane.renderAttachments();
 });
@@ -1915,9 +2005,6 @@ prime.onRpcExit(({ key, code, error }) => {
 prime.onRpcError(({ key, message }) => {
   const pane = (key && G.panes.find((p) => p.key === key)) || G.focused;
   if (pane) pane.setBanner(message || 'Agent process error.', true);
-});
-prime.onFlushWait(({ key }) => {
-  for (const pane of G.panes.filter((p) => p.key === key)) pane.setAgentState('saving session before switching…');
 });
 prime.onMenuAction(({ id }) => {
   if (id === 'new-chat') G.focused && G.focused.newChat();

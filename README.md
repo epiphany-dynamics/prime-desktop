@@ -11,7 +11,7 @@ The current Hermes-minus-voice contract and honest completion states live in [`P
 - **Concurrent sessions** — two independent panes, drag-to-split, pop-outs, pane focus, and live event fanout when panes/windows view the same session.
 - **Project-aware chats** — per-pane Choose Project, recents, linked Git worktrees/branch identity, Cmd+O, and cwd-pinned process/session activation.
 - **Safe file explorer** — lazy ignored tree, symlink confinement, cached pagination, refresh watching, text preview, Add to chat, copy path, and Finder reveal.
-- **Attachment drafts** — image paste/picker/drop with decode/resize and caps; general-file, folder, and session references; thumbnails/chips/removal; attachment-only turns; retention when a prompt is rejected.
+- **Attachment drafts** — image paste/picker/drop with PNG/JPEG decode, bounded GIF/WebP conversion, resize, and caps; general-file, folder, and session references; atomic pane-scoped mutation; thumbnails/chips/removal; attachment-only turns; retention when a prompt is rejected.
 - **Inline context** — keyboard-navigable `/` command and `@` workspace/session suggestions.
 - **Prime controls** — model/thinking pickers, steering and stop, context/cost, schedules/heartbeats, capabilities, settings, and focused-session HUD.
 - **Hardened boundaries** — sandboxed renderer, narrow sender-validated IPC, bounded DTOs/JSONL, write-only credentials, navigation denial, sensitive-path policy, transactional project changes, and awaited RPC teardown.
@@ -54,7 +54,7 @@ The renderer does not receive arbitrary shell or filesystem APIs. Project/file o
 
 ## Offline verification
 
-`npm run smoke` and `npm run ui-smoke` use `scripts/fake-agent.js`, an isolated temporary HOME, and local fixtures. They require no network or provider credentials. The UI smoke covers project/worktree selection, multi-pane isolation, tree and attachment flows, rejection retention, streaming transition guards, drop policy, credential redaction, sandboxing, and navigation denial.
+`npm run smoke` and `npm run ui-smoke` use `scripts/fake-agent.js`, an isolated temporary HOME, and local fixtures. They require no network or provider credentials. The UI smoke covers project/worktree selection, shared-session pane and HUD fan-out/abort, dedicated automation routing, PNG/GIF/WebP attachment flows, rejection retention, streaming/activation guards, saved-session workspace degradation, synthetic pathless-drop rejection, credential redaction, sandboxing, and navigation policy.
 
 ## Current limitations
 

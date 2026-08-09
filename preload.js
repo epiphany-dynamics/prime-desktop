@@ -13,35 +13,49 @@ function filePaths(files) {
   }).filter(Boolean);
 }
 
+const MAX_PASTE_IMAGE_BYTES = 20_000_000;
+function pasteImage(key, paneId, bindingEpoch, draftId, bytes, name) {
+  const supportedBytes = bytes instanceof ArrayBuffer || ArrayBuffer.isView(bytes);
+  const byteLength = supportedBytes && Number.isSafeInteger(bytes.byteLength) ? bytes.byteLength : -1;
+  if (byteLength < 1 || byteLength > MAX_PASTE_IMAGE_BYTES) {
+    const tooLarge = byteLength > MAX_PASTE_IMAGE_BYTES;
+    return Promise.resolve({ ok: false, code: tooLarge ? 'IMAGE_TOO_LARGE' : 'INVALID_IMAGE', error: tooLarge ? 'Images must be 20 MB or smaller' : 'The pasted image could not be read' });
+  }
+  if (typeof name !== 'string' || !name || name.length > 255 || /[\u0000-\u001f\u007f]/.test(name)) {
+    return Promise.resolve({ ok: false, code: 'INVALID_IMAGE', error: 'The pasted image name is invalid' });
+  }
+  return ipcRenderer.invoke('attachments:paste-image', { key, paneId, bindingEpoch, draftId, bytes, name });
+}
+
 contextBridge.exposeInMainWorld('prime', {
   command: (key, cmd) => ipcRenderer.invoke('rpc:command', { key, cmd }),
   automationCommand: (key, cmd) => ipcRenderer.invoke('automation:command', { key, cmd }),
   activate: (options) => ipcRenderer.invoke('rpc:activate', options || {}),
   listClients: () => ipcRenderer.invoke('rpc:list-clients'),
   touchClient: (key) => ipcRenderer.invoke('rpc:touch-client', { key }),
-  releasePane: (key, paneId) => ipcRenderer.invoke('pane:release', { key, paneId }),
+  releasePane: (key, paneId, bindingEpoch) => ipcRenderer.invoke('pane:release', { key, paneId, bindingEpoch }),
 
   listSessions: () => ipcRenderer.invoke('sessions:list'),
   deleteSession: (sessionPath) => ipcRenderer.invoke('sessions:delete', sessionPath),
   sessionTail: (sessionPath, max) => ipcRenderer.invoke('sessions:tail', { path: sessionPath, max }),
 
-  getWorkspace: (key, paneId) => ipcRenderer.invoke('workspace:get', { key, paneId }),
-  pickWorkspace: (key, paneId) => ipcRenderer.invoke('workspace:pick', { key, paneId }),
-  activateWorkspace: (key, paneId, choiceId) => ipcRenderer.invoke('workspace:activate', { key, paneId, choiceId }),
-  listWorkspaceDirectory: (key, paneId, request) => ipcRenderer.invoke('workspace:list-dir', { key, paneId, request }),
-  searchWorkspace: (key, paneId, request) => ipcRenderer.invoke('workspace:search', { key, paneId, request }),
-  readWorkspaceFile: (key, paneId, nodeId, maxBytes) => ipcRenderer.invoke('workspace:read-file', { key, paneId, nodeId, maxBytes }),
-  refreshWorkspace: (key, paneId) => ipcRenderer.invoke('workspace:refresh', { key, paneId }),
-  showWorkspaceContextMenu: (key, paneId, nodeId) => ipcRenderer.invoke('workspace:context-menu', { key, paneId, nodeId }),
+  getWorkspace: (key, paneId, bindingEpoch) => ipcRenderer.invoke('workspace:get', { key, paneId, bindingEpoch }),
+  pickWorkspace: (key, paneId, bindingEpoch) => ipcRenderer.invoke('workspace:pick', { key, paneId, bindingEpoch }),
+  activateWorkspace: (key, paneId, bindingEpoch, choiceId) => ipcRenderer.invoke('workspace:activate', { key, paneId, bindingEpoch, choiceId }),
+  listWorkspaceDirectory: (key, paneId, bindingEpoch, request) => ipcRenderer.invoke('workspace:list-dir', { key, paneId, bindingEpoch, request }),
+  searchWorkspace: (key, paneId, bindingEpoch, request) => ipcRenderer.invoke('workspace:search', { key, paneId, bindingEpoch, request }),
+  readWorkspaceFile: (key, paneId, bindingEpoch, nodeId, maxBytes) => ipcRenderer.invoke('workspace:read-file', { key, paneId, bindingEpoch, nodeId, maxBytes }),
+  refreshWorkspace: (key, paneId, bindingEpoch) => ipcRenderer.invoke('workspace:refresh', { key, paneId, bindingEpoch }),
+  showWorkspaceContextMenu: (key, paneId, bindingEpoch, nodeId) => ipcRenderer.invoke('workspace:context-menu', { key, paneId, bindingEpoch, nodeId }),
 
-  getAttachments: (key, paneId) => ipcRenderer.invoke('attachments:get', { key, paneId }),
-  pickAttachments: (key, paneId, draftId) => ipcRenderer.invoke('attachments:pick', { key, paneId, draftId }),
-  dropAttachments: (key, paneId, draftId, files) => ipcRenderer.invoke('attachments:drop', { key, paneId, draftId, paths: filePaths(files) }),
-  pasteImage: (key, paneId, draftId, bytes, name) => ipcRenderer.invoke('attachments:paste-image', { key, paneId, draftId, bytes, name }),
-  addTreeAttachment: (key, paneId, draftId, nodeId) => ipcRenderer.invoke('attachments:add-tree-node', { key, paneId, draftId, nodeId }),
-  addSessionAttachment: (key, paneId, draftId, sessionPath, name) => ipcRenderer.invoke('attachments:add-session', { key, paneId, draftId, sessionPath, name }),
-  removeAttachment: (key, paneId, draftId, attachmentId) => ipcRenderer.invoke('attachments:remove', { key, paneId, draftId, attachmentId }),
-  sendChat: (key, paneId, draftId, text, behavior) => ipcRenderer.invoke('chat:send', { key, paneId, draftId, text, behavior }),
+  getAttachments: (key, paneId, bindingEpoch) => ipcRenderer.invoke('attachments:get', { key, paneId, bindingEpoch }),
+  pickAttachments: (key, paneId, bindingEpoch, draftId) => ipcRenderer.invoke('attachments:pick', { key, paneId, bindingEpoch, draftId }),
+  dropAttachments: (key, paneId, bindingEpoch, draftId, files) => ipcRenderer.invoke('attachments:drop', { key, paneId, bindingEpoch, draftId, paths: filePaths(files) }),
+  pasteImage,
+  addTreeAttachment: (key, paneId, bindingEpoch, draftId, nodeId) => ipcRenderer.invoke('attachments:add-tree-node', { key, paneId, bindingEpoch, draftId, nodeId }),
+  addSessionAttachment: (key, paneId, bindingEpoch, draftId, sessionPath, name) => ipcRenderer.invoke('attachments:add-session', { key, paneId, bindingEpoch, draftId, sessionPath, name }),
+  removeAttachment: (key, paneId, bindingEpoch, draftId, attachmentId) => ipcRenderer.invoke('attachments:remove', { key, paneId, bindingEpoch, draftId, attachmentId }),
+  sendChat: (key, paneId, bindingEpoch, draftId, text, behavior) => ipcRenderer.invoke('chat:send', { key, paneId, bindingEpoch, draftId, text, behavior }),
 
   readConfig: () => ipcRenderer.invoke('config:read'),
   writeSettings: (patch) => ipcRenderer.invoke('config:write-settings', patch),
@@ -72,7 +86,6 @@ contextBridge.exposeInMainWorld('prime', {
   onSessionsChanged: (callback) => on('sessions-changed', callback),
   onRpcExit: (callback) => on('rpc-exit', callback),
   onRpcError: (callback) => on('rpc-error', callback),
-  onFlushWait: (callback) => on('rpc-flush-wait', callback),
   onMenuAction: (callback) => on('menu-action', callback),
   onInstallProgress: (callback) => on('agent-install-progress', callback),
   onXaiDeviceCode: (callback) => on('xai-device-code', callback),

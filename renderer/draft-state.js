@@ -5,10 +5,18 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function factory() {
   "use strict";
 
+  function sameBinding(left, right) {
+    return !!left && !!right
+      && typeof left.key === "string" && left.key.length > 0 && left.key === right.key
+      && typeof left.paneId === "string" && left.paneId.length > 0 && left.paneId === right.paneId
+      && typeof left.bindingEpoch === "string" && left.bindingEpoch.length > 0 && left.bindingEpoch === right.bindingEpoch;
+  }
+
   class DraftState {
     constructor() {
       this.id = null;
       this.workspaceGeneration = 0;
+      this.revision = 0;
       this.items = [];
       this.error = null;
       this.pending = new Set();
@@ -18,6 +26,7 @@
     reset(descriptor) {
       this.id = descriptor && descriptor.id || null;
       this.workspaceGeneration = descriptor && descriptor.workspaceGeneration || 0;
+      this.revision = descriptor && Number.isSafeInteger(descriptor.revision) ? descriptor.revision : 0;
       this.items = descriptor && Array.isArray(descriptor.items) ? [...descriptor.items] : [];
       this.error = null;
       this.pending.clear();
@@ -31,12 +40,22 @@
       return { token, draftId: this.id, workspaceGeneration: this.workspaceGeneration };
     }
 
+    applySnapshot(descriptor) {
+      if (!descriptor || descriptor.id !== this.id || descriptor.workspaceGeneration !== this.workspaceGeneration) return false;
+      const nextRevision = Number.isSafeInteger(descriptor.revision) ? descriptor.revision : 0;
+      if (nextRevision < this.revision) return false;
+      this.revision = nextRevision;
+      this.items = [...(descriptor.items || [])];
+      return true;
+    }
+
     applyIngest(receipt, response) {
       if (!receipt || !this.pending.has(receipt.token)) return false;
       this.pending.delete(receipt.token);
       if (receipt.draftId !== this.id || receipt.workspaceGeneration !== this.workspaceGeneration) return false;
-      if (response && response.draft && response.draft.id === this.id) this.items = [...(response.draft.items || [])];
-      else if (response && Array.isArray(response.items)) {
+      if (response && response.draft && response.draft.id === this.id) {
+        this.applySnapshot(response.draft);
+      } else if (response && Array.isArray(response.items)) {
         const existing = new Map(this.items.map((item) => [item.id, item]));
         for (const item of response.items) existing.set(item.id, item);
         this.items = [...existing.values()];
@@ -53,7 +72,7 @@
     }
 
     beginSend() {
-      if (!this.id || this.sending) return null;
+      if (!this.id || this.sending || this.pending.size > 0) return null;
       this.sending = true;
       return { draftId: this.id, workspaceGeneration: this.workspaceGeneration };
     }
@@ -75,6 +94,7 @@
       return {
         id: this.id,
         workspaceGeneration: this.workspaceGeneration,
+        revision: this.revision,
         items: [...this.items],
         error: this.error,
         pending: this.pending.size,
@@ -83,5 +103,5 @@
     }
   }
 
-  return { DraftState };
+  return { DraftState, sameBinding };
 });

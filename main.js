@@ -8,14 +8,17 @@ const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
 const os = require('os');
-const { pathToFileURL } = require('url');
 
 const { primeDaemonLaunchConfig } = require('./daemon-launch');
 const { prepareSessionHandoff } = require('./session-handoff');
 const { RpcManager, canonicalDirectory } = require('./lib/rpc-manager');
-const { WorkspaceService, isWithin } = require('./lib/workspace-service');
-const { AttachmentService, AttachmentError, MAX_DIMENSION, MAX_IMAGE_BASE64, sniffImageMime, parseFileTransport } = require('./lib/attachment-service');
-const { canonicalSessionsRoot, canonicalSessionPath, validateSessionHeader, safeDeleteSession, cleanupTrackedEmptySessions, countSessionMessages } = require('./lib/session-utils');
+const { WorkspaceService, activateWorkspaceForClient, isWithin } = require('./lib/workspace-service');
+const { AttachmentService, AttachmentError, sniffImageMime, parseFileTransport } = require('./lib/attachment-service');
+const { canonicalSessionPath, validateSessionHeader, safeDeleteSession, cleanupTrackedEmptySessions, countSessionMessages } = require('./lib/session-utils');
+const { tryAcquireFlag } = require('./lib/inflight-lock');
+const { classifyNavigation } = require('./lib/navigation-policy');
+const { SessionLifecycleRegistry } = require('./lib/session-lifecycle');
+const { createElectronImageNormalizer } = require('./lib/electron-image-normalizer');
 
 const TEST_MODE = !app.isPackaged && process.env.PRIME_DESKTOP_TEST_MODE === '1';
 const HOME_INPUT = TEST_MODE && process.env.PRIME_DESKTOP_TEST_HOME ? path.resolve(process.env.PRIME_DESKTOP_TEST_HOME) : os.homedir();
@@ -24,7 +27,6 @@ const HOME = fs.realpathSync(HOME_INPUT);
 if (TEST_MODE) app.setPath('userData', path.join(HOME, '.prime-desktop-test-user-data'));
 const SESSIONS_DIR = path.join(HOME, '.prime', 'agent', 'sessions');
 const COMMAND_TIMEOUT_MS = 30000;
-const SWITCH_SESSION_TIMEOUT_MS = 90000;
 const MAX_CLIENTS = 8;
 const MAX_IPC_JSON_BYTES = 2 * 1024 * 1024;
 const WORKSPACE_STATE_PATH = path.join(app.getPath('userData'), 'workspaces.json');
@@ -102,6 +104,7 @@ function resolveAgentInvocation(childEnv) {
 // One hardened RpcManager per live session, routed by opaque pane contexts.
 
 const clients = new Map();
+const sessionLifecycle = new SessionLifecycleRegistry();
 const paneContexts = new Map();
 const createdSessionFiles = new Set();
 const securityEvents = [];
@@ -188,11 +191,19 @@ function createWorkspaceService(client) {
 
 async function disposeClient(client, reason = 'shutdown', remove = true) {
   if (!client) return;
-  if (remove) for (const [key, value] of clients) if (value === client) clients.delete(key);
+  if (client.disposePromise) return client.disposePromise;
   client.committed = false;
   client.alive = false;
   if (client.workspace) client.workspace.dispose();
-  await client.rpc.stop(reason);
+  const sessionKey = client.sessionFile || (typeof client.key === 'string' && !client.key.startsWith('new:') ? client.key : null);
+  const stopping = (async () => {
+    try { await client.rpc.stop(reason); }
+    finally {
+      if (remove) for (const [key, value] of clients) if (value === client) clients.delete(key);
+    }
+  })();
+  client.disposePromise = sessionKey ? sessionLifecycle.trackDisposal(sessionKey, stopping) : stopping;
+  return client.disposePromise;
 }
 
 async function evictIdleClients() {
@@ -227,6 +238,7 @@ async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspa
     alive: true,
     committed: false,
     workspace: null,
+    workspaceWarning: null,
   };
   rpc.on('event', (event) => handleClientMessage(client, event));
   // Never mirror provider stderr into the renderer; it can contain paths or credentials.
@@ -253,8 +265,15 @@ async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspa
     client.streaming = !!(ready.data && ready.data.isStreaming);
     client.workspace = createWorkspaceService(client);
     if (targetCwd !== HOME) {
-      const inspected = inspectedWorkspace || await client.workspace.inspectPath(targetCwd);
-      await client.workspace.activatePath(targetCwd, { inspected, recordRecent: true });
+      const activated = await activateWorkspaceForClient(client.workspace, targetCwd, {
+        inspected: inspectedWorkspace,
+        recordRecent: true,
+        // Saved sessions remain usable even when their historical cwd is too
+        // broad/private/unwatchable for the Files surface. New/project-picker
+        // clients stay transactional and fail instead of silently degrading.
+        degradeOnFailure: !!sessionPath,
+      });
+      client.workspaceWarning = activated.warning;
     } else client.workspace.clear('home-session');
     const collision = clients.get(client.key);
     if (collision && collision !== client && collision.alive) {
@@ -274,13 +293,18 @@ async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspa
 }
 
 async function ensureClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspace = null }) {
-  const existing = sessionPath && getClient(sessionPath);
-  if (existing && existing.alive) {
-    existing.lastUsed = Date.now();
-    return existing;
-  }
-  if (existing) await disposeClient(existing, 'dead client replacement');
-  return spawnClient({ sessionPath, cwd, ownerWin, inspectedWorkspace });
+  const activate = async () => {
+    if (sessionPath) await sessionLifecycle.waitForDisposal(sessionPath);
+    const existing = sessionPath && getClient(sessionPath);
+    if (existing && existing.alive && !existing.disposePromise) {
+      existing.lastUsed = Date.now();
+      return existing;
+    }
+    if (existing) await disposeClient(existing, 'dead client replacement');
+    if (sessionPath) await sessionLifecycle.waitForDisposal(sessionPath);
+    return spawnClient({ sessionPath, cwd, ownerWin, inspectedWorkspace });
+  };
+  return sessionPath ? sessionLifecycle.run(sessionPath, activate) : activate();
 }
 
 function runAgentCliJson(args, timeoutMs = 8_000) {
@@ -318,14 +342,6 @@ async function prepareTargetSession(sessionPath) {
     timeoutMs: 5_000,
   });
 }
-async function waitForSessionPersisted(filePath, timeoutMs = 20_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (countSessionMessages(filePath) > 0) return true;
-    await new Promise((resolve) => setTimeout(resolve, 300));
-  }
-  return false;
-}
 
 function ownerForEvent(event) { return BrowserWindow.fromWebContents(event.sender); }
 function paneContextFor(event, request = {}, options = {}) {
@@ -333,28 +349,32 @@ function paneContextFor(event, request = {}, options = {}) {
   const context = paneContexts.get(request.paneId);
   const owner = ownerForEvent(event);
   if (!context || context.ownerWin !== owner) throw new Error('This pane is no longer available');
-  if (request.key && context.client.key !== request.key) throw new Error('This pane changed sessions; retry the action');
+  if (typeof request.key !== 'string' || !request.key || context.client.key !== request.key) throw new Error('This pane changed sessions; retry the action');
+  if (typeof request.bindingEpoch !== 'string' || !request.bindingEpoch || context.bindingEpoch !== request.bindingEpoch) throw new Error('This pane changed sessions; retry the action');
   return context;
 }
 function bindPane(event, requestedPaneId, client) {
   const ownerWin = ownerForEvent(event);
+  if (!ownerWin || ownerWin.isDestroyed()) throw new Error('This window is no longer available');
+  if (!client || !client.alive || client.disposePromise || !clientIsCurrent(client)) throw new Error('That agent session is no longer available');
   let paneId = typeof requestedPaneId === 'string' && requestedPaneId.length <= 100 ? requestedPaneId : null;
   const previous = paneId && paneContexts.get(paneId);
   if (previous && previous.ownerWin !== ownerWin) throw new Error('This pane is no longer available');
   if (!paneId || !previous) paneId = `pane_${crypto.randomUUID()}`;
-  if (previous) {
-    previous.attachmentService.deleteDraft(previous.draft.id);
-    paneContexts.delete(paneId);
-    refreshClientViewers(previous.client);
-  }
+  // Build the replacement completely before committing over the prior binding.
   const attachmentService = new AttachmentService({
     homeDir: HOME,
     getWorkspace: () => client.workspace.describe(),
     normalizeImage: normalizeImageWithElectron,
   });
   const draft = attachmentService.createDraft();
-  const context = { id: paneId, ownerWin, client, attachmentService, draft };
+  const context = { id: paneId, bindingEpoch: `binding_${crypto.randomUUID()}`, ownerWin, client, attachmentService, draft, sending: false, pendingActions: 0 };
+  if (previous) {
+    previous.attachmentService.deleteDraft(previous.draft.id);
+    paneContexts.delete(paneId);
+  }
   paneContexts.set(paneId, context);
+  if (previous) refreshClientViewers(previous.client);
   refreshClientViewers(client);
   return context;
 }
@@ -363,9 +383,11 @@ function describeActivation(context, state) {
     ok: true,
     key: context.client.key,
     paneId: context.id,
+    bindingEpoch: context.bindingEpoch,
     sessionFile: context.client.sessionFile,
     state,
     workspace: context.client.workspace.describe(),
+    warning: context.client.workspaceWarning ? boundedText(context.client.workspaceWarning, 300) : null,
     draft: context.draft,
   };
 }
@@ -379,6 +401,42 @@ async function stateForClient(client) {
 async function requireIdleClient(client, action) {
   const state = await stateForClient(client);
   if (state.isStreaming) throw new Error(`Stop the current response before ${action}`);
+  return state;
+}
+function assertCurrentPaneContext(context) {
+  if (context && paneContexts.get(context.id) !== context) throw new Error('This pane changed sessions; retry the action');
+  return context;
+}
+async function awaitForPane(context, promise) {
+  const result = await promise;
+  assertCurrentPaneContext(context);
+  return result;
+}
+function reservePaneAction(context) {
+  assertCurrentPaneContext(context);
+  if (context.sending) throw new Error('Wait for the current message before adding attachments');
+  context.pendingActions += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    context.pendingActions = Math.max(0, context.pendingActions - 1);
+  };
+}
+function assertPaneLocallyIdle(context, action) {
+  if (!context) return;
+  assertCurrentPaneContext(context);
+  if (context.sending) throw new Error(`Wait for the current message before ${action}`);
+  if (context.pendingActions > 0 || context.attachmentService.pendingMutationCount(context.draft.id) > 0) throw new Error(`Wait for attachments to finish before ${action}`);
+}
+async function requirePaneProjectIdle(context, action) {
+  if (!context) return null;
+  assertPaneLocallyIdle(context, action);
+  let state = { isStreaming: false };
+  if (context.client.alive && !context.client.disposePromise && clientIsCurrent(context.client)) {
+    state = await requireIdleClient(context.client, action);
+  }
+  assertPaneLocallyIdle(context, action);
   return state;
 }
 function runPaneTransition(task) {
@@ -426,30 +484,51 @@ secureHandle('automation:command', async (_event, request) => {
 
 secureHandle('rpc:activate', async (event, request = {}) => {
   try {
-    assertSmallDto(request, 32 * 1024);
-    const ownerWin = ownerForEvent(event);
-    let sessionPath = null;
-    let targetCwd = HOME;
-    if (request.sessionPath) {
-      const verified = await validateSessionHeader(SESSIONS_DIR, request.sessionPath);
-      sessionPath = verified.sessionPath;
-      targetCwd = verified.header.cwd;
-      if (!clients.has(sessionPath) && !TEST_MODE) {
-        const prepared = await prepareTargetSession(sessionPath);
-        if (!prepared.ok) throw new Error(prepared.error);
+    return await runPaneTransition(async () => {
+      assertSmallDto(request, 32 * 1024);
+      const ownerWin = ownerForEvent(event);
+      const currentContext = request.paneId && paneContexts.get(request.paneId);
+      let priorContext = null;
+      if (currentContext) {
+        priorContext = paneContextFor(event, { paneId: request.paneId, key: request.sourceKey, bindingEpoch: request.bindingEpoch }, { cap: 8 * 1024 });
+      } else if (request.sourceKey != null || request.bindingEpoch != null) {
+        throw new Error('The pane binding changed before this action completed');
       }
-    } else {
-      const sourceContext = request.paneId && paneContexts.get(request.paneId);
-      const sourceClient = sourceContext && sourceContext.ownerWin === ownerWin
-        ? sourceContext.client
-        : getClient(request.sourceKey);
-      if (sourceClient) targetCwd = sourceClient.cwd;
-    }
-    const client = await ensureClient({ sessionPath, cwd: targetCwd, ownerWin });
-    const state = await stateForClient(client);
-    const context = bindPane(event, request.paneId, client);
-    if (ownerWin) lastFocusedMainWin = ownerWin;
-    return describeActivation(context, state);
+      await requirePaneProjectIdle(priorContext, 'changing sessions');
+      let sessionPath = null;
+      let targetCwd = HOME;
+      let client = null;
+      let clientWasExisting = false;
+      let bound = false;
+      try {
+        if (request.sessionPath) {
+          const verified = await validateSessionHeader(SESSIONS_DIR, request.sessionPath);
+          sessionPath = verified.sessionPath;
+          targetCwd = verified.header.cwd;
+          if (!clients.has(sessionPath) && !TEST_MODE) {
+            const prepared = await prepareTargetSession(sessionPath);
+            if (!prepared.ok) throw new Error(prepared.error);
+          }
+        } else {
+          const sourceClient = priorContext ? priorContext.client : getClient(request.sourceKey);
+          if (sourceClient) targetCwd = sourceClient.cwd;
+        }
+        const existingBefore = new Set(clients.values());
+        client = await ensureClient({ sessionPath, cwd: targetCwd, ownerWin });
+        clientWasExisting = existingBefore.has(client);
+        const state = await stateForClient(client);
+        await requirePaneProjectIdle(priorContext, 'changing sessions');
+        const context = bindPane(event, request.paneId, client);
+        bound = true;
+        if (ownerWin) lastFocusedMainWin = ownerWin;
+        return describeActivation(context, state);
+      } catch (error) {
+        if (client && !bound && !clientWasExisting && ![...paneContexts.values()].some((context) => context.client === client)) {
+          await disposeClient(client, 'failed session activation rollback').catch(() => {});
+        }
+        throw error;
+      }
+    });
   } catch (error) { return publicError(error, 'The session could not be opened'); }
 });
 
@@ -469,12 +548,15 @@ secureHandle('rpc:touch-client', (event, request) => {
 });
 secureHandle('pane:release', async (event, request) => {
   try {
-    const context = paneContextFor(event, request, { cap: 8 * 1024 });
-    context.attachmentService.deleteDraft(context.draft.id);
-    paneContexts.delete(context.id);
-    refreshClientViewers(context.client);
-    await evictIdleClients();
-    return { ok: true };
+    return await runPaneTransition(async () => {
+      const context = paneContextFor(event, request, { cap: 8 * 1024 });
+      assertPaneLocallyIdle(context, 'closing this pane');
+      context.attachmentService.deleteDraft(context.draft.id);
+      paneContexts.delete(context.id);
+      refreshClientViewers(context.client);
+      await evictIdleClients();
+      return { ok: true };
+    });
   } catch (error) { return publicError(error); }
 });
 
@@ -835,46 +917,17 @@ secureHandle('prefs:write', (_event, patch) => {
 
 // ---------- Pane workspaces, safe tree, and attachment registry ----------
 
-function resizeWithin(width, height, maxDimension) {
-  const scale = Math.min(1, maxDimension / Math.max(width, height));
-  return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) };
-}
-async function normalizeImageWithElectron({ buffer, mimeType, maxDimension = MAX_DIMENSION, maxBase64 = MAX_IMAGE_BASE64 }) {
-  const image = nativeImage.createFromBuffer(buffer);
-  if (image.isEmpty()) throw new AttachmentError('IMAGE_DECODE', 'That image could not be decoded safely');
-  const sourceSize = image.getSize();
-  if (!sourceSize.width || !sourceSize.height || sourceSize.width * sourceSize.height > 36_000_000) {
-    throw new AttachmentError('IMAGE_DIMENSIONS', 'That image is too large to decode safely (36 megapixels maximum)');
-  }
-  const target = resizeWithin(sourceSize.width, sourceSize.height, maxDimension);
-  let normalizedImage = target.width === sourceSize.width && target.height === sourceSize.height
-    ? image
-    : image.resize({ width: target.width, height: target.height, quality: 'best' });
-  let output = buffer;
-  let outputMime = mimeType;
-  if (target.width !== sourceSize.width || target.height !== sourceSize.height || buffer.toString('base64').length >= maxBase64 || mimeType === 'image/gif') {
-    output = mimeType === 'image/png' ? normalizedImage.toPNG() : normalizedImage.toJPEG(90);
-    outputMime = mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
-  }
-  let quality = 88;
-  for (let round = 0; output.toString('base64').length >= maxBase64 && round < 12; round += 1) {
-    const size = normalizedImage.getSize();
-    if (round >= 4) normalizedImage = normalizedImage.resize({ width: Math.max(1, Math.round(size.width * 0.86)), height: Math.max(1, Math.round(size.height * 0.86)), quality: 'best' });
-    output = normalizedImage.toJPEG(Math.max(45, quality));
-    outputMime = 'image/jpeg';
-    quality -= 7;
-  }
-  if (!output.length || output.toString('base64').length >= maxBase64 || !sniffImageMime(output)) {
-    throw new AttachmentError('IMAGE_NORMALIZE_LIMIT', 'That image remains too large after resizing');
-  }
-  const size = normalizedImage.getSize();
-  const previewSize = resizeWithin(size.width, size.height, 180);
-  const preview = normalizedImage.resize({ ...previewSize, quality: 'good' }).toPNG();
-  return { buffer: output, mimeType: outputMime, width: size.width, height: size.height, previewBuffer: preview, previewMimeType: 'image/png' };
-}
+const normalizeImageWithElectron = createElectronImageNormalizer({ nativeImage, AttachmentError, sniffImageMime });
 
 function requireCurrentDraft(context, draftId) {
   if (!context || !context.draft || context.draft.id !== draftId) throw new AttachmentError('STALE_DRAFT', 'This attachment draft is no longer available');
+}
+function bindingMeta(context, fallback = null) {
+  if (context) return { key: context.client.key, paneId: context.id, bindingEpoch: context.bindingEpoch };
+  if (fallback && typeof fallback.key === 'string' && typeof fallback.paneId === 'string' && typeof fallback.bindingEpoch === 'string') {
+    return { key: fallback.key, paneId: fallback.paneId, bindingEpoch: fallback.bindingEpoch };
+  }
+  return {};
 }
 function updateContextDraft(context) {
   context.draft = context.attachmentService.describeDraft(context.draft.id);
@@ -883,22 +936,26 @@ function updateContextDraft(context) {
 function rotateContextDraft(context) {
   if (context.draft && context.draft.id) context.attachmentService.deleteDraft(context.draft.id);
   context.draft = context.attachmentService.createDraft();
-  sendToWindow(context.ownerWin, 'attachments-reset', { paneId: context.id, draft: context.draft });
+  sendToWindow(context.ownerWin, 'attachments-reset', { key: context.client.key, paneId: context.id, bindingEpoch: context.bindingEpoch, draft: context.draft });
   return context.draft;
 }
 
 async function activateProjectForPane(event, context, inspected) {
   let client = null;
+  let bound = false;
+  const existingBefore = new Set(clients.values());
   try {
     client = await spawnClient({ cwd: inspected.root, ownerWin: context.ownerWin, inspectedWorkspace: inspected });
     const state = await stateForClient(client);
+    await requirePaneProjectIdle(context, 'changing projects');
     const replacement = bindPane(event, context.id, client);
-    sendToWindow(replacement.ownerWin, 'workspace-changed', { key: client.key, paneId: replacement.id, workspace: client.workspace.describe() });
+    bound = true;
+    sendToWindow(replacement.ownerWin, 'workspace-changed', { key: client.key, paneId: replacement.id, bindingEpoch: replacement.bindingEpoch, workspace: client.workspace.describe() });
     return describeActivation(replacement, state);
   } catch (error) {
     // Rollback is simple and complete: bindPane commits only after both the RPC
     // client and workspace watcher are ready, so the prior pane/context remains.
-    if (client && (!paneContexts.get(context.id) || paneContexts.get(context.id).client !== client)) {
+    if (client && !bound && !existingBefore.has(client) && ![...paneContexts.values()].some((candidate) => candidate.client === client)) {
       await disposeClient(client, 'failed workspace activation rollback').catch(() => {});
     }
     throw error;
@@ -908,14 +965,14 @@ async function activateProjectForPane(event, context, inspected) {
 secureHandle('workspace:get', async (event, request) => {
   try {
     const context = paneContextFor(event, request, { cap: 16 * 1024 });
-    return { ok: true, workspace: context.client.workspace.describe(), choices: await context.client.workspace.choicesForRenderer() };
+    return { ok: true, workspace: context.client.workspace.describe(), choices: await awaitForPane(context, context.client.workspace.choicesForRenderer()) };
   } catch (error) { return publicError(error, 'Project details are unavailable'); }
 });
 secureHandle('workspace:pick', async (event, request) => {
   try {
     const context = paneContextFor(event, request, { cap: 16 * 1024 });
     return await runPaneTransition(async () => {
-      await requireIdleClient(context.client, 'changing projects');
+      await requirePaneProjectIdle(context, 'changing projects');
       let selected;
       if (TEST_MODE && process.env.PRIME_DESKTOP_TEST_PROJECT) selected = path.resolve(process.env.PRIME_DESKTOP_TEST_PROJECT);
       else {
@@ -926,7 +983,7 @@ secureHandle('workspace:pick', async (event, request) => {
       const choice = await context.client.workspace.issuePickerChoice(selected);
       const inspected = await context.client.workspace.resolveChoice(choice.id);
       // A response may have started while the native picker was open.
-      await requireIdleClient(context.client, 'changing projects');
+      await requirePaneProjectIdle(context, 'changing projects');
       return await activateProjectForPane(event, context, inspected);
     });
   } catch (error) { return publicError(error, 'That project could not be opened'); }
@@ -935,7 +992,7 @@ secureHandle('workspace:activate', async (event, request) => {
   try {
     const context = paneContextFor(event, request, { cap: 16 * 1024 });
     return await runPaneTransition(async () => {
-      await requireIdleClient(context.client, 'changing projects');
+      await requirePaneProjectIdle(context, 'changing projects');
       const inspected = await context.client.workspace.resolveChoice(request.choiceId);
       return await activateProjectForPane(event, context, inspected);
     });
@@ -944,19 +1001,19 @@ secureHandle('workspace:activate', async (event, request) => {
 secureHandle('workspace:list-dir', async (event, request) => {
   try {
     const context = paneContextFor(event, request, { cap: 32 * 1024 });
-    return await context.client.workspace.listDirectory(request.request || {});
+    return await awaitForPane(context, context.client.workspace.listDirectory(request.request || {}));
   } catch (error) { return publicError(error, 'That folder could not be read'); }
 });
 secureHandle('workspace:search', async (event, request) => {
   try {
     const context = paneContextFor(event, request, { cap: 32 * 1024 });
-    return await context.client.workspace.search(request.request || {});
+    return await awaitForPane(context, context.client.workspace.search(request.request || {}));
   } catch (error) { return { ...publicError(error, 'Project files could not be searched'), entries: [] }; }
 });
 secureHandle('workspace:read-file', async (event, request) => {
   try {
     const context = paneContextFor(event, request, { cap: 16 * 1024 });
-    return await context.client.workspace.readFile(request.nodeId, request.maxBytes);
+    return await awaitForPane(context, context.client.workspace.readFile(request.nodeId, request.maxBytes));
   } catch (error) { return publicError(error, 'That file could not be read'); }
 });
 secureHandle('workspace:refresh', (event, request) => {
@@ -966,7 +1023,7 @@ secureHandle('workspace:refresh', (event, request) => {
 secureHandle('workspace:context-menu', async (event, request) => {
   try {
     const context = paneContextFor(event, request, { cap: 16 * 1024 });
-    const paths = await context.client.workspace.contextPaths(request.nodeId);
+    const paths = await awaitForPane(context, context.client.workspace.contextPaths(request.nodeId));
     const menu = Menu.buildFromTemplate([
       { label: 'Copy Relative Path', click: () => clipboard.writeText(paths.relative) },
       { label: 'Copy Absolute Path', click: () => clipboard.writeText(paths.absolute) },
@@ -984,9 +1041,11 @@ secureHandle('attachments:get', (event, request) => {
 });
 secureHandle('attachments:pick', async (event, request) => {
   let context = null;
+  let releaseAction = null;
   try {
     context = paneContextFor(event, request, { cap: 16 * 1024 });
     requireCurrentDraft(context, request.draftId);
+    releaseAction = reservePaneAction(context);
     let paths;
     if (TEST_MODE && process.env.PRIME_DESKTOP_TEST_ATTACH_PATHS) paths = JSON.parse(process.env.PRIME_DESKTOP_TEST_ATTACH_PATHS);
     else {
@@ -994,9 +1053,13 @@ secureHandle('attachments:pick', async (event, request) => {
       if (result.canceled) return { ok: true, canceled: true, draft: context.draft };
       paths = result.filePaths;
     }
+    assertCurrentPaneContext(context);
+    requireCurrentDraft(context, request.draftId);
     const result = await context.attachmentService.ingestPaths({ draftId: request.draftId, paths, source: 'picker' });
+    assertCurrentPaneContext(context);
     return { ok: true, ...result, draft: updateContextDraft(context) };
   } catch (error) { return { ...publicError(error, 'A selected file could not be attached'), draft: context && context.draft }; }
+  finally { if (releaseAction) releaseAction(); }
 });
 secureHandle('attachments:drop', async (event, request) => {
   let context = null;
@@ -1005,6 +1068,7 @@ secureHandle('attachments:drop', async (event, request) => {
     requireCurrentDraft(context, request.draftId);
     if (!Array.isArray(request.paths) || request.paths.some((value) => typeof value !== 'string')) throw new AttachmentError('INVALID_SELECTION', 'That dropped file selection is invalid');
     const result = await context.attachmentService.ingestPaths({ draftId: request.draftId, paths: request.paths, source: 'drop' });
+    assertCurrentPaneContext(context);
     return { ok: true, ...result, draft: updateContextDraft(context) };
   } catch (error) { return { ...publicError(error, 'A dropped file could not be attached'), draft: context && context.draft }; }
 });
@@ -1012,7 +1076,7 @@ secureHandle('attachments:paste-image', async (event, request) => {
   let context = null;
   try {
     if (!request || typeof request.paneId !== 'string' || typeof request.draftId !== 'string' || typeof request.name !== 'string') throw new AttachmentError('INVALID_IMAGE', 'The pasted image could not be read');
-    context = paneContextFor(event, { paneId: request.paneId, key: request.key }, { cap: 16 * 1024 });
+    context = paneContextFor(event, { paneId: request.paneId, key: request.key, bindingEpoch: request.bindingEpoch }, { cap: 16 * 1024 });
     requireCurrentDraft(context, request.draftId);
     const raw = request.bytes;
     const length = raw && typeof raw.byteLength === 'number' ? raw.byteLength : -1;
@@ -1020,18 +1084,21 @@ secureHandle('attachments:paste-image', async (event, request) => {
     if (length > 20_000_000) throw new AttachmentError('IMAGE_TOO_LARGE', 'Images must be 20 MB or smaller');
     const bytes = Buffer.from(raw.buffer || raw, raw.byteOffset || 0, length);
     const result = await context.attachmentService.ingestClipboardImage({ draftId: request.draftId, bytes, name: request.name });
+    assertCurrentPaneContext(context);
     return { ok: true, item: result.item, duplicate: result.duplicate, draft: updateContextDraft(context) };
   } catch (error) { return { ...publicError(error, 'The pasted image could not be attached'), draft: context && context.draft }; }
 });
 secureHandle('attachments:add-tree-node', async (event, request) => {
   let context = null;
+  let releaseAction = null;
   try {
     context = paneContextFor(event, request, { cap: 16 * 1024 });
     requireCurrentDraft(context, request.draftId);
+    releaseAction = reservePaneAction(context);
     const node = await context.client.workspace.contextPaths(request.nodeId);
     let result;
     if (node.isDirectory) {
-      result = context.attachmentService.ingestReference({
+      result = await context.attachmentService.ingestReference({
         draftId: request.draftId,
         kind: 'folder',
         name: path.basename(node.relative) || context.client.workspace.describe().name,
@@ -1043,14 +1110,18 @@ secureHandle('attachments:add-tree-node', async (event, request) => {
       const file = await context.client.workspace.attachmentPath(request.nodeId);
       result = await context.attachmentService.ingestPaths({ draftId: request.draftId, paths: [file.path], source: 'tree' });
     }
+    assertCurrentPaneContext(context);
     return { ok: true, ...result, draft: updateContextDraft(context) };
   } catch (error) { return { ...publicError(error, 'That project entry could not be attached'), draft: context && context.draft }; }
+  finally { if (releaseAction) releaseAction(); }
 });
 secureHandle('attachments:add-session', async (event, request) => {
   let context = null;
+  let releaseAction = null;
   try {
     context = paneContextFor(event, request, { cap: 16 * 1024 });
     requireCurrentDraft(context, request.draftId);
+    releaseAction = reservePaneAction(context);
     const sessionPath = await canonicalSessionPath(SESSIONS_DIR, request.sessionPath);
     const lines = (await fsp.readFile(sessionPath, 'utf8')).split('\n');
     const transcript = [];
@@ -1065,43 +1136,50 @@ secureHandle('attachments:add-session', async (event, request) => {
       } catch {}
       if (transcript.length >= 30) break;
     }
-    const result = context.attachmentService.ingestReference({
+    const result = await context.attachmentService.ingestReference({
       draftId: request.draftId,
       kind: 'session',
       name: boundedText(request.name || path.basename(sessionPath), 255),
       dedupeKey: `session:${sessionPath}`,
       text: `<referenced_session>\n${transcript.join('\n')}\n</referenced_session>`,
     });
+    assertCurrentPaneContext(context);
     return { ok: true, items: result.duplicate ? [] : [result.item], duplicates: result.duplicate ? 1 : 0, errors: [], draft: updateContextDraft(context) };
   } catch (error) { return { ...publicError(error, 'That session could not be attached'), draft: context && context.draft }; }
+  finally { if (releaseAction) releaseAction(); }
 });
 secureHandle('attachments:remove', async (event, request) => {
   let context = null;
   try {
     context = paneContextFor(event, request, { cap: 16 * 1024 });
     requireCurrentDraft(context, request.draftId);
-    context.draft = context.attachmentService.remove({ draftId: request.draftId, attachmentId: request.attachmentId });
+    await context.attachmentService.remove({ draftId: request.draftId, attachmentId: request.attachmentId });
+    assertCurrentPaneContext(context);
+    context.draft = updateContextDraft(context);
     return { ok: true, draft: context.draft };
   } catch (error) { return { ...publicError(error, 'That attachment could not be removed'), draft: context && context.draft }; }
 });
 secureHandle('chat:send', async (event, request) => {
   let context = null;
+  let releaseSend = null;
   try {
     context = paneContextFor(event, request, { cap: 256 * 1024 });
     requireCurrentDraft(context, request.draftId);
-    if (context.sending) throw new Error('A message is already being sent from this pane');
-    context.sending = true;
+    if (context.pendingActions > 0) throw new AttachmentError('ATTACHMENTS_PENDING', 'Wait for attachments to finish before sending');
+    releaseSend = tryAcquireFlag(context, 'sending');
+    if (!releaseSend) throw new Error('A message is already being sent from this pane');
     const behavior = request.behavior === 'steer' ? 'steer' : request.behavior === 'followUp' ? 'followUp' : 'prompt';
     const sent = await context.attachmentService.sendDraft(
       { draftId: request.draftId, text: request.text || '', behavior },
       (command) => clientCommand(context.client, command),
     );
-    if (!sent.accepted) return { ok: false, accepted: false, error: boundedText(sent.error, 500), draft: context.draft };
+    assertCurrentPaneContext(context);
+    if (!sent.accepted) return { ...bindingMeta(context), ok: false, accepted: false, error: boundedText(sent.error, 500), draft: context.draft };
     const rendered = { text: sent.serialized.visibleText, attachments: sent.serialized.attachments };
     const draft = rotateContextDraft(context);
-    return { ok: true, accepted: true, response: sent.response, rendered, draft };
-  } catch (error) { return { ...publicError(error, 'The message could not be sent'), accepted: false, draft: context && context.draft }; }
-  finally { if (context) context.sending = false; }
+    return { ...bindingMeta(context), ok: true, accepted: true, response: sent.response, rendered, draft };
+  } catch (error) { return { ...bindingMeta(context, request), ...publicError(error, 'The message could not be sent'), accepted: false, draft: context && context.draft }; }
+  finally { if (releaseSend) releaseSend(); }
 });
 secureHandle('security:get-events', () => ({ events: TEST_MODE ? [...securityEvents] : [] }));
 
@@ -1182,23 +1260,20 @@ let hudClient = null;
 let lastFocusedMainWin = null;
 const HUD_WIDTH = 620, HUD_HEIGHT = 480;
 function installNavigationPolicy(window, localFile) {
-  const allowed = pathToFileURL(localFile);
-  const localPath = allowed.pathname;
-  const isLocal = (target) => {
-    try { const parsed = new URL(target); return parsed.protocol === 'file:' && parsed.pathname === localPath; }
-    catch { return false; }
-  };
   const deny = (target, kind) => {
+    const classification = classifyNavigation(target, localFile);
     rememberSecurityEvent(kind, target);
-    if (!TEST_MODE && /^https?:\/\//i.test(String(target || ''))) shell.openExternal(target).catch(() => {});
+    // Frozen policy: never replace the app document; explicit http(s) links are
+    // opened by the OS browser, while every other remote/custom scheme is denied.
+    if (!TEST_MODE && classification.action === 'external') shell.openExternal(classification.url).catch(() => {});
   };
   window.webContents.on('will-navigate', (event, target) => {
-    if (isLocal(target)) return;
+    if (classifyNavigation(target, localFile).action === 'local') return;
     event.preventDefault();
     deny(target, 'navigation-denied');
   });
   window.webContents.on('will-redirect', (event, target) => {
-    if (isLocal(target)) return;
+    if (classifyNavigation(target, localFile).action === 'local') return;
     event.preventDefault();
     deny(target, 'redirect-denied');
   });

@@ -654,6 +654,7 @@ body.split .chat { padding: 18px 16px 10px; }
 .project-empty { padding: 14px; color: var(--text-faint); font-size: 12px; text-align: center; }
 
 .attachment-error { max-width: 860px; margin: 0 auto 7px; padding: 7px 9px; border-radius: 6px; color: #ffaaaa; background: rgba(235,87,87,.09); border: 1px solid rgba(235,87,87,.18); font-size: 11.5px; }
+.attachment-pending { max-width: 860px; margin: 0 auto 7px; color: var(--text-3); font-size: 11.5px; letter-spacing: .01em; }
 #project-choice-error { margin: 8px 10px 0; }
 .attachment-strip { max-width: 860px; margin: 0 auto 8px; display: flex; gap: 7px; flex-wrap: wrap; max-height: 154px; overflow-y: auto; }
 .attachment-chip {

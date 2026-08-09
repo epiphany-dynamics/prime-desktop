@@ -152,3 +152,22 @@ test("restart preserves prior cwd and restores a requested session", async (t) =
   assert.equal(result.cwd, fs.realpathSync(project));
   assert.ok(commands.some((command) => command.type === "switch_session" && command.sessionPath === prior));
 });
+
+
+test("late and unmatched response records are ignored instead of emitted as events", async (t) => {
+  let timedOutCommand = null;
+  const f = fixture({
+    commandTimeoutMs: 15,
+    onCommand(command) { timedOutCommand = command; },
+  });
+  await cleanup(t, f);
+  const events = [];
+  f.manager.on("event", (event) => events.push(event));
+  await f.manager.start(f.root);
+  await assert.rejects(f.manager.command({ type: "get_messages" }), /timed out/);
+  f.processes[0].stdout.write(JSON.stringify({ id: timedOutCommand.id, type: "response", success: true, data: {} }) + "\n");
+  f.processes[0].stdout.write(JSON.stringify({ id: "never-issued", type: "response", success: true, data: {} }) + "\n");
+  f.processes[0].stdout.write(JSON.stringify({ type: "agent_end" }) + "\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [{ type: "agent_end" }]);
+});

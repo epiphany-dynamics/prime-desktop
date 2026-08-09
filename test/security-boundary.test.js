@@ -38,9 +38,32 @@ test("sandbox bridge exposes descriptors, not raw IPC or arbitrary filesystem au
   assert.doesNotMatch(preload, /sendSync|executeJavaScript|readFileSync|writeFileSync|child_process/);
   assert.match(preload, /webUtils\.getPathForFile/);
   assert.match(preload, /paths: filePaths\(files\)/);
+  const pasteGuard = preload.slice(preload.indexOf("const MAX_PASTE_IMAGE_BYTES"), preload.indexOf("contextBridge.exposeInMainWorld"));
+  assert.match(pasteGuard, /MAX_PASTE_IMAGE_BYTES = 20_000_000/);
+  assert.match(pasteGuard, /bytes instanceof ArrayBuffer \|\| ArrayBuffer\.isView\(bytes\)/);
+  assert.match(pasteGuard, /byteLength < 1 \|\| byteLength > MAX_PASTE_IMAGE_BYTES/);
+  assert.match(pasteGuard, /name\.length > 255/);
+  assert.ok(pasteGuard.indexOf("byteLength > MAX_PASTE_IMAGE_BYTES") < pasteGuard.indexOf("ipcRenderer.invoke('attachments:paste-image'"));
   assert.match(html, /Content-Security-Policy/);
   assert.match(html, /connect-src 'none'/);
   assert.match(html, /img-src 'self' data: blob:/);
   assert.match(main, /setWindowOpenHandler/);
   assert.match(main, /will-navigate/);
+});
+
+
+test("pane-scoped authority requires exact binding epochs and serializes lifecycle transitions", () => {
+  const paneGuard = main.slice(main.indexOf("function paneContextFor"), main.indexOf("function bindingMeta"));
+  assert.match(paneGuard, /typeof request\.key !== 'string'/);
+  assert.match(paneGuard, /typeof request\.bindingEpoch !== 'string'/);
+  assert.match(paneGuard, /!request\.bindingEpoch/);
+  assert.match(paneGuard, /context\.bindingEpoch !== request\.bindingEpoch/);
+  const activation = main.slice(main.indexOf("secureHandle('rpc:activate'"), main.indexOf("secureHandle('rpc:list-clients'"));
+  const release = main.slice(main.indexOf("secureHandle('pane:release'"), main.indexOf("\/\/ ---------- Empty-session cleanup"));
+  assert.match(activation, /runPaneTransition/);
+  assert.match(activation, /failed session activation rollback/);
+  assert.match(release, /runPaneTransition/);
+  assert.match(main, /if \(context\.sending\) throw new Error\('Wait for the current message before adding attachments'\)/);
+  assert.match(main, /if \(context\.pendingActions > 0\) throw new AttachmentError\('ATTACHMENTS_PENDING'/);
+  assert.doesNotMatch(preload, /rpc-flush-wait|rpcFlushWait/);
 });
