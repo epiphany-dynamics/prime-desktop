@@ -38,8 +38,10 @@ const privateDir = path.join(home, ".ssh"); fs.mkdirSync(privateDir);
 const privateFile = path.join(privateDir, "id_rsa"); fs.writeFileSync(privateFile, "PRIVATE_UI_SMOKE_SENTINEL\n");
 const sessionsDir = path.join(primeDir, "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
 const unsafeSession = path.join(sessionsDir, "unsafe-cwd.jsonl");
+const deletableSession = path.join(sessionsDir, "inactive-delete.jsonl");
 const unsafeCwd = fs.realpathSync("/usr");
 fs.writeFileSync(unsafeSession, JSON.stringify({ type: "session", version: 1, id: "unsafe-cwd", cwd: unsafeCwd }) + "\n");
+fs.writeFileSync(deletableSession, JSON.stringify({ type: "session", version: 1, id: "inactive-delete", cwd: project }) + "\n");
 
 const waitSource = `(predicate, label, timeout = 12000) => new Promise((resolve, reject) => { const started = Date.now(); const tick = () => { let value = false; try { value = predicate(); } catch {} if (value) return resolve(value); if (Date.now() - started > timeout) return reject(new Error('Timed out: ' + label)); setTimeout(tick, 50); }; tick(); })`;
 const evalSource = `(async () => {
@@ -139,9 +141,28 @@ const evalSource = `(async () => {
   first.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
   await first.send();
   await wait(() => first.isStreaming && second.isStreaming, 'same-session event fan-out');
+  const deleteWhileStreaming = await window.prime.deleteSession(firstSession);
+  const restartWhileStreaming = await restartAllAgents();
+  results.busyLifecycleRejected = deleteWhileStreaming.ok === false && restartWhileStreaming === false && first.isStreaming && second.isStreaming;
   await second.stop();
   await wait(() => !first.isStreaming && !second.isStreaming, 'same-session abort fan-out');
   results.sameSessionFanoutAbort = first.key === second.key;
+
+  const sharedSearch = await window.prime.searchWorkspace(first.key, first.paneId, first.bindingEpoch, {
+    workspaceId: first.workspace.workspaceId, generation: first.workspace.generation, query: 'fixture.txt', limit: 10,
+  });
+  const sharedFile = (sharedSearch.entries || []).find((entry) => entry.name === 'fixture.txt');
+  const pendingAttachment = first.addTreeAttachment(sharedFile.nodeId);
+  const deleteWhileAttaching = await window.prime.deleteSession(firstSession);
+  await pendingAttachment;
+  const deleteWhileShared = await window.prime.deleteSession(firstSession);
+  results.sharedDeleteRejected = deleteWhileAttaching.ok === false && deleteWhileShared.ok === false && first.key === firstSession && second.key === firstSession && first.draftState.items.some((item) => item.name === 'fixture.txt');
+
+  const inactiveDeleted = await window.prime.deleteSession('${deletableSession}');
+  const sessionsAfterDelete = await window.prime.listSessions();
+  const secondKeyBeforeDeletedReopen = second.key;
+  const deletedReopen = await second.activate('${deletableSession}');
+  results.inactiveDeleteLifecycle = inactiveDeleted.ok === true && !sessionsAfterDelete.some((session) => session.path === '${deletableSession}') && deletedReopen === false && second.key === secondKeyBeforeDeletedReopen;
   const hudPrompt = await window.prime.hudPrompt({ key: first.key, text: '__HOLD__' });
   await wait(() => first.isStreaming && second.isStreaming, 'HUD prompt fan-out');
   const hudAbort = await window.prime.hudAbort();
@@ -167,6 +188,12 @@ const evalSource = `(async () => {
 
   const config = await window.prime.readConfig();
   results.redacted = !JSON.stringify(config).includes('${secretSentinel}') && config.modelsJson.providers.fixture.hasApiKey === true;
+  openCustomForm('fixture', config.modelsJson.providers.fixture, false);
+  document.querySelector('#cf-baseurl').value = 'http://127.0.0.1.invalid/edited';
+  document.querySelector('#cf-save').click();
+  await wait(() => document.querySelector('#custom-form').classList.contains('hidden'), 'redacted provider edit');
+  const editedConfig = await window.prime.readConfig();
+  results.providerSecretPreserved = editedConfig.modelsJson.providers.fixture.hasApiKey === true && editedConfig.modelsJson.providers.fixture.baseUrl.endsWith('/edited');
   window.open('https://example.invalid/window-smoke');
   const link = document.createElement('a'); link.href = 'https://example.invalid/navigation-smoke'; link.textContent = 'navigation test'; document.body.appendChild(link); link.click();
   await new Promise((resolve) => setTimeout(resolve, 150));
@@ -186,9 +213,19 @@ const evalSource = `(async () => {
   results.savedUnsafeCwdDegrades = unsafeOpened === true && !second.workspace.selected && second.bannerEl.textContent.includes('saved project is unavailable') && unsafeClient && unsafeClient.cwd === '${unsafeCwd}';
   results.activationTextLifecycle = retainedOnFailure && second.inputEl.value === '';
   results.concurrentActivationGuard = concurrentActivation === false && bindingControlsLocked;
-  await restartAllAgents();
+  first.inputEl.value = 'UNSENT RESTART DRAFT';
+  first.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+  const restartDraftBefore = { id: first.draftState.id, sessionFile: first.sessionFile, items: first.draftState.items.map((item) => item.name) };
+  const restarted = await restartAllAgents();
   const restartedClients = await window.prime.listClients();
-  results.restartRecovery = G.panes.every((pane) => pane.ready && pane.key && pane.bindingEpoch && restartedClients.some((client) => client.key === pane.key && client.alive));
+  results.restartRecovery = restarted === true && G.panes.every((pane) => pane.ready && pane.key && pane.bindingEpoch && restartedClients.some((client) => client.key === pane.key && client.alive));
+  results.restartDraftPreserved = first.sessionFile === restartDraftBefore.sessionFile && first.draftState.id === restartDraftBefore.id && first.inputEl.value === 'UNSENT RESTART DRAFT' && JSON.stringify(first.draftState.items.map((item) => item.name)) === JSON.stringify(restartDraftBefore.items);
+  const crashDraftBefore = { id: first.draftState.id, epoch: first.bindingEpoch, text: first.inputEl.value, items: first.draftState.items.map((item) => item.name) };
+  await window.prime.command(first.key, { type: 'get_state', testCrash: true });
+  await wait(() => first.bannerEl.textContent.includes('Click to restart'), 'synthetic crash banner');
+  first.bannerEl.click();
+  await wait(() => first.ready && first.bindingEpoch !== crashDraftBefore.epoch, 'synthetic crash recovery');
+  results.crashDraftPreserved = first.draftState.id === crashDraftBefore.id && first.inputEl.value === crashDraftBefore.text && JSON.stringify(first.draftState.items.map((item) => item.name)) === JSON.stringify(crashDraftBefore.items);
   results.noRealHome = !document.documentElement.outerHTML.includes('${os.homedir().replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');
   results.sandboxSurface = typeof window.require === 'undefined' && typeof window.process === 'undefined';
   results.controls = !!document.querySelector('.attach-btn') && !!document.querySelector('.pane-folder') && !!document.querySelector('#tree-toggle');
@@ -229,12 +266,16 @@ child.on("exit", (code, signal) => {
     const line = stdout.split(/\r?\n/).find((entry) => entry.startsWith("EVAL_RESULT "));
     if (code !== 0 || !line) throw new Error(`Electron UI smoke failed (code ${code}, signal ${signal || "none"})${stderr ? `: ${stderr.slice(-2000)}` : ""}`);
     const result = JSON.parse(line.slice("EVAL_RESULT ".length));
+    const storedProvider = JSON.parse(fs.readFileSync(path.join(primeDir, "models.json"), "utf8")).providers.fixture;
+    if (storedProvider.apiKey !== secretSentinel) throw new Error("Redacted provider edit did not preserve the exact stored key");
     console.log("UI-SMOKE project/worktree + multi-pane: PASS");
     console.log("UI-SMOKE lazy tree + file chip: PASS");
     console.log("UI-SMOKE PNG/GIF/WebP paste + picker/reject/attachment-only: PASS");
     console.log("UI-SMOKE streaming guard + same-session/HUD fan-out/abort + automation route: PASS");
+    console.log("UI-SMOKE shared/busy/inactive session deletion lifecycle: PASS");
+    console.log("UI-SMOKE redacted provider edit preserves exact stored key: PASS");
     console.log("UI-SMOKE synthetic pathless drop rejection (real outside-drop policy is unit-tested): PASS");
-    console.log("UI-SMOKE saved unsafe cwd degrade + activation/concurrent/restart lifecycle: PASS");
+    console.log("UI-SMOKE saved unsafe cwd degrade + activation/restart/crash draft lifecycle: PASS");
     console.log("UI-SMOKE navigation/sandbox/redaction: PASS");
     console.log("UI-SMOKE OK", JSON.stringify(result));
   } catch (error) {

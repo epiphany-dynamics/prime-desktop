@@ -288,3 +288,21 @@ test("asynchronous watcher errors close once and emit bounded degraded invalidat
   assert.equal(closes, 1);
   assert.equal(invalidations.length, 1);
 });
+
+
+test("macOS internal and mounted volume roots are rejected before watcher creation", { skip: process.platform !== "darwin" }, async (t) => {
+  const { base, home } = createRepo(t);
+  const watched = [];
+  const service = new WorkspaceService({
+    homeDir: home,
+    statePath: path.join(base, "volume-root-state.json"),
+    watchFactory: (root) => { watched.push(root); return { close() {} }; },
+  });
+  t.after(() => service.dispose());
+  for (const target of ["/System/Volumes", "/System/Volumes/Data", "/System/Volumes/Preboot"]) {
+    if (!fs.existsSync(target)) continue;
+    await assert.rejects(service.activatePath(target), /project folder|filesystem or user root/);
+  }
+  await assert.rejects(service._assertReasonableRoot("/Volumes/PrimeDesktopSyntheticVolume"), /project folder|filesystem or user root/);
+  assert.deepEqual(watched, []);
+});

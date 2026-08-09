@@ -471,3 +471,18 @@ test("renderer IPC rejection fallback retains binding metadata and clears sendin
   assert.equal(state.sending, false);
   assert.equal(state.error, "IPC transport rejected");
 });
+
+
+test("same-session workspace rebinding preserves the draft id and attachments", async (t) => {
+  const f = fixture(t);
+  const draft = f.service.createDraft();
+  await f.service.ingestClipboardImage({ draftId: draft.id, bytes: PNG_1X1, name: "unsent.png" });
+  const replacementWorkspace = { selected: true, workspaceId: "workspace-after-restart", generation: 9, cwd: f.workspaceRoot };
+  const rebound = f.service.rebindDraftWorkspace(draft.id, () => replacementWorkspace);
+  assert.equal(rebound.id, draft.id);
+  assert.equal(rebound.workspaceGeneration, 9);
+  assert.deepEqual(rebound.items.map((item) => item.name), ["unsent.png"]);
+  const serialized = f.service.serialize({ draftId: draft.id, text: "UNSENT RESTART DRAFT", behavior: "prompt" });
+  assert.equal(serialized.visibleText, "UNSENT RESTART DRAFT");
+  assert.equal(serialized.attachments.length, 1);
+});

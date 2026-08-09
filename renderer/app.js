@@ -418,6 +418,7 @@ class Pane {
 
   async applyActivation(response, sessionPath, requestId) {
     if (requestId !== this.activationRequest) return false;
+    const preserveDraft = !!(response.preservedDraft && this.sessionFile && response.sessionFile === this.sessionFile && response.draft && response.draft.id === this.draftState.id);
     this.key = response.key;
     this.paneId = response.paneId;
     this.bindingEpoch = response.bindingEpoch;
@@ -427,11 +428,15 @@ class Pane {
     this.draftState.reset(response.draft || null);
     this.renderAttachments();
     this.setBanner(null);
-    // The new main-owned binding is current now. Clear the prior binding's
-    // composer before async sync/history work so new-session typing is retained.
-    this.inputEl.value = '';
-    this.composerRevision += 1;
-    this.autoSize();
+    this.bannerEl.style.cursor = '';
+    this.bannerEl.onclick = null;
+    // A process-only same-session recovery keeps unsent text and the main-owned
+    // draft. Genuine new/session/project bindings clear before async history work.
+    if (!preserveDraft) {
+      this.inputEl.value = '';
+      this.composerRevision += 1;
+      this.autoSize();
+    }
     this.hideSuggestions();
     await this.syncState();
     if (requestId !== this.activationRequest || this.bindingEpoch !== response.bindingEpoch) return false;
@@ -1081,11 +1086,13 @@ function renderSidebar() {
     item.querySelector('.s-delete').onclick = async (e) => {
       e.stopPropagation();
       if (!confirm('Delete this session? This cannot be undone.')) return;
-      await prime.deleteSession(s.path);
+      const deleted = await prime.deleteSession(s.path);
+      if (!deleted.ok) {
+        for (const pane of G.panes.filter((candidate) => candidate.sessionFile === s.path)) pane.setBanner(deleted.error || 'That session could not be deleted', true);
+        return;
+      }
       if (G.pinnedPaths.has(s.path)) { G.pinnedPaths.delete(s.path); await prime.writePrefs({ pins: [...G.pinnedPaths] }); }
-      const pane = G.panes.find((p) => p.sessionFile === s.path);
-      if (pane) await pane.newChat();
-      refreshSessions();
+      await refreshSessions();
     };
     return item;
   };
@@ -1397,13 +1404,45 @@ async function openWorkspaceFileViewer(pane, nodeId, name) {
 
 // ---------------- restart helpers ----------------
 async function restartAllAgents() {
-  const snapshot = G.panes.map((p) => ({ pane: p, sessionFile: p.sessionFile }));
-  await prime.killAllAgents();
-  for (const { pane, sessionFile } of snapshot) {
-    pane.ready = false; pane.isStreaming = false;
-    await pane.activate(sessionFile || null);
+  for (const pane of G.panes) if (!pane.canChangeBinding('restarting agents')) return false;
+  const snapshot = G.panes.map((pane) => ({ pane, sessionFile: pane.sessionFile }));
+  for (const { pane } of snapshot) { pane.bindingChangePending = true; pane.updateComposer(); }
+  try {
+    const stopped = await prime.killAllAgents({ preserveDrafts: true });
+    if (!stopped.ok) {
+      for (const { pane } of snapshot) pane.setBanner(stopped.error || 'Agents could not be restarted', true);
+      return false;
+    }
+    let restored = true;
+    for (const { pane, sessionFile } of snapshot) {
+      pane.bindingChangePending = false;
+      pane.ready = false; pane.isStreaming = false;
+      try { if (!await pane.activate(sessionFile || null)) restored = false; }
+      catch { restored = false; }
+    }
+    renderSidebar();
+    return restored;
+  } finally {
+    for (const { pane } of snapshot) { pane.bindingChangePending = false; pane.updateComposer(); }
   }
-  renderSidebar();
+}
+
+async function recoverPanesForKey(key) {
+  const targets = G.panes.filter((pane) => pane.key === key);
+  for (const pane of targets) if (!pane.canChangeBinding('recovering this session')) return false;
+  for (const pane of targets) { pane.bindingChangePending = true; pane.updateComposer(); }
+  try {
+    let recovered = true;
+    for (const pane of targets) {
+      pane.bindingChangePending = false;
+      pane.ready = false;
+      try { if (!await pane.activate(pane.sessionFile || null)) recovered = false; }
+      catch { recovered = false; }
+    }
+    return recovered;
+  } finally {
+    for (const pane of targets) { pane.bindingChangePending = false; pane.updateComposer(); }
+  }
 }
 
 // ---------------- settings panel ----------------
@@ -1549,7 +1588,7 @@ function openCustomForm(editId, existing, isBuiltinExtension) {
       <input id="cf-id" value="${esc(editId || '')}" ${editId ? 'disabled' : ''} placeholder="ollama" /></div>
     <div class="s-field ${isBuiltinExtension ? 'hidden' : ''}"><label>Base URL</label><input id="cf-baseurl" value="${esc(p.baseUrl || '')}" placeholder="http://localhost:11434/v1" /></div>
     <div class="s-field ${isBuiltinExtension ? 'hidden' : ''}"><label>API type</label><select id="cf-api">${API_TYPES.map((a) => `<option ${p.api === a ? 'selected' : ''}>${a}</option>`).join('')}</select></div>
-    <div class="s-field ${isBuiltinExtension ? 'hidden' : ''}"><label>API key <span class="s-dim">(literal, ENV_VAR name, or !shell command)</span></label>
+    <div class="s-field ${isBuiltinExtension ? 'hidden' : ''}"><label>API key <span class="s-dim">(blank preserves; use none to remove, or enter a literal, ENV_VAR, or !shell command)</span></label>
       <input id="cf-apikey" value="${esc(p.apiKey || '')}" placeholder="sk-... or MY_ENV_VAR" /></div>
     <div class="s-field ${isBuiltinExtension ? 'hidden' : ''}"><label><input type="checkbox" id="cf-authheader" ${p.authHeader ? 'checked' : ''} /> Send <code>Authorization: Bearer</code> header</label></div>
     <div class="s-field"><label>Models</label><div id="cf-models"></div>
@@ -1612,7 +1651,9 @@ function openCustomForm(editId, existing, isBuiltinExtension) {
       }
       entry = { ...prev, models: merged };
     } else {
-      entry = { baseUrl, api, apiKey: apiKey || 'none', models };
+      entry = { baseUrl, api, models };
+      if (apiKey) entry.apiKey = apiKey;
+      else if (!prev.hasApiKey) entry.apiKey = 'none';
       if (authHeader) entry.authHeader = true;
     }
     providers[id] = entry;
@@ -1996,10 +2037,18 @@ prime.onAttachmentsReset(({ key, paneId, bindingEpoch, draft }) => {
   pane.renderAttachments();
 });
 prime.onRpcExit(({ key, code, error }) => {
-  for (const pane of G.panes.filter((p) => p.key === key)) {
+  const targets = G.panes.filter((pane) => pane.key === key);
+  const recover = async () => {
+    for (const pane of targets) pane.bannerEl.onclick = null;
+    await recoverPanesForKey(key);
+  };
+  for (const pane of targets) {
+    pane.isStreaming = false;
+    pane.endStream();
+    pane.updateComposer();
     pane.setBanner(`${error || 'Agent process exited'} (code ${code}). Click to restart.`, true);
     pane.bannerEl.style.cursor = 'pointer';
-    pane.bannerEl.onclick = async () => { pane.bannerEl.onclick = null; await pane.activate(pane.sessionFile || null, pane.cwd); };
+    pane.bannerEl.onclick = recover;
   }
 });
 prime.onRpcError(({ key, message }) => {

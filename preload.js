@@ -73,7 +73,7 @@ contextBridge.exposeInMainWorld('prime', {
   toggleSkill: (id, enable) => ipcRenderer.invoke('skills:toggle', { id, enable }),
   addSkillFromFolder: () => ipcRenderer.invoke('skills:add-from-folder'),
   installAgent: () => ipcRenderer.invoke('agent:install'),
-  killAllAgents: () => ipcRenderer.invoke('agent:kill-all'),
+  killAllAgents: (options) => ipcRenderer.invoke('agent:kill-all', options || {}),
   popOut: (sessionPath) => ipcRenderer.invoke('window:pop-out', sessionPath),
   getSecurityEvents: () => ipcRenderer.invoke('security:get-events'),
 

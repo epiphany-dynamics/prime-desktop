@@ -54,7 +54,7 @@ The renderer does not receive arbitrary shell or filesystem APIs. Project/file o
 
 ## Offline verification
 
-`npm run smoke` and `npm run ui-smoke` use `scripts/fake-agent.js`, an isolated temporary HOME, and local fixtures. They require no network or provider credentials. The UI smoke covers project/worktree selection, shared-session pane and HUD fan-out/abort, dedicated automation routing, PNG/GIF/WebP attachment flows, rejection retention, streaming/activation guards, saved-session workspace degradation, synthetic pathless-drop rejection, credential redaction, sandboxing, and navigation policy.
+`npm run smoke` and `npm run ui-smoke` use `scripts/fake-agent.js`, an isolated temporary HOME, and local fixtures. They require no network or provider credentials. The UI smoke covers project/worktree selection, shared-session pane and HUD fan-out/abort, busy/shared/inactive deletion safety, draft-preserving same-session restart, dedicated automation routing, PNG/GIF/WebP attachment flows, rejection retention, streaming/activation guards, saved-session workspace degradation, redacted-provider secret preservation, synthetic pathless-drop rejection, sandboxing, and navigation policy.
 
 ## Current limitations
 

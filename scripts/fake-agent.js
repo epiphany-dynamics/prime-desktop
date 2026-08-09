@@ -74,7 +74,10 @@ input.on("line", (line) => {
   try { command = JSON.parse(line); } catch { return; }
   try {
     switch (command.type) {
-      case "get_state": respond(command, true, { sessionFile: currentSession, model, thinkingLevel, isStreaming: streaming }); break;
+      case "get_state":
+        respond(command, true, { sessionFile: currentSession, model, thinkingLevel, isStreaming: streaming });
+        if (command.testCrash === true) setTimeout(() => process.exit(23), 50);
+        break;
       case "get_messages": respond(command, true, { messages }); break;
       case "get_session_stats": respond(command, true, { contextUsage: { percent: 1 }, cost: 0 }); break;
       case "get_available_models": respond(command, true, { models: [model] }); break;

@@ -19,6 +19,7 @@ const { tryAcquireFlag } = require('./lib/inflight-lock');
 const { classifyNavigation } = require('./lib/navigation-policy');
 const { SessionLifecycleRegistry } = require('./lib/session-lifecycle');
 const { createElectronImageNormalizer } = require('./lib/electron-image-normalizer');
+const { providerEntryPreservingSecret } = require('./lib/config-secrets');
 
 const TEST_MODE = !app.isPackaged && process.env.PRIME_DESKTOP_TEST_MODE === '1';
 const HOME_INPUT = TEST_MODE && process.env.PRIME_DESKTOP_TEST_HOME ? path.resolve(process.env.PRIME_DESKTOP_TEST_HOME) : os.homedir();
@@ -349,11 +350,12 @@ function paneContextFor(event, request = {}, options = {}) {
   const context = paneContexts.get(request.paneId);
   const owner = ownerForEvent(event);
   if (!context || context.ownerWin !== owner) throw new Error('This pane is no longer available');
+  if (context.lifecycleLocked) throw new Error('This pane is completing a lifecycle change; retry the action');
   if (typeof request.key !== 'string' || !request.key || context.client.key !== request.key) throw new Error('This pane changed sessions; retry the action');
   if (typeof request.bindingEpoch !== 'string' || !request.bindingEpoch || context.bindingEpoch !== request.bindingEpoch) throw new Error('This pane changed sessions; retry the action');
   return context;
 }
-function bindPane(event, requestedPaneId, client) {
+function bindPane(event, requestedPaneId, client, options = {}) {
   const ownerWin = ownerForEvent(event);
   if (!ownerWin || ownerWin.isDestroyed()) throw new Error('This window is no longer available');
   if (!client || !client.alive || client.disposePromise || !clientIsCurrent(client)) throw new Error('That agent session is no longer available');
@@ -362,15 +364,17 @@ function bindPane(event, requestedPaneId, client) {
   if (previous && previous.ownerWin !== ownerWin) throw new Error('This pane is no longer available');
   if (!paneId || !previous) paneId = `pane_${crypto.randomUUID()}`;
   // Build the replacement completely before committing over the prior binding.
-  const attachmentService = new AttachmentService({
-    homeDir: HOME,
-    getWorkspace: () => client.workspace.describe(),
-    normalizeImage: normalizeImageWithElectron,
-  });
-  const draft = attachmentService.createDraft();
-  const context = { id: paneId, bindingEpoch: `binding_${crypto.randomUUID()}`, ownerWin, client, attachmentService, draft, sending: false, pendingActions: 0 };
+  const preserveDraft = !!(options.preserveDraft && previous);
+  const workspaceProvider = () => client.workspace.describe();
+  const attachmentService = preserveDraft
+    ? previous.attachmentService
+    : new AttachmentService({ homeDir: HOME, getWorkspace: workspaceProvider, normalizeImage: normalizeImageWithElectron });
+  const draft = preserveDraft
+    ? attachmentService.rebindDraftWorkspace(previous.draft.id, workspaceProvider)
+    : attachmentService.createDraft();
+  const context = { id: paneId, bindingEpoch: `binding_${crypto.randomUUID()}`, ownerWin, client, attachmentService, draft, sending: false, pendingActions: 0, lifecycleLocked: false };
   if (previous) {
-    previous.attachmentService.deleteDraft(previous.draft.id);
+    if (!preserveDraft) previous.attachmentService.deleteDraft(previous.draft.id);
     paneContexts.delete(paneId);
   }
   paneContexts.set(paneId, context);
@@ -378,9 +382,10 @@ function bindPane(event, requestedPaneId, client) {
   refreshClientViewers(client);
   return context;
 }
-function describeActivation(context, state) {
+function describeActivation(context, state, options = {}) {
   return {
     ok: true,
+    preservedDraft: !!options.preservedDraft,
     key: context.client.key,
     paneId: context.id,
     bindingEpoch: context.bindingEpoch,
@@ -518,10 +523,11 @@ secureHandle('rpc:activate', async (event, request = {}) => {
         clientWasExisting = existingBefore.has(client);
         const state = await stateForClient(client);
         await requirePaneProjectIdle(priorContext, 'changing sessions');
-        const context = bindPane(event, request.paneId, client);
+        const preserveDraft = !!(priorContext && priorContext.client.sessionFile === client.sessionFile);
+        const context = bindPane(event, request.paneId, client, { preserveDraft });
         bound = true;
         if (ownerWin) lastFocusedMainWin = ownerWin;
-        return describeActivation(context, state);
+        return describeActivation(context, state, { preservedDraft: preserveDraft });
       } catch (error) {
         if (client && !bound && !clientWasExisting && ![...paneContexts.values()].some((context) => context.client === client)) {
           await disposeClient(client, 'failed session activation rollback').catch(() => {});
@@ -634,13 +640,18 @@ secureHandle('sessions:list', () => listSessions());
 secureHandle('sessions:delete', async (_event, sessionPath) => {
   try {
     const canonical = await canonicalSessionPath(SESSIONS_DIR, sessionPath);
-    const client = clients.get(canonical);
-    if (client) {
-      if (client.streaming) throw new Error('Stop the current response before deleting this session');
-      await disposeClient(client, 'session deletion');
-    }
-    await safeDeleteSession(SESSIONS_DIR, canonical);
-    return { ok: true };
+    return await runPaneTransition(() => sessionLifecycle.run(canonical, async () => {
+      await sessionLifecycle.waitForDisposal(canonical);
+      const attached = [...paneContexts.values()].filter((context) => context.client.sessionFile === canonical);
+      for (const context of attached) assertPaneLocallyIdle(context, 'deleting this session');
+      const client = clients.get(canonical);
+      if (client && client.alive && !client.disposePromise && clientIsCurrent(client)) await requireIdleClient(client, 'deleting this session');
+      for (const context of attached) assertPaneLocallyIdle(context, 'deleting this session');
+      if (attached.length) throw new Error('Switch or close every pane using this session before deleting it');
+      if (client) await disposeClient(client, 'session deletion');
+      await safeDeleteSession(SESSIONS_DIR, canonical);
+      return { ok: true };
+    }));
   } catch (error) { return publicError(error, 'That session could not be deleted'); }
 });
 secureHandle('sessions:tail', async (_event, request) => {
@@ -687,11 +698,32 @@ function runAgentInstaller() {
 }
 secureHandle('agent:install', () => runAgentInstaller());
 
-secureHandle('agent:kill-all', async () => {
-  const unique = [...new Set(clients.values())];
-  await Promise.all(unique.map((client) => disposeClient(client, 'manual restart')));
-  clients.clear();
-  return { ok: true };
+secureHandle('agent:kill-all', async (_event, request = {}) => {
+  try {
+    assertSmallDto(request, 8 * 1024);
+    return await runPaneTransition(async () => {
+      const contexts = [...paneContexts.values()];
+      const releases = [];
+      try {
+        for (const context of contexts) assertPaneLocallyIdle(context, 'restarting agents');
+        const unique = [...new Set(clients.values())];
+        for (const client of unique) {
+          if (client.alive && !client.disposePromise && clientIsCurrent(client)) await requireIdleClient(client, 'restarting agents');
+        }
+        for (const context of contexts) {
+          assertPaneLocallyIdle(context, 'restarting agents');
+          releases.push(reservePaneAction(context));
+          context.lifecycleLocked = true;
+        }
+        await Promise.all(unique.map((client) => disposeClient(client, request.preserveDrafts ? 'draft-preserving restart' : 'manual restart')));
+        clients.clear();
+        return { ok: true };
+      } finally {
+        for (const context of contexts) context.lifecycleLocked = false;
+        for (const release of releases) release();
+      }
+    });
+  } catch (error) { return publicError(error, 'Agents could not be restarted'); }
 });
 
 // ---------- Config files ----------
@@ -746,13 +778,7 @@ function writeModelsPreservingSecrets(incoming) {
   const providers = {};
   for (const [id, raw] of Object.entries(incoming.providers)) {
     if (!/^[a-z0-9][a-z0-9._-]{0,79}$/i.test(id) || !raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid provider entry');
-    const entry = { ...raw };
-    delete entry.hasApiKey;
-    delete entry.apiKeyMasked;
-    if ((entry.apiKey == null || entry.apiKey === '') && existing.providers && existing.providers[id] && typeof existing.providers[id].apiKey === 'string') {
-      entry.apiKey = existing.providers[id].apiKey;
-    }
-    providers[id] = entry;
+    providers[id] = providerEntryPreservingSecret(raw, existing.providers && existing.providers[id]);
   }
   writeJsonAtomic(MODELS_PATH, { ...incoming, providers });
   return { ok: true };

@@ -67,3 +67,28 @@ test("pane-scoped authority requires exact binding epochs and serializes lifecyc
   assert.match(main, /if \(context\.pendingActions > 0\) throw new AttachmentError\('ATTACHMENTS_PENDING'/);
   assert.doesNotMatch(preload, /rpc-flush-wait|rpcFlushWait/);
 });
+
+
+test("session deletion is serialized and the renderer honors failed deletes", () => {
+  const deletion = main.slice(main.indexOf("secureHandle('sessions:delete'"), main.indexOf("secureHandle('sessions:tail'"));
+  assert.match(deletion, /runPaneTransition/);
+  assert.match(deletion, /sessionLifecycle\.run\(canonical/);
+  assert.match(deletion, /assertPaneLocallyIdle/);
+  assert.match(deletion, /attached\.length/);
+  const renderer = read("renderer/app.js");
+  const deleteUi = renderer.slice(renderer.indexOf("item.querySelector('.s-delete')"), renderer.indexOf("return item", renderer.indexOf("item.querySelector('.s-delete')")));
+  assert.match(deleteUi, /if \(!deleted\.ok\)/);
+  assert.ok(deleteUi.indexOf("if (!deleted.ok)") < deleteUi.indexOf("G.pinnedPaths.delete"));
+});
+
+
+test("draft-preserving restarts lock pane authority and reuse same-session drafts", () => {
+  const restart = main.slice(main.indexOf("secureHandle('agent:kill-all'"), main.indexOf("// ---------- Config files"));
+  assert.match(restart, /runPaneTransition/);
+  assert.match(restart, /context\.lifecycleLocked = true/);
+  assert.match(restart, /reservePaneAction/);
+  assert.match(main, /rebindDraftWorkspace/);
+  const renderer = read("renderer/app.js");
+  assert.match(renderer, /response\.preservedDraft/);
+  assert.match(renderer, /prime\.killAllAgents\(\{ preserveDrafts: true \}\)/);
+});
