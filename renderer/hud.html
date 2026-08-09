@@ -6,49 +6,61 @@
   <title>Prime HUD</title>
   <style>
     :root {
-      --bg: #0f1011; --border: rgba(255,255,255,0.08); --text: #f7f8f8;
-      --text-dim: #8a8f98; --text-faint: #62666d;
+      --bg: #0f1011; --panel: #151719; --border: rgba(255,255,255,0.09); --text: #f7f8f8;
+      --text-dim: #9aa0a9; --text-faint: #696e76; --ok: #10b981; --err: #f06b6b;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; }
     body {
       font-family: "Inter Variable", "SF Pro Display", -apple-system, system-ui, sans-serif;
-      background: var(--bg); color: var(--text);
-      border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
-      display: flex; flex-direction: column;
+      background: var(--bg); color: var(--text); border: 1px solid var(--border);
+      border-radius: 14px; overflow: hidden; display: flex; flex-direction: column;
       -webkit-app-region: drag;
     }
-    .hud-top { display: flex; align-items: center; gap: 8px; padding: 10px 14px 0; }
+    .hud-top { display: flex; align-items: center; gap: 8px; padding: 11px 14px 9px; }
     .hud-mark { width: 18px; height: 18px; }
     .hud-title { font-size: 12px; font-weight: 600; color: var(--text-dim); flex: 1; }
     .hud-hint { font-size: 10px; color: var(--text-faint); }
+    #output {
+      flex: 1; min-height: 0; overflow: auto; margin: 0 14px 10px; padding: 12px;
+      border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+      color: #e7e9ec; font-size: 13px; line-height: 1.55; white-space: pre-wrap;
+      overflow-wrap: anywhere; user-select: text; -webkit-app-region: no-drag;
+    }
+    #output.empty { color: var(--text-faint); }
     textarea {
-      flex: 1; margin: 10px 14px; padding: 10px 12px; resize: none;
+      height: 82px; flex: none; margin: 0 14px 9px; padding: 10px 12px; resize: none;
       background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 10px;
-      color: var(--text); font: inherit; font-size: 13.5px; line-height: 1.5; outline: none;
+      color: var(--text); font: inherit; font-size: 13.5px; line-height: 1.45; outline: none;
       -webkit-app-region: no-drag;
     }
-    textarea:focus { border-color: rgba(255,255,255,0.2); }
-    .hud-bottom { display: flex; align-items: center; justify-content: space-between; padding: 0 14px 10px; }
-    #status { font-size: 11px; color: var(--text-faint); }
-    #status.ok { color: #10b981; }
-    #status.err { color: #eb5757; }
-    #send {
-      padding: 5px 14px; border-radius: 6px; border: none; cursor: pointer;
-      background: var(--text); color: #08090a; font-weight: 600; font-size: 12px;
+    textarea:focus { border-color: rgba(255,255,255,0.22); }
+    .hud-bottom { display: flex; align-items: center; gap: 7px; padding: 0 14px 11px; }
+    #status { min-width: 0; flex: 1; font-size: 11px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #status.ok { color: var(--ok); } #status.err { color: var(--err); }
+    button {
+      padding: 6px 11px; border-radius: 7px; border: 1px solid var(--border); cursor: pointer;
+      background: rgba(255,255,255,0.06); color: var(--text-dim); font-weight: 600; font-size: 11px;
+      -webkit-app-region: no-drag;
     }
+    button:hover { background: rgba(255,255,255,0.1); color: var(--text); }
+    #send { padding-inline: 15px; border: none; background: var(--text); color: #08090a; }
+    button:disabled { opacity: .45; cursor: default; }
   </style>
 </head>
 <body>
   <div class="hud-top">
     <img class="hud-mark" src="assets/prime-butterfly.svg" alt="" />
     <span class="hud-title">Prime HUD</span>
-    <span class="hud-hint">⏎ send · esc close</span>
+    <span class="hud-hint">⌘⇧Space · esc close</span>
   </div>
+  <div id="output" class="empty" role="log" aria-live="polite">Response will appear here.</div>
   <textarea id="input" placeholder="Quick prompt for the current session…" autofocus></textarea>
   <div class="hud-bottom">
     <span id="status"></span>
-    <button id="send">Send</button>
+    <button id="open-session" type="button">Open session</button>
+    <button id="abort" type="button" disabled>Stop</button>
+    <button id="send" type="button">Send</button>
   </div>
   <script src="hud.js"></script>
 </body>

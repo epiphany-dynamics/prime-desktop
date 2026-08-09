@@ -65,12 +65,15 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 }
 .brand-mark img { width: 16px; height: 16px; display: block; }
 .brand-name { font-weight: 510; font-size: 13.5px; letter-spacing: -0.13px; }
+.new-chat-row { display: flex; gap: 6px; }
 #new-chat-btn {
-  width: 100%; padding: 8px 10px; border-radius: 6px;
+  flex: 1; padding: 8px 10px; border-radius: 6px;
   background: var(--accent); color: #08090a; font-weight: 590; font-size: 13px;
   transition: background .12s ease;
 }
 #new-chat-btn:hover { background: var(--accent-hover); }
+#new-folder-chat-btn { width: 34px; border-radius: 6px; background: rgba(255,255,255,0.06); color: var(--text-dim); font-size: 16px; }
+#new-folder-chat-btn:hover { background: rgba(255,255,255,0.10); color: var(--text); }
 .sidebar-search { padding: 6px 12px 8px; }
 #session-filter {
   width: 100%; padding: 6px 10px; border-radius: 6px;
@@ -283,8 +286,8 @@ details.thinking .thinking-body {
 .notice { text-align: center; font-size: 12px; color: var(--text-faint); margin: 10px 0; font-style: italic; }
 
 /* ---------- Composer ---------- */
-#composer { border-top: 1px solid var(--border); padding: 12px 16px 8px; background: var(--bg); }
-#queue-hint { font-size: 12px; color: var(--amber); margin-bottom: 6px; max-width: 860px; margin-left: auto; margin-right: auto; }
+.composer { border-top: 1px solid var(--border); padding: 12px 16px 8px; background: var(--bg); }
+.queue-hint { font-size: 12px; color: var(--amber); margin-bottom: 6px; max-width: 860px; margin-left: auto; margin-right: auto; }
 .composer-row {
   max-width: 860px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end;
   background: rgba(255,255,255,0.02); border: 1px solid var(--border-2); border-radius: 12px;
@@ -292,22 +295,48 @@ details.thinking .thinking-body {
   transition: border-color .12s;
 }
 .composer-row:focus-within { border-color: var(--accent-2); }
-#input {
-  flex: 1; background: none; border: none; outline: none; resize: none;
+.composer .input {
+  flex: 1; min-width: 0; width: 100%; background: transparent; border: 0; outline: 0; resize: none;
   color: var(--text); font: inherit; line-height: 1.5;
-  max-height: 200px; padding: 4px 0;
+  max-height: 200px; padding: 4px 0; appearance: none;
 }
-#input::placeholder { color: var(--text-faint); }
-#send-btn, #stop-btn {
+.composer .input::placeholder { color: var(--text-faint); }
+.composer .attach-btn, .composer .send-btn, .composer .stop-btn {
   width: 32px; height: 32px; border-radius: 6px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
   font-size: 13px; transition: background .12s;
 }
-#send-btn { background: var(--accent); color: #08090a; }
-#send-btn:hover { background: var(--accent-hover); }
-#send-btn:disabled { background: rgba(255,255,255,0.05); color: var(--text-faint); cursor: default; }
-#stop-btn { background: rgba(255,255,255,0.05); color: var(--red); }
-#stop-btn:hover { background: var(--red); color: #fff; }
+.composer .attach-btn { background: transparent; color: var(--text-dim); font-size: 18px; }
+.composer .attach-btn:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+.composer .send-btn { background: var(--accent); color: #08090a; }
+.composer .send-btn:hover { background: var(--accent-hover); }
+.composer .send-btn:disabled { background: rgba(255,255,255,0.05); color: var(--text-faint); cursor: default; }
+.composer .stop-btn { background: rgba(255,255,255,0.05); color: var(--red); }
+.composer .stop-btn:hover { background: var(--red); color: #fff; }
+.attachment-strip {
+  max-width: 860px; margin: 0 auto 7px; display: flex; gap: 6px; flex-wrap: wrap;
+}
+.attachment-chip {
+  max-width: 240px; display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 7px; border-radius: 6px; background: rgba(255,255,255,0.05);
+  color: var(--text-dim); font-size: 11.5px; border: 1px solid var(--border-solid);
+}
+.attachment-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-chip button { color: var(--text-faint); padding: 0 2px; }
+.attachment-chip button:hover { color: var(--text); }
+.composer-popover {
+  position: absolute; left: 16px; right: 16px; bottom: 70px; z-index: 40;
+  max-width: 860px; max-height: 280px; margin: 0 auto; overflow-y: auto;
+  background: var(--bg-3); border: 1px solid var(--border-2); border-radius: 10px;
+  box-shadow: 0 8px 16px rgba(0,0,0,0.34); padding: 5px;
+}
+.composer-option { display: flex; align-items: center; gap: 9px; width: 100%; padding: 7px 9px; border-radius: 6px; text-align: left; }
+.composer-option:hover, .composer-option.active { background: rgba(255,255,255,0.07); }
+.composer-option-main { min-width: 0; flex: 1; }
+.composer-option-name { color: var(--text); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.composer-option-desc { color: var(--text-faint); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.composer { position: relative; }
+
 .composer-meta {
   max-width: 860px; margin: 6px auto 0; display: flex; justify-content: space-between;
   font-size: 10.5px; color: var(--text-faint); font-family: var(--mono);
@@ -389,6 +418,9 @@ details.thinking .thinking-body {
 .provider-row:hover { background: rgba(255,255,255,0.03); }
 .p-name { font-weight: 510; color: var(--text-2); min-width: 190px; }
 .p-status { color: var(--text-faint); font-size: 11.5px; flex: 1; font-family: var(--mono); }
+.p-status b, .p-status small { display: block; font-weight: 400; }
+.p-status b { color: var(--text-dim); font-size: 12px; margin-bottom: 2px; }
+.p-status .error-text { color: var(--red); }
 .p-status.ok { color: var(--emerald); }
 .p-actions { display: flex; gap: 6px; align-items: center; }
 .s-btn {
@@ -506,11 +538,13 @@ details.thinking .thinking-body {
 /* ---------- v0.6 panes ---------- */
 #panes { flex: 1; display: flex; min-width: 0; }
 .pane {
-  flex: 1; display: flex; flex-direction: column; min-width: 0;
+  position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0;
   border-left: 1px solid transparent;
 }
 body.split .pane:first-child { border-right: 1px solid var(--border); }
 .pane.focused .pane-topbar { box-shadow: inset 0 1px 0 rgba(255,255,255,0.10); }
+.pane.drag-target { box-shadow: inset 0 0 0 2px rgba(255,255,255,0.28); }
+.pane.drag-target::after { content: 'Drop session here'; position: absolute; inset: 48px 12px 82px; z-index: 35; display: grid; place-items: center; border: 1px dashed rgba(255,255,255,0.24); border-radius: 10px; background: rgba(8,9,10,0.82); color: var(--text-dim); pointer-events: none; }
 .pane-topbar {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 16px; padding-top: 38px;
@@ -543,13 +577,12 @@ body.split .chat { padding: 18px 16px 10px; }
   align-items: center; justify-content: center; color: var(--text-dim); gap: 10px;
   pointer-events: none;
 }
-.composer { border-top: 1px solid var(--border); padding: 12px 16px 8px; }
-
 /* panel head/tabs (shared by settings/capabilities/schedules) */
 .panel-head {
   display: flex; justify-content: space-between; align-items: center;
   padding: 14px 18px 10px; font-weight: 590; font-size: 15px; letter-spacing: -0.13px;
 }
+.panel-head-actions { display: flex; align-items: center; gap: 6px; }
 .panel-head button { color: var(--text-dim); padding: 2px 6px; border-radius: 4px; }
 .panel-head button:hover { color: var(--text); background: rgba(255,255,255,0.06); }
 .panel-tabs { display: flex; gap: 4px; padding: 0 18px; border-bottom: 1px solid var(--border); }

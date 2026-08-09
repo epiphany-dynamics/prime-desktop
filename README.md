@@ -2,7 +2,9 @@
 
 A native macOS desktop app for [Prime Agent](https://primeintellect.ai) — modeled after Hermes.app (Nous Research), skinned with the Linear desktop-app design system (dark-native `#08090a` canvas, fully achromatic — emphasis comes from white luminance steps, not hue; translucent white borders) and the official Prime butterfly mark (`assets/brand/prime-butterfly.svg` from PrimeIntellect-ai/prime-agent). Electron shell over `prime-agent --mode rpc`.
 
-![stack](https://img.shields.io/badge/electron-35-blue) ![status](https://img.shields.io/badge/status-v0.1-green)
+Product direction and the complete no-voice Hermes parity contract are tracked in [`HERMES_PARITY.md`](HERMES_PARITY.md). This is the build baseline, not an optional backlog.
+
+![stack](https://img.shields.io/badge/electron-35-blue) ![status](https://img.shields.io/badge/status-v0.6.1-green)
 
 ## Features
 
@@ -65,7 +67,7 @@ renderer <--IPC--> main.js <--JSONL stdio--> prime-agent --mode rpc
 - **Finder launches**: the app resolves `prime-agent` via explicit node + bundle path (`~/.local/lib/node_modules/prime-agent/dist/bundle/cli.js`), so it works from Spotlight/Finder where PATH is sparse.
 - **Housekeeping**: empty sessions created by the app are deleted on quit. Double-click a session name in the sidebar to rename it.
 
-## Known limitations (v0.2)
+## Known limitations (v0.6.1)
 
 - No branch/tree view, no fork UI (RPC supports it — `fork`, `get_fork_messages`)
 - No RLM subagent tree view (RPC `observe` command exists for this)

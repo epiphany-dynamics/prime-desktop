@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('prime', {
   command: (key, cmd) => ipcRenderer.invoke('rpc:command', { key, cmd }),
   activate: (opts) => ipcRenderer.invoke('rpc:activate', opts),
   listClients: () => ipcRenderer.invoke('rpc:list-clients'),
+  touchClient: (key) => ipcRenderer.invoke('rpc:touch-client', key),
 
   listSessions: () => ipcRenderer.invoke('sessions:list'),
   deleteSession: (p) => ipcRenderer.invoke('sessions:delete', p),
@@ -34,6 +35,8 @@ contextBridge.exposeInMainWorld('prime', {
 
   listDir: (p) => ipcRenderer.invoke('fs:list-dir', p),
   readFile: (p, maxBytes) => ipcRenderer.invoke('fs:read-file', { path: p, maxBytes }),
+  searchFiles: (root, query, limit) => ipcRenderer.invoke('fs:search', { root, query, limit }),
+  pickAttachments: () => ipcRenderer.invoke('dialog:pick-attachments'),
 
   listSkills: () => ipcRenderer.invoke('skills:list'),
   toggleSkill: (dir, enable) => ipcRenderer.invoke('skills:toggle', { dir, enable }),
@@ -47,6 +50,8 @@ contextBridge.exposeInMainWorld('prime', {
   popOut: (sessionPath) => ipcRenderer.invoke('window:pop-out', sessionPath),
 
   hudPrompt: (payload) => ipcRenderer.invoke('hud:prompt', payload),
+  hudAbort: () => ipcRenderer.invoke('hud:abort'),
+  hudOpenSession: () => ipcRenderer.invoke('hud:open-session'),
   hudHide: () => ipcRenderer.invoke('hud:hide'),
 
   onRpcEvent: (cb) => on('rpc-event', cb),
@@ -59,4 +64,5 @@ contextBridge.exposeInMainWorld('prime', {
   onInstallProgress: (cb) => on('agent-install-progress', cb),
   onXaiDeviceCode: (cb) => on('xai-device-code', cb),
   onHudOpened: (cb) => on('hud-opened', cb),
+  onHudEvent: (cb) => on('hud-event', cb),
 });

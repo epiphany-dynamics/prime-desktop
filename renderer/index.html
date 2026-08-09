@@ -14,7 +14,10 @@
           <div class="brand-mark"><img src="assets/prime-butterfly.svg" alt="Prime" /></div>
           <div class="brand-name">Prime Agent</div>
         </div>
-        <button id="new-chat-btn" title="New session (Cmd+N)">+ New chat</button>
+        <div class="new-chat-row">
+          <button id="new-chat-btn" title="New session (Cmd+N)">+ New chat</button>
+          <button id="new-folder-chat-btn" title="New chat in folder (Cmd+O)">⌁</button>
+        </div>
       </div>
       <div class="sidebar-nav">
         <button id="capabilities-btn" class="nav-item" title="Skills, commands and capabilities">⚡ Capabilities</button>
@@ -67,6 +70,7 @@
             </div>
           </div>
           <span class="context-meter" title="Context window usage"></span>
+          <button class="picker-btn pane-folder" title="Start a new chat in a folder">⌁</button>
           <button class="picker-btn pane-popout" title="Open this session in a new window">⧉</button>
           <button class="picker-btn pane-close hidden" title="Close pane">✕</button>
         </div>
@@ -82,7 +86,10 @@
       </div>
       <footer class="composer">
         <div class="queue-hint hidden"></div>
+        <div class="attachment-strip hidden"></div>
+        <div class="composer-popover hidden" role="listbox"></div>
         <div class="composer-row">
+          <button class="attach-btn" title="Attach files or images">＋</button>
           <textarea class="input" rows="1" placeholder="Message Prime Agent…  (Enter to send, Shift+Enter for newline)"></textarea>
           <button class="stop-btn hidden" title="Stop generation">■</button>
           <button class="send-btn" title="Send">➤</button>
@@ -196,7 +203,7 @@
     <div id="viewer-panel">
       <div class="panel-head">
         <span id="viewer-title">Viewer</span>
-        <button id="viewer-close" title="Close">✕</button>
+        <span class="panel-head-actions"><button id="viewer-add-chat" class="hidden" title="Add this file to the focused chat">Add to chat</button><button id="viewer-close" title="Close">✕</button></span>
       </div>
       <div id="viewer-body"></div>
     </div>

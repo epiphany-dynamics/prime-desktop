@@ -61,6 +61,11 @@ class Pane {
     this.stream = null;
     this.toolCards = new Map();
     this.ready = false;
+    this.attachments = [];
+    this.suggestions = [];
+    this.suggestionIndex = 0;
+    this.commandCache = null;
+    this.suggestionRequest = 0;
 
     const tpl = $('#pane-template').content.cloneNode(true);
     this.el = tpl.querySelector('.pane');
@@ -72,6 +77,9 @@ class Pane {
     this.scrollEl = $('.chat-scroll', this.el);
     this.emptyEl = $('.empty-state', this.el);
     this.inputEl = $('.input', this.el);
+    this.attachBtn = $('.attach-btn', this.el);
+    this.attachmentStrip = $('.attachment-strip', this.el);
+    this.composerPopover = $('.composer-popover', this.el);
     this.sendBtn = $('.send-btn', this.el);
     this.stopBtn = $('.stop-btn', this.el);
     this.queueHint = $('.queue-hint', this.el);
@@ -85,12 +93,22 @@ class Pane {
     this.thinkingBtn = $('.thinking-btn', this.el);
     this.thinkingMenu = $('.thinking-menu', this.el);
     this.closeBtn = $('.pane-close', this.el);
+    this.folderBtn = $('.pane-folder', this.el);
 
     this.el.addEventListener('mousedown', () => setFocusedPane(this));
-    this.inputEl.addEventListener('input', () => this.autoSize());
+    this.el.addEventListener('dragover', (e) => this.handlePaneDragOver(e));
+    this.el.addEventListener('dragleave', (e) => { if (!this.el.contains(e.relatedTarget)) this.el.classList.remove('drag-target'); });
+    this.el.addEventListener('drop', (e) => this.handlePaneDrop(e));
+    this.inputEl.addEventListener('input', () => { this.autoSize(); this.updateSuggestions(); });
+    this.inputEl.addEventListener('paste', (e) => this.handlePaste(e));
+    this.inputEl.addEventListener('dragover', (e) => { if (e.dataTransfer && e.dataTransfer.files.length) e.preventDefault(); });
+    this.inputEl.addEventListener('drop', (e) => this.handleFileDrop(e));
     this.inputEl.addEventListener('keydown', (e) => {
+      if (this.handleSuggestionKey(e)) return;
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.send(); }
     });
+    this.attachBtn.onclick = () => this.pickAttachments();
+    this.folderBtn.onclick = () => this.chooseFolder();
     this.sendBtn.onclick = () => this.send();
     this.stopBtn.onclick = () => this.stop();
     this.modelBtn.onclick = async () => {
@@ -103,6 +121,205 @@ class Pane {
     this.thinkingBtn.onclick = () => { this.renderThinkingMenu(); toggleMenu(this.thinkingMenu); };
     $('.pane-popout', this.el).onclick = () => prime.popOut(this.sessionFile || undefined);
     this.closeBtn.onclick = () => closePane(this);
+  }
+
+  // ---------- composer context / workspace interactions ----------
+  async chooseFolder() {
+    const dir = await prime.pickDirectory();
+    if (dir) await this.newChat(dir);
+  }
+
+  async pickAttachments() {
+    const r = await prime.pickAttachments();
+    if (r && r.ok) this.addAttachments(r.attachments || []);
+    else if (r && !r.cancelled && r.error) this.setBanner('Could not attach: ' + r.error, true);
+  }
+
+  addAttachments(items) {
+    for (const item of items || []) {
+      if (!item) continue;
+      const key = item.path || `${item.name}:${item.data ? item.data.slice(0, 48) : ''}`;
+      if (this.attachments.some((a) => (a.path || `${a.name}:${a.data ? a.data.slice(0, 48) : ''}`) === key)) continue;
+      this.attachments.push(item);
+    }
+    this.renderAttachments();
+  }
+
+  renderAttachments() {
+    const host = this.attachmentStrip;
+    host.innerHTML = '';
+    host.classList.toggle('hidden', this.attachments.length === 0);
+    this.attachments.forEach((item, index) => {
+      const chip = document.createElement('div');
+      chip.className = 'attachment-chip';
+      const icon = item.kind === 'image' ? '▧' : item.kind === 'session' ? '◫' : item.kind === 'folder' ? '▱' : '▤';
+      chip.innerHTML = `<b>${icon}</b><span title="${esc(item.path || item.name)}">${esc(item.name || baseName(item.path))}</span><button title="Remove">×</button>`;
+      chip.querySelector('button').onclick = () => { this.attachments.splice(index, 1); this.renderAttachments(); };
+      host.appendChild(chip);
+    });
+  }
+
+  fileToImage(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(reader.error || new Error('Could not read image'));
+      reader.onload = () => resolve({
+        kind: 'image', name: file.name || 'pasted-image.png', mimeType: file.type || 'image/png',
+        data: String(reader.result || '').split(',')[1] || '',
+      });
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async handlePaste(e) {
+    const images = [...(e.clipboardData && e.clipboardData.files || [])].filter((f) => f.type.startsWith('image/'));
+    if (!images.length) return;
+    e.preventDefault();
+    try { this.addAttachments(await Promise.all(images.map((f) => this.fileToImage(f)))); }
+    catch (err) { this.setBanner('Could not paste image: ' + String(err), true); }
+  }
+
+  async handleFileDrop(e) {
+    const files = [...(e.dataTransfer && e.dataTransfer.files || [])];
+    if (!files.length) return;
+    e.preventDefault(); e.stopPropagation();
+    const images = [];
+    const paths = [];
+    for (const file of files) {
+      if (file.type.startsWith('image/')) images.push(await this.fileToImage(file));
+      else if (file.path) paths.push({ kind: 'file', name: file.name, path: file.path, size: file.size });
+    }
+    this.addAttachments([...images, ...paths]);
+  }
+
+  handlePaneDragOver(e) {
+    if (!e.dataTransfer || ![...e.dataTransfer.types].includes('application/x-prime-session')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    this.el.classList.add('drag-target');
+  }
+
+  async handlePaneDrop(e) {
+    this.el.classList.remove('drag-target');
+    const sessionPath = e.dataTransfer && e.dataTransfer.getData('application/x-prime-session');
+    if (!sessionPath) return;
+    e.preventDefault(); e.stopPropagation();
+    const existing = G.panes.find((p) => p.sessionFile === sessionPath);
+    if (existing) { setFocusedPane(existing); return; }
+    if (G.panes.length < 2) await splitWithSession(sessionPath);
+    else await this.activate(sessionPath);
+  }
+
+  currentComposerToken() {
+    const before = this.inputEl.value.slice(0, this.inputEl.selectionStart);
+    const match = before.match(/(?:^|\s)([/@][^\s]*)$/);
+    return match ? { value: match[1], start: before.length - match[1].length, end: this.inputEl.selectionStart } : null;
+  }
+
+  async updateSuggestions() {
+    const token = this.currentComposerToken();
+    if (!token || (token.value[0] === '/' && token.start !== 0)) { this.hideSuggestions(); return; }
+    const request = ++this.suggestionRequest;
+    let options = [];
+    if (token.value.startsWith('/')) {
+      if (!this.commandCache && this.key) {
+        const r = await prime.command(this.key, { type: 'get_commands' });
+        this.commandCache = r.success ? (r.data.commands || []) : [];
+      }
+      const query = token.value.slice(1).toLowerCase();
+      options = (this.commandCache || []).filter((c) => !query || c.name.toLowerCase().includes(query)).slice(0, 40)
+        .map((c) => ({ type: 'command', label: '/' + c.name, description: c.description || c.source || '', value: '/' + c.name + ' ' }));
+    } else {
+      const query = token.value.slice(1).toLowerCase();
+      const sessions = G.sessions.filter((s) => {
+        const label = s.name || s.preview || s.id || '';
+        return !query || label.toLowerCase().includes(query);
+      }).slice(0, 12).map((s) => ({
+        type: 'session', label: '@' + (s.name || s.preview || s.id.slice(0, 8)), description: 'session',
+        value: '@' + (s.name || s.id.slice(0, 8)), attachment: { kind: 'session', name: s.name || s.preview || s.id.slice(0, 8), path: s.path },
+      }));
+      let files = [];
+      if (this.cwd) {
+        const r = await prime.searchFiles(this.cwd, query, 40);
+        if (r.ok) files = (r.entries || []).map((f) => ({
+          type: f.type, label: '@' + f.relative, description: f.type,
+          value: '@' + f.relative, attachment: { kind: f.type, name: f.name, path: f.path, relative: f.relative },
+        }));
+      }
+      options = [...sessions, ...files].slice(0, 50);
+    }
+    if (request !== this.suggestionRequest) return;
+    this.suggestions = options;
+    this.suggestionIndex = 0;
+    this.renderSuggestions(token);
+  }
+
+  renderSuggestions(token) {
+    const host = this.composerPopover;
+    host.innerHTML = '';
+    host.classList.toggle('hidden', this.suggestions.length === 0);
+    this.suggestions.forEach((option, index) => {
+      const row = document.createElement('button');
+      row.className = 'composer-option' + (index === this.suggestionIndex ? ' active' : '');
+      row.innerHTML = `<span>${option.type === 'command' ? '⌘' : option.type === 'session' ? '◫' : option.type === 'folder' ? '▱' : '▤'}</span><span class="composer-option-main"><div class="composer-option-name">${esc(option.label)}</div><div class="composer-option-desc">${esc(option.description)}</div></span>`;
+      row.onmousedown = (e) => { e.preventDefault(); this.selectSuggestion(index, token); };
+      host.appendChild(row);
+    });
+  }
+
+  hideSuggestions() {
+    this.suggestions = [];
+    this.composerPopover.classList.add('hidden');
+    this.composerPopover.innerHTML = '';
+  }
+
+  selectSuggestion(index, providedToken) {
+    const option = this.suggestions[index];
+    const token = providedToken || this.currentComposerToken();
+    if (!option || !token) return;
+    const text = this.inputEl.value;
+    this.inputEl.value = text.slice(0, token.start) + option.value + text.slice(token.end);
+    const cursor = token.start + option.value.length;
+    this.inputEl.setSelectionRange(cursor, cursor);
+    if (option.attachment) this.addAttachments([option.attachment]);
+    this.hideSuggestions();
+    this.autoSize();
+    this.inputEl.focus();
+  }
+
+  handleSuggestionKey(e) {
+    if (this.composerPopover.classList.contains('hidden') || !this.suggestions.length) return false;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const delta = e.key === 'ArrowDown' ? 1 : -1;
+      this.suggestionIndex = (this.suggestionIndex + delta + this.suggestions.length) % this.suggestions.length;
+      this.renderSuggestions(this.currentComposerToken());
+      return true;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); this.selectSuggestion(this.suggestionIndex); return true; }
+    if (e.key === 'Escape') { e.preventDefault(); this.hideSuggestions(); return true; }
+    return false;
+  }
+
+  async buildPromptContext(text) {
+    let message = text;
+    const images = [];
+    for (const item of this.attachments) {
+      if (item.kind === 'image') {
+        images.push({ type: 'image', data: item.data, mimeType: item.mimeType });
+      } else if (item.kind === 'file') {
+        const r = await prime.readFile(item.path, 300000);
+        if (r.ok) message += `\n\n<attached_file path="${item.path}">\n${r.text}${r.truncated ? '\n[truncated]' : ''}\n</attached_file>`;
+        else message += `\n\nAttached file available at: ${item.path}`;
+      } else if (item.kind === 'folder') {
+        message += `\n\nReferenced folder: ${item.path}`;
+      } else if (item.kind === 'session') {
+        const r = await prime.sessionTail(item.path, 30);
+        const transcript = r.ok ? (r.messages || []).map((m) => `${m.role}: ${m.text}`).join('\n') : '';
+        message += `\n\n<referenced_session path="${item.path}">\n${transcript}\n</referenced_session>`;
+      }
+    }
+    return { message, images };
   }
 
   // ---------- activation ----------
@@ -195,14 +412,20 @@ class Pane {
   // ---------- sending ----------
   async send() {
     const text = this.inputEl.value.trim();
-    if (!text || !this.key) return;
-    this.inputEl.value = '';
-    this.autoSize();
-    const cmd = { type: 'prompt', message: text };
+    if ((!text && !this.attachments.length) || !this.key) return;
+    this.hideSuggestions();
+    const visibleText = text || 'Attached context';
+    const payload = await this.buildPromptContext(text || 'Review the attached context.');
+    const cmd = { type: 'prompt', message: payload.message };
+    if (payload.images.length) cmd.images = payload.images;
     if (this.isStreaming) cmd.streamingBehavior = 'steer';
-    else this.addUserBubble(text);
+    else this.addUserBubble(visibleText);
     const r = await prime.command(this.key, cmd);
-    if (!r.success) this.setBanner('Prompt rejected: ' + (r.error || 'unknown'), true);
+    if (!r.success) { this.setBanner('Prompt rejected: ' + (r.error || 'unknown'), true); return; }
+    this.inputEl.value = '';
+    this.attachments = [];
+    this.renderAttachments();
+    this.autoSize();
   }
 
   async stop() {
@@ -525,6 +748,7 @@ class Pane {
 function setFocusedPane(pane) {
   G.focused = pane;
   for (const p of G.panes) p.el.classList.toggle('focused', p === pane);
+  if (pane && pane.key) prime.touchClient(pane.key);
 }
 
 function toggleMenu(menu, show) {
@@ -637,6 +861,12 @@ function renderSidebar() {
     const paneHere = G.panes.find((p) => p.sessionFile === s.path);
     const item = document.createElement('div');
     item.className = 'session-item' + (paneHere ? ' active' : '');
+    item.draggable = true;
+    item.addEventListener('dragstart', (e) => {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('application/x-prime-session', s.path);
+      e.dataTransfer.setData('text/plain', s.path);
+    });
     item.innerHTML = `
       <div class="s-name">${(paneHere && paneHere.isStreaming) ? '<span class="live-dot"></span>' : ''}${esc(label)}</div>
       <div class="s-meta">${esc(baseName(s.cwd))} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs</div>
@@ -744,7 +974,10 @@ function renderSubagents() {
 }
 
 let subagentPoll = null;
+let currentViewerFile = null;
 async function openSubagentViewer(session) {
+  currentViewerFile = null;
+  $('#viewer-add-chat').classList.add('hidden');
   $('#viewer-title').textContent = 'Subagent — ' + (session.name || session.id.slice(0, 8)) + ' (live)';
   $('#viewer-backdrop').classList.remove('hidden');
   const body = $('#viewer-body');
@@ -813,6 +1046,8 @@ async function renderTreeLevel(container, dirPath) {
   if (!r.entries.length) container.innerHTML = '<div class="tree-loading">empty</div>';
 }
 async function openFileViewer(p) {
+  currentViewerFile = p;
+  $('#viewer-add-chat').classList.remove('hidden');
   $('#viewer-title').textContent = p.split('/').pop();
   const body = $('#viewer-body');
   body.innerHTML = '<p class="s-help">Loading…</p>';
@@ -1184,6 +1419,19 @@ async function openSchedules() {
 }
 function scheduleClient() { return G.focused && G.focused.key ? G.focused : G.panes[0]; }
 
+function scheduleText(schedule) {
+  if (!schedule) return '';
+  if (typeof schedule === 'string') return schedule;
+  return schedule.expression || schedule.kind || '';
+}
+function jobTiming(job) {
+  const bits = [];
+  if (job.nextRunAt) bits.push('next ' + relTime(Date.parse(job.nextRunAt)));
+  if (job.lastRunAt) bits.push('last ' + relTime(Date.parse(job.lastRunAt)));
+  if (Number.isFinite(job.runCount)) bits.push(job.runCount + ' runs');
+  return bits.join(' · ');
+}
+
 async function renderSchedulesList() {
   const pane = scheduleClient();
   const host = $('#schedules-list');
@@ -1194,9 +1442,11 @@ async function renderSchedulesList() {
   for (const j of jobs) {
     const row = document.createElement('div');
     row.className = 'provider-row';
-    row.innerHTML = `<span class="p-name" style="min-width:130px;font-family:var(--mono);font-size:12px">${esc(j.schedule || '')}</span>
-      <span class="p-status" style="font-family:inherit">${esc((j.prompt || '').slice(0, 60))}${(j.prompt || '').length > 60 ? '…' : ''}</span>
-      <span class="p-actions"><span class="s-dim">${j.active === false ? 'inactive' : 'active'}</span></span>`;
+    const summary = (j.prompt || '').slice(0, 72) + ((j.prompt || '').length > 72 ? '…' : '');
+    const timing = jobTiming(j);
+    row.innerHTML = `<span class="p-name" style="min-width:150px;font-family:var(--mono);font-size:12px">${esc(scheduleText(j.schedule))}</span>
+      <span class="p-status" style="font-family:inherit"><b>${esc(j.label || summary || 'Scheduled prompt')}</b>${timing ? `<small>${esc(timing)}</small>` : ''}${j.lastError ? `<small class="error-text">${esc(j.lastError)}</small>` : ''}</span>
+      <span class="p-actions"><span class="s-dim">${esc(j.status || 'active')}</span></span>`;
     const del = document.createElement('button');
     del.className = 's-btn danger'; del.textContent = 'Cancel';
     del.onclick = async () => {
@@ -1216,20 +1466,21 @@ async function renderHeartbeatsList() {
   const r = await prime.command(pane.key, { type: 'list_heartbeats' });
   const hbs = (r.success && r.data.heartbeats) || [];
   host.innerHTML = hbs.length ? '' : '<p class="s-help">No heartbeats configured.</p>';
-  for (const h of hbs) {
+  for (const heartbeat of hbs) {
+    const h = heartbeat.job || heartbeat;
     const row = document.createElement('div');
     row.className = 'provider-row';
-    const state = h.paused ? 'paused' : (h.active === false ? 'stopped' : 'running');
-    row.innerHTML = `<span class="p-name" style="min-width:130px;font-family:var(--mono);font-size:12px">${esc(h.schedule || '')}</span>
-      <span class="p-status" style="font-family:inherit">${esc((h.prompt || '').slice(0, 60))}</span>
-      <span class="p-actions"><span class="s-dim">${state}</span></span>`;
+    row.innerHTML = `<span class="p-name" style="min-width:150px;font-family:var(--mono);font-size:12px">${esc(scheduleText(h.schedule))}</span>
+      <span class="p-status" style="font-family:inherit"><b>${esc(h.label || heartbeat.sessionName || 'Heartbeat')}</b><small>${esc((h.prompt || heartbeat.firstMessage || '').slice(0, 72))}</small>${jobTiming(h) ? `<small>${esc(jobTiming(h))}</small>` : ''}</span>
+      <span class="p-actions"><span class="s-dim">${esc(h.status || 'active')}</span></span>`;
     const actions = row.querySelector('.p-actions');
     for (const [label, action] of [['Pause', 'pause'], ['Resume', 'resume'], ['Stop', 'stop']]) {
       const b = document.createElement('button');
       b.className = 's-btn' + (action === 'stop' ? ' danger' : '');
       b.textContent = label;
+      b.disabled = (action === 'pause' && h.status === 'paused') || (action === 'resume' && h.status === 'active');
       b.onclick = async () => {
-        await prime.command(pane.key, { type: 'manage_heartbeat', activeSessionId: h.activeSessionId, jobId: h.jobId || h.id, action });
+        await prime.command(pane.key, { type: 'manage_heartbeat', activeSessionId: h.activeSessionId, jobId: h.id, action });
         renderHeartbeatsList();
       };
       actions.appendChild(b);
@@ -1240,6 +1491,11 @@ async function renderHeartbeatsList() {
 
 // ---------------- menu actions / wiring ----------------
 $('#new-chat-btn').onclick = () => G.focused && G.focused.newChat();
+$('#new-folder-chat-btn').onclick = async () => {
+  if (!G.focused) return;
+  const dir = await prime.pickDirectory();
+  if (dir) await G.focused.newChat(dir);
+};
 $('#session-filter').addEventListener('input', renderSidebar);
 $('#settings-btn').onclick = openSettings;
 $('#settings-close').onclick = closeSettings;
@@ -1309,6 +1565,12 @@ $('#sf-save').onclick = async () => {
 };
 
 $('#tree-close').onclick = toggleTree;
+$('#viewer-add-chat').onclick = () => {
+  if (!currentViewerFile || !G.focused) return;
+  G.focused.addAttachments([{ kind: 'file', name: baseName(currentViewerFile), path: currentViewerFile }]);
+  $('#viewer-backdrop').classList.add('hidden');
+  G.focused.inputEl.focus();
+};
 $('#viewer-close').onclick = () => { clearInterval(subagentPoll); $('#viewer-backdrop').classList.add('hidden'); };
 $('#viewer-backdrop').onclick = (e) => { if (e.target === $('#viewer-backdrop')) { clearInterval(subagentPoll); $('#viewer-backdrop').classList.add('hidden'); } };
 
@@ -1333,17 +1595,14 @@ $('#sidebar').querySelector('.sidebar-bottom-row').appendChild(treeBtn);
 
 // ---------------- daemon events ----------------
 prime.onRpcEvent(({ key, event }) => {
-  const pane = G.panes.find((p) => p.key === key);
-  if (pane) pane.handleEvent(event);
+  for (const pane of G.panes.filter((p) => p.key === key)) pane.handleEvent(event);
 });
 prime.onKeyMapped(({ oldKey, key }) => {
-  const pane = G.panes.find((p) => p.key === oldKey);
-  if (pane) { pane.key = key; pane.sessionFile = key; }
+  for (const pane of G.panes.filter((p) => p.key === oldKey)) { pane.key = key; pane.sessionFile = key; }
 });
 prime.onSessionsChanged((list) => refreshSessions(list));
 prime.onRpcExit(({ key, code, error }) => {
-  const pane = G.panes.find((p) => p.key === key);
-  if (pane) {
+  for (const pane of G.panes.filter((p) => p.key === key)) {
     pane.setBanner(`${error || 'Agent process exited'} (code ${code}). Click to restart.`, true);
     pane.bannerEl.style.cursor = 'pointer';
     pane.bannerEl.onclick = async () => { pane.bannerEl.onclick = null; await pane.activate(pane.sessionFile || null, pane.cwd); };
@@ -1354,11 +1613,11 @@ prime.onRpcError(({ key, message }) => {
   if (pane) pane.setBanner(message || 'Agent process error.', true);
 });
 prime.onFlushWait(({ key }) => {
-  const pane = G.panes.find((p) => p.key === key);
-  if (pane) pane.setAgentState('saving session before switching…');
+  for (const pane of G.panes.filter((p) => p.key === key)) pane.setAgentState('saving session before switching…');
 });
 prime.onMenuAction(({ id }) => {
   if (id === 'new-chat') G.focused && G.focused.newChat();
+  else if (id === 'new-folder-chat') G.focused && G.focused.chooseFolder();
   else if (id === 'open-settings') openSettings();
   else if (id === 'install-agent' || id === 'update-agent') runAgentInstall(id === 'install-agent' ? 'Install Prime Agent' : 'Update Prime Agent');
   else if (id === 'restart-agent') restartAllAgents();

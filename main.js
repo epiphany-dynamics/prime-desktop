@@ -138,6 +138,7 @@ function spawnClient({ sessionPath, cwd, ownerWin }) {
     }
     client.pending.clear();
     sendToWindow(client.ownerWin, 'rpc-exit', { key: client.key, code: code == null ? -1 : code, error: errMsg || null });
+    sendHudEvent(client, { type: 'error', error: errMsg || ('Agent process exited (' + (code == null ? -1 : code) + ')') });
   };
   proc.on('exit', (code) => onDead(code, null));
   proc.on('error', (err) => onDead(null, 'Failed to start prime-agent: ' + String(err)));
@@ -196,6 +197,11 @@ function handleClientMessage(client, obj) {
     }).catch(() => {});
   }
   sendToWindow(client.ownerWin, 'rpc-event', { key: client.key, event: obj });
+  const assistantEvent = (obj.type === 'message_update' || obj.type === 'message_end')
+    && (!obj.message || obj.message.role === 'assistant');
+  const errorEvent = obj.type === 'error'
+    || (obj.type === 'message_update' && obj.assistantMessageEvent && obj.assistantMessageEvent.type === 'error');
+  if (assistantEvent || errorEvent || obj.type === 'agent_end') sendHudEvent(client, obj);
 }
 
 function clientCommand(client, cmd, timeoutMs) {
@@ -286,6 +292,8 @@ ipcMain.handle('rpc:command', async (e, { key, cmd }) => {
   try {
     const client = getClient(key);
     if (!client) throw new Error('No agent for this pane (key ' + key + ')');
+    const senderWin = BrowserWindow.fromWebContents(e.sender);
+    if (senderWin) { client.ownerWin = senderWin; lastFocusedMainWin = senderWin; }
     if (cmd.type === 'switch_session' && cmd.sessionPath) {
       try {
         const prep = await prepareTargetSession(cmd.sessionPath);
@@ -320,6 +328,8 @@ ipcMain.handle('rpc:activate', async (e, { sessionPath, cwd }) => {
   const client = ensureClient({ sessionPath, cwd, ownerWin: win });
   if (!client) return { ok: false, error: 'failed to spawn agent' };
   client.ownerWin = win;
+  client.lastUsed = Date.now();
+  if (win) lastFocusedMainWin = win;
   for (let i = 0; i < 60; i++) {
     try {
       const r = await clientCommand(client, { type: 'get_state' });
@@ -332,6 +342,14 @@ ipcMain.handle('rpc:activate', async (e, { sessionPath, cwd }) => {
 
 ipcMain.handle('rpc:list-clients', () =>
   [...clients.values()].map((c) => ({ key: c.key, sessionFile: c.sessionFile, streaming: c.streaming, alive: c.alive, cwd: c.cwd })));
+ipcMain.handle('rpc:touch-client', (e, key) => {
+  const client = getClient(key);
+  if (!client) return { ok: false };
+  const win = BrowserWindow.fromWebContents(e.sender);
+  client.lastUsed = Date.now();
+  if (win) { client.ownerWin = win; lastFocusedMainWin = win; }
+  return { ok: true };
+});
 
 // ---------- Empty-session cleanup ----------
 
@@ -690,6 +708,56 @@ ipcMain.handle('fs:read-file', (_e, { path: p, maxBytes }) => {
   } catch (err) { return { ok: false, error: String(err) }; }
 });
 
+ipcMain.handle('fs:search', (_e, { root, query, limit }) => {
+  try {
+    if (typeof root !== 'string' || !root.startsWith(HOME)) throw new Error('outside home');
+    const needle = String(query || '').toLowerCase();
+    const cap = Math.min(Math.max(Number(limit) || 40, 1), 100);
+    const out = [];
+    const stack = [root];
+    let visited = 0;
+    while (stack.length && out.length < cap && visited < 6000) {
+      const dir = stack.pop();
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        if (++visited > 6000) break;
+        if (TREE_SKIP.has(entry.name)) continue;
+        if (entry.name.startsWith('.') && entry.isDirectory()) continue;
+        const p = path.join(dir, entry.name);
+        if (entry.isDirectory()) stack.push(p);
+        const relative = path.relative(root, p);
+        if (!needle || relative.toLowerCase().includes(needle)) {
+          out.push({ name: entry.name, path: p, relative, type: entry.isDirectory() ? 'folder' : 'file' });
+          if (out.length >= cap) break;
+        }
+      }
+    }
+    return { ok: true, entries: out };
+  } catch (err) { return { ok: false, error: String(err), entries: [] }; }
+});
+
+const IMAGE_MIME = new Map([
+  ['.png', 'image/png'], ['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg'],
+  ['.gif', 'image/gif'], ['.webp', 'image/webp'],
+]);
+ipcMain.handle('dialog:pick-attachments', async () => {
+  try {
+    const r = await dialog.showOpenDialog(null, { properties: ['openFile', 'multiSelections'] });
+    if (r.canceled) return { ok: false, cancelled: true, attachments: [] };
+    const attachments = r.filePaths.map((p) => {
+      const stat = fs.statSync(p);
+      const mimeType = IMAGE_MIME.get(path.extname(p).toLowerCase());
+      if (mimeType) {
+        if (stat.size > 25 * 1024 * 1024) throw new Error(`${path.basename(p)} exceeds the 25 MB image limit`);
+        return { kind: 'image', name: path.basename(p), path: p, mimeType, data: fs.readFileSync(p).toString('base64') };
+      }
+      return { kind: 'file', name: path.basename(p), path: p, size: stat.size };
+    });
+    return { ok: true, attachments };
+  } catch (err) { return { ok: false, error: String(err), attachments: [] }; }
+});
+
 // ---------- Skills (list / toggle / add) ----------
 
 const SKILL_DIRS = [path.join(HOME, '.agents', 'skills'), path.join(PRIME_DIR, 'skills')];
@@ -752,7 +820,9 @@ ipcMain.handle('skills:add-from-folder', async () => {
 // ---------- HUD ----------
 
 let hudWin = null;
-const HUD_WIDTH = 620, HUD_HEIGHT = 320;
+let hudClient = null;
+let lastFocusedMainWin = null;
+const HUD_WIDTH = 620, HUD_HEIGHT = 480;
 function createHud() {
   hudWin = new BrowserWindow({
     width: HUD_WIDTH, height: HUD_HEIGHT, frame: false, resizable: false,
@@ -763,27 +833,73 @@ function createHud() {
   hudWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   hudWin.on('blur', () => { if (hudWin && !hudWin.webContents.isDevToolsOpened()) hudWin.hide(); });
 }
+function selectHudClient(key) {
+  const explicit = key && clients.get(key);
+  if (explicit && explicit.alive) return explicit;
+  const available = [...clients.values()].filter((client) => client.alive);
+  const focused = lastFocusedMainWin && !lastFocusedMainWin.isDestroyed()
+    ? available.filter((client) => client.ownerWin === lastFocusedMainWin)
+    : [];
+  return (focused.length ? focused : available).sort((a, b) => b.lastUsed - a.lastUsed)[0] || null;
+}
+
+function sendHudEvent(client, event) {
+  if (!hudWin || hudWin.isDestroyed() || client !== hudClient) return;
+  sendToWindow(hudWin, 'hud-event', { key: client.key, event });
+}
+
 function toggleHud() {
   if (!hudWin) return;
   if (hudWin.isVisible()) { hudWin.hide(); return; }
+  hudClient = selectHudClient(null);
   const cursor = screen.getCursorScreenPoint();
   const display = screen.getDisplayNearestPoint(cursor);
   const { x, y, width, height } = display.workArea;
   hudWin.setPosition(Math.round(x + (width - HUD_WIDTH) / 2), Math.round(y + height - HUD_HEIGHT - 72));
   hudWin.show(); hudWin.focus();
-  hudWin.webContents.send('hud-opened');
+  hudWin.webContents.send('hud-opened', {
+    key: hudClient && hudClient.key,
+    sessionFile: hudClient && hudClient.sessionFile,
+    streaming: !!(hudClient && hudClient.streaming),
+  });
 }
 ipcMain.handle('hud:hide', () => { if (hudWin) hudWin.hide(); });
 ipcMain.handle('hud:prompt', async (_e, { key, text }) => {
   try {
-    const client = getClient(key) || [...clients.values()].sort((a, b) => b.lastUsed - a.lastUsed)[0];
+    const client = selectHudClient(key) || (hudClient && hudClient.alive ? hudClient : null);
     if (!client) return { ok: false, error: 'no agent running' };
+    hudClient = client;
+    client.lastUsed = Date.now();
     const st = await clientCommand(client, { type: 'get_state' });
     const cmd = { type: 'prompt', message: text };
     if (st.success && st.data.isStreaming) cmd.streamingBehavior = 'steer';
     const r = await clientCommand(client, cmd);
-    return { ok: !!r.success, error: r.error || null, streaming: !!(st.success && st.data.isStreaming) };
+    return {
+      ok: !!r.success, error: r.error || null,
+      streaming: !!(st.success && st.data.isStreaming),
+      key: client.key, sessionFile: client.sessionFile,
+    };
   } catch (err) { return { ok: false, error: String(err && err.message || err) }; }
+});
+ipcMain.handle('hud:abort', async () => {
+  try {
+    if (!hudClient || !hudClient.alive) return { ok: false, error: 'no agent running' };
+    const r = await clientCommand(hudClient, { type: 'abort' });
+    return { ok: !!r.success, error: r.error || null };
+  } catch (err) { return { ok: false, error: String(err && err.message || err) }; }
+});
+ipcMain.handle('hud:open-session', () => {
+  if (!hudClient) return { ok: false, error: 'no session selected' };
+  const owner = hudClient.ownerWin;
+  if (owner && !owner.isDestroyed()) {
+    if (owner.isMinimized()) owner.restore();
+    owner.show();
+    owner.focus();
+  } else {
+    createWindow(hudClient.sessionFile || undefined);
+  }
+  if (hudWin) hudWin.hide();
+  return { ok: true, sessionFile: hudClient.sessionFile };
 });
 
 // ---------- Windows / pop-out ----------
@@ -797,7 +913,11 @@ function createWindow(sessionQuery) {
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
   });
   wins.add(win);
-  win.on('closed', () => wins.delete(win));
+  win.on('focus', () => { lastFocusedMainWin = win; });
+  win.on('closed', () => {
+    wins.delete(win);
+    if (lastFocusedMainWin === win) lastFocusedMainWin = null;
+  });
   const file = path.join(__dirname, 'renderer', 'index.html');
   if (sessionQuery) win.loadFile(file, { query: { session: sessionQuery } });
   else win.loadFile(file);
@@ -850,6 +970,7 @@ function buildMenu() {
     ] },
     { label: 'File', submenu: [
       { label: 'New Chat', accelerator: 'CmdOrCtrl+N', click: send('new-chat') },
+      { label: 'Open Folder…', accelerator: 'CmdOrCtrl+O', click: send('new-folder-chat') },
       { label: 'New Window', accelerator: 'CmdOrCtrl+Shift+N', click: () => createWindow() },
       { type: 'separator' },
       { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: send('open-settings') },
