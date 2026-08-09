@@ -42,3 +42,13 @@ test('schedules and heartbeat rows consume current RPC shapes', () => {
   assert.match(app, /jobId: h\.id/);
   assert.match(app, /job\.nextRunAt/);
 });
+
+
+test('async suggestion invalidation, Electron file paths, and safe search are wired', () => {
+  assert.match(app, /hideSuggestions\(\) \{\s*this\.suggestionRequest\+\+/s);
+  assert.match(preload, /webUtils\.getPathForFile/);
+  assert.match(main, /fs\.promises\.readdir/);
+  assert.match(main, /path\.relative\(canonicalHome, canonicalRoot\)/);
+  const searchHandler = main.slice(main.indexOf("ipcMain.handle('fs:search'"), main.indexOf('const IMAGE_MIME'));
+  assert.doesNotMatch(searchHandler, /readdirSync/);
+});

@@ -90,6 +90,7 @@ prime.onHudEvent(({ key, event }) => {
       const err = event.assistantMessageEvent.error;
       showOutput(err && err.message || event.error || 'Generation failed.', true);
       status.className = 'err'; status.textContent = 'Generation failed';
+      active = false; abortButton.disabled = true;
       return;
     }
     if (!event.message || event.message.role !== 'assistant') return;
@@ -102,6 +103,7 @@ prime.onHudEvent(({ key, event }) => {
     const err = event.error;
     showOutput(typeof err === 'string' ? err : (err && err.message) || 'Agent error.', true);
     status.className = 'err'; status.textContent = 'Agent error';
+    active = false; abortButton.disabled = true;
   } else if (event.type === 'agent_end') {
     active = false;
     abortButton.disabled = true;

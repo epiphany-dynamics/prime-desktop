@@ -13,7 +13,7 @@ test('HUD binds to an alive client from the focused window before global recency
   const selector = main.match(/function selectHudClient\(key\) \{([\s\S]*?)\n\}/);
   assert.ok(selector, 'selectHudClient helper is present');
   assert.match(selector[1], /client\.alive/);
-  assert.match(selector[1], /client\.ownerWin === lastFocusedMainWin/);
+  assert.match(selector[1], /client\.viewers && client\.viewers\.has\(lastFocusedMainWin\)/);
   assert.match(selector[1], /sort\(\(a, b\) => b\.lastUsed - a\.lastUsed\)/);
   assert.match(main, /hudClient = selectHudClient\(null\)/);
 });
@@ -41,4 +41,16 @@ test('HUD keeps output visible and exposes stop and full-session actions', () =>
   const sendBody = js.match(/async function send\(\) \{([\s\S]*?)\n\}/);
   assert.ok(sendBody);
   assert.doesNotMatch(sendBody[1], /hudHide/);
+});
+
+
+test('HUD never falls back when an explicit bound session is dead', () => {
+  assert.match(main, /if \(key\) \{\s*const explicit = clients\.get\(key\);\s*return explicit && explicit\.alive \? explicit : null;/s);
+  assert.match(main, /const client = key \? selectHudClient\(key\)/);
+});
+
+test('RPC events fan out to every window viewing a client', () => {
+  assert.match(main, /function sendToClientWindows/);
+  assert.match(main, /sendToClientWindows\(client, 'rpc-event'/);
+  assert.match(main, /client\.viewers\.add\(win\)/);
 });

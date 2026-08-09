@@ -87,6 +87,10 @@ const createdSessionFiles = new Set();
 function sendToWindow(win, channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
+function sendToClientWindows(client, channel, payload) {
+  const viewers = client.viewers || new Set(client.ownerWin ? [client.ownerWin] : []);
+  for (const win of viewers) sendToWindow(win, channel, payload);
+}
 function broadcast(channel, payload) {
   for (const win of BrowserWindow.getAllWindows()) sendToWindow(win, channel, payload);
 }
@@ -111,7 +115,7 @@ function spawnClient({ sessionPath, cwd, ownerWin }) {
   const client = {
     key, proc, pending: new Map(), buffer: '', alive: true,
     sessionFile: sessionPath || null, cwd: cwd || HOME,
-    ownerWin, streaming: false, lastUsed: Date.now(), autoCreated: !sessionPath,
+    ownerWin, viewers: new Set(ownerWin ? [ownerWin] : []), streaming: false, lastUsed: Date.now(), autoCreated: !sessionPath,
   };
   clients.set(key, client);
 
@@ -129,7 +133,7 @@ function spawnClient({ sessionPath, cwd, ownerWin }) {
       handleClientMessage(client, obj);
     }
   });
-  proc.stderr.on('data', (d) => sendToWindow(client.ownerWin, 'rpc-stderr', { key: client.key, text: d.toString() }));
+  proc.stderr.on('data', (d) => sendToClientWindows(client, 'rpc-stderr', { key: client.key, text: d.toString() }));
   const onDead = (code, errMsg) => {
     client.alive = false;
     for (const { reject, timer } of client.pending.values()) {
@@ -137,7 +141,7 @@ function spawnClient({ sessionPath, cwd, ownerWin }) {
       reject(new Error(errMsg || ('RPC process exited (' + code + ')')));
     }
     client.pending.clear();
-    sendToWindow(client.ownerWin, 'rpc-exit', { key: client.key, code: code == null ? -1 : code, error: errMsg || null });
+    sendToClientWindows(client, 'rpc-exit', { key: client.key, code: code == null ? -1 : code, error: errMsg || null });
     sendHudEvent(client, { type: 'error', error: errMsg || ('Agent process exited (' + (code == null ? -1 : code) + ')') });
   };
   proc.on('exit', (code) => onDead(code, null));
@@ -156,7 +160,7 @@ function spawnClient({ sessionPath, cwd, ownerWin }) {
               clients.delete(key);
               client.key = client.sessionFile;
               clients.set(client.key, client);
-              sendToWindow(client.ownerWin, 'rpc-key-mapped', { oldKey: key, key: client.key });
+              sendToClientWindows(client, 'rpc-key-mapped', { oldKey: key, key: client.key });
             }
             break;
           }
@@ -196,7 +200,7 @@ function handleClientMessage(client, obj) {
       if (r.success && r.data.sessionFile) createdSessionFiles.add(r.data.sessionFile);
     }).catch(() => {});
   }
-  sendToWindow(client.ownerWin, 'rpc-event', { key: client.key, event: obj });
+  sendToClientWindows(client, 'rpc-event', { key: client.key, event: obj });
   const assistantEvent = (obj.type === 'message_update' || obj.type === 'message_end')
     && (!obj.message || obj.message.role === 'assistant');
   const errorEvent = obj.type === 'error'
@@ -222,15 +226,16 @@ function clientCommand(client, cmd, timeoutMs) {
 }
 
 function getClient(key) {
-  const c = clients.get(key);
-  if (c) c.lastUsed = Date.now();
-  return c;
+  return clients.get(key);
 }
 
 // Ensure a client exists for a session; spawn with --resume if needed.
 function ensureClient({ key, sessionPath, cwd, ownerWin }) {
   const existing = getClient(key) || (sessionPath && getClient(sessionPath));
-  if (existing && existing.alive) return existing;
+  if (existing && existing.alive) {
+    if (ownerWin) existing.viewers.add(ownerWin);
+    return existing;
+  }
   return spawnClient({ sessionPath: sessionPath || (key && key.startsWith('/') ? key : null), cwd, ownerWin });
 }
 
@@ -292,8 +297,6 @@ ipcMain.handle('rpc:command', async (e, { key, cmd }) => {
   try {
     const client = getClient(key);
     if (!client) throw new Error('No agent for this pane (key ' + key + ')');
-    const senderWin = BrowserWindow.fromWebContents(e.sender);
-    if (senderWin) { client.ownerWin = senderWin; lastFocusedMainWin = senderWin; }
     if (cmd.type === 'switch_session' && cmd.sessionPath) {
       try {
         const prep = await prepareTargetSession(cmd.sessionPath);
@@ -306,7 +309,7 @@ ipcMain.handle('rpc:command', async (e, { key, cmd }) => {
       try {
         const st = await clientCommand(client, { type: 'get_state' });
         if (st.success && st.data.isStreaming && st.data.sessionFile) {
-          sendToWindow(client.ownerWin, 'rpc-flush-wait', { key: client.key, sessionFile: st.data.sessionFile });
+          sendToClientWindows(client, 'rpc-flush-wait', { key: client.key, sessionFile: st.data.sessionFile });
           await waitForSessionPersisted(st.data.sessionFile);
         }
       } catch {}
@@ -327,7 +330,7 @@ ipcMain.handle('rpc:activate', async (e, { sessionPath, cwd }) => {
   }
   const client = ensureClient({ sessionPath, cwd, ownerWin: win });
   if (!client) return { ok: false, error: 'failed to spawn agent' };
-  client.ownerWin = win;
+  if (win) client.viewers.add(win);
   client.lastUsed = Date.now();
   if (win) lastFocusedMainWin = win;
   for (let i = 0; i < 60; i++) {
@@ -347,7 +350,7 @@ ipcMain.handle('rpc:touch-client', (e, key) => {
   if (!client) return { ok: false };
   const win = BrowserWindow.fromWebContents(e.sender);
   client.lastUsed = Date.now();
-  if (win) { client.ownerWin = win; lastFocusedMainWin = win; }
+  if (win) { client.viewers.add(win); lastFocusedMainWin = win; }
   return { ok: true };
 });
 
@@ -708,25 +711,29 @@ ipcMain.handle('fs:read-file', (_e, { path: p, maxBytes }) => {
   } catch (err) { return { ok: false, error: String(err) }; }
 });
 
-ipcMain.handle('fs:search', (_e, { root, query, limit }) => {
+ipcMain.handle('fs:search', async (_e, { root, query, limit }) => {
   try {
-    if (typeof root !== 'string' || !root.startsWith(HOME)) throw new Error('outside home');
+    if (typeof root !== 'string') throw new Error('invalid root');
+    const canonicalHome = fs.realpathSync(HOME);
+    const canonicalRoot = fs.realpathSync(root);
+    const fromHome = path.relative(canonicalHome, canonicalRoot);
+    if (fromHome === '..' || fromHome.startsWith('..' + path.sep) || path.isAbsolute(fromHome)) throw new Error('outside home');
     const needle = String(query || '').toLowerCase();
     const cap = Math.min(Math.max(Number(limit) || 40, 1), 100);
     const out = [];
-    const stack = [root];
+    const stack = [canonicalRoot];
     let visited = 0;
-    while (stack.length && out.length < cap && visited < 6000) {
+    while (stack.length && out.length < cap && visited < 2500) {
       const dir = stack.pop();
       let entries;
-      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { continue; }
       for (const entry of entries) {
-        if (++visited > 6000) break;
+        if (++visited > 2500) break;
         if (TREE_SKIP.has(entry.name)) continue;
         if (entry.name.startsWith('.') && entry.isDirectory()) continue;
         const p = path.join(dir, entry.name);
-        if (entry.isDirectory()) stack.push(p);
-        const relative = path.relative(root, p);
+        if (entry.isDirectory() && !entry.isSymbolicLink()) stack.push(p);
+        const relative = path.relative(canonicalRoot, p);
         if (!needle || relative.toLowerCase().includes(needle)) {
           out.push({ name: entry.name, path: p, relative, type: entry.isDirectory() ? 'folder' : 'file' });
           if (out.length >= cap) break;
@@ -834,11 +841,13 @@ function createHud() {
   hudWin.on('blur', () => { if (hudWin && !hudWin.webContents.isDevToolsOpened()) hudWin.hide(); });
 }
 function selectHudClient(key) {
-  const explicit = key && clients.get(key);
-  if (explicit && explicit.alive) return explicit;
+  if (key) {
+    const explicit = clients.get(key);
+    return explicit && explicit.alive ? explicit : null;
+  }
   const available = [...clients.values()].filter((client) => client.alive);
   const focused = lastFocusedMainWin && !lastFocusedMainWin.isDestroyed()
-    ? available.filter((client) => client.ownerWin === lastFocusedMainWin)
+    ? available.filter((client) => client.viewers && client.viewers.has(lastFocusedMainWin))
     : [];
   return (focused.length ? focused : available).sort((a, b) => b.lastUsed - a.lastUsed)[0] || null;
 }
@@ -866,7 +875,7 @@ function toggleHud() {
 ipcMain.handle('hud:hide', () => { if (hudWin) hudWin.hide(); });
 ipcMain.handle('hud:prompt', async (_e, { key, text }) => {
   try {
-    const client = selectHudClient(key) || (hudClient && hudClient.alive ? hudClient : null);
+    const client = key ? selectHudClient(key) : (hudClient && hudClient.alive ? hudClient : selectHudClient(null));
     if (!client) return { ok: false, error: 'no agent running' };
     hudClient = client;
     client.lastUsed = Date.now();
@@ -890,7 +899,9 @@ ipcMain.handle('hud:abort', async () => {
 });
 ipcMain.handle('hud:open-session', () => {
   if (!hudClient) return { ok: false, error: 'no session selected' };
-  const owner = hudClient.ownerWin;
+  const owner = (lastFocusedMainWin && hudClient.viewers && hudClient.viewers.has(lastFocusedMainWin))
+    ? lastFocusedMainWin
+    : [...(hudClient.viewers || [])].find((win) => win && !win.isDestroyed());
   if (owner && !owner.isDestroyed()) {
     if (owner.isMinimized()) owner.restore();
     owner.show();
@@ -916,6 +927,7 @@ function createWindow(sessionQuery) {
   win.on('focus', () => { lastFocusedMainWin = win; });
   win.on('closed', () => {
     wins.delete(win);
+    for (const client of clients.values()) client.viewers && client.viewers.delete(win);
     if (lastFocusedMainWin === win) lastFocusedMainWin = null;
   });
   const file = path.join(__dirname, 'renderer', 'index.html');

@@ -66,6 +66,7 @@ class Pane {
     this.suggestionIndex = 0;
     this.commandCache = null;
     this.suggestionRequest = 0;
+    this.sending = false;
 
     const tpl = $('#pane-template').content.cloneNode(true);
     this.el = tpl.querySelector('.pane');
@@ -135,13 +136,24 @@ class Pane {
     else if (r && !r.cancelled && r.error) this.setBanner('Could not attach: ' + r.error, true);
   }
 
+  attachmentBytes(item) {
+    if (Number.isFinite(item.size)) return item.size;
+    return item.data ? Math.ceil(item.data.length * 3 / 4) : 0;
+  }
+
   addAttachments(items) {
+    let total = this.attachments.reduce((sum, item) => sum + this.attachmentBytes(item), 0);
+    let rejected = false;
     for (const item of items || []) {
       if (!item) continue;
       const key = item.path || `${item.name}:${item.data ? item.data.slice(0, 48) : ''}`;
       if (this.attachments.some((a) => (a.path || `${a.name}:${a.data ? a.data.slice(0, 48) : ''}`) === key)) continue;
+      const bytes = this.attachmentBytes(item);
+      if (this.attachments.length >= 8 || total + bytes > 50 * 1024 * 1024) { rejected = true; continue; }
       this.attachments.push(item);
+      total += bytes;
     }
+    if (rejected) this.setBanner('Attachment limit: 8 files and 50 MB total.', true);
     this.renderAttachments();
   }
 
@@ -161,6 +173,7 @@ class Pane {
 
   fileToImage(file) {
     return new Promise((resolve, reject) => {
+      if (file.size > 25 * 1024 * 1024) { reject(new Error(`${file.name || 'Image'} exceeds the 25 MB limit`)); return; }
       const reader = new FileReader();
       reader.onerror = () => reject(reader.error || new Error('Could not read image'));
       reader.onload = () => resolve({
@@ -175,6 +188,7 @@ class Pane {
     const images = [...(e.clipboardData && e.clipboardData.files || [])].filter((f) => f.type.startsWith('image/'));
     if (!images.length) return;
     e.preventDefault();
+    if (images.length + this.attachments.length > 8) { this.setBanner('A prompt can include at most 8 attachments.', true); return; }
     try { this.addAttachments(await Promise.all(images.map((f) => this.fileToImage(f)))); }
     catch (err) { this.setBanner('Could not paste image: ' + String(err), true); }
   }
@@ -183,11 +197,16 @@ class Pane {
     const files = [...(e.dataTransfer && e.dataTransfer.files || [])];
     if (!files.length) return;
     e.preventDefault(); e.stopPropagation();
+    if (files.length + this.attachments.length > 8) { this.setBanner('A prompt can include at most 8 attachments.', true); return; }
     const images = [];
     const paths = [];
     for (const file of files) {
       if (file.type.startsWith('image/')) images.push(await this.fileToImage(file));
-      else if (file.path) paths.push({ kind: 'file', name: file.name, path: file.path, size: file.size });
+      else {
+        let filePath = null;
+        try { filePath = prime.pathForFile(file); } catch {}
+        if (filePath) paths.push({ kind: 'file', name: file.name, path: filePath, size: file.size });
+      }
     }
     this.addAttachments([...images, ...paths]);
   }
@@ -268,6 +287,7 @@ class Pane {
   }
 
   hideSuggestions() {
+    this.suggestionRequest++;
     this.suggestions = [];
     this.composerPopover.classList.add('hidden');
     this.composerPopover.innerHTML = '';
@@ -289,6 +309,7 @@ class Pane {
 
   handleSuggestionKey(e) {
     if (this.composerPopover.classList.contains('hidden') || !this.suggestions.length) return false;
+    if (!this.currentComposerToken()) { this.hideSuggestions(); return false; }
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
       const delta = e.key === 'ArrowDown' ? 1 : -1;
@@ -325,6 +346,8 @@ class Pane {
   // ---------- activation ----------
   async activate(sessionPath, cwd) {
     this.setBanner(null);
+    this.commandCache = null;
+    this.hideSuggestions();
     const r = await prime.activate({ sessionPath: sessionPath || undefined, cwd: cwd || undefined });
     if (!r.ok) { this.setBanner('Could not start session: ' + (r.error || 'unknown'), true); return false; }
     this.key = r.key;
@@ -412,20 +435,27 @@ class Pane {
   // ---------- sending ----------
   async send() {
     const text = this.inputEl.value.trim();
-    if ((!text && !this.attachments.length) || !this.key) return;
-    this.hideSuggestions();
-    const visibleText = text || 'Attached context';
-    const payload = await this.buildPromptContext(text || 'Review the attached context.');
-    const cmd = { type: 'prompt', message: payload.message };
-    if (payload.images.length) cmd.images = payload.images;
-    if (this.isStreaming) cmd.streamingBehavior = 'steer';
-    else this.addUserBubble(visibleText);
-    const r = await prime.command(this.key, cmd);
-    if (!r.success) { this.setBanner('Prompt rejected: ' + (r.error || 'unknown'), true); return; }
-    this.inputEl.value = '';
-    this.attachments = [];
-    this.renderAttachments();
-    this.autoSize();
+    if (this.sending || (!text && !this.attachments.length) || !this.key) return;
+    this.sending = true;
+    this.sendBtn.disabled = true;
+    try {
+      this.hideSuggestions();
+      const visibleText = text || 'Attached context';
+      const payload = await this.buildPromptContext(text || 'Review the attached context.');
+      const cmd = { type: 'prompt', message: payload.message };
+      if (payload.images.length) cmd.images = payload.images;
+      if (this.isStreaming) cmd.streamingBehavior = 'steer';
+      else this.addUserBubble(visibleText);
+      const r = await prime.command(this.key, cmd);
+      if (!r.success) { this.setBanner('Prompt rejected: ' + (r.error || 'unknown'), true); return; }
+      this.inputEl.value = '';
+      this.attachments = [];
+      this.renderAttachments();
+      this.autoSize();
+    } finally {
+      this.sending = false;
+      this.sendBtn.disabled = false;
+    }
   }
 
   async stop() {

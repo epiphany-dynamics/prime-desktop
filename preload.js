@@ -1,5 +1,5 @@
 // Bridge between sandboxed renderers and the main process.
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 function on(channel, cb) {
   const listener = (_e, payload) => cb(payload);
@@ -37,6 +37,7 @@ contextBridge.exposeInMainWorld('prime', {
   readFile: (p, maxBytes) => ipcRenderer.invoke('fs:read-file', { path: p, maxBytes }),
   searchFiles: (root, query, limit) => ipcRenderer.invoke('fs:search', { root, query, limit }),
   pickAttachments: () => ipcRenderer.invoke('dialog:pick-attachments'),
+  pathForFile: (file) => webUtils.getPathForFile(file),
 
   listSkills: () => ipcRenderer.invoke('skills:list'),
   toggleSkill: (dir, enable) => ipcRenderer.invoke('skills:toggle', { dir, enable }),
