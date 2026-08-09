@@ -23,6 +23,15 @@ contextBridge.exposeInMainWorld('prime', {
   },
   installAgent: () => ipcRenderer.invoke('agent:install'),
 
+  xaiStatus: () => ipcRenderer.invoke('xai:status'),
+  xaiConnect: () => ipcRenderer.invoke('xai:connect'),
+  xaiDisconnect: () => ipcRenderer.invoke('xai:disconnect'),
+  onXaiDeviceCode: (cb) => {
+    const listener = (_e, payload) => cb(payload);
+    ipcRenderer.on('xai-device-code', listener);
+    return () => ipcRenderer.removeListener('xai-device-code', listener);
+  },
+
   readConfig: () => ipcRenderer.invoke('config:read'),
   writeSettings: (patch) => ipcRenderer.invoke('config:write-settings', patch),
   writeModels: (modelsJson) => ipcRenderer.invoke('config:write-models', modelsJson),

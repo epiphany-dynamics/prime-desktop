@@ -457,6 +457,118 @@ function buildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+// ---------- xAI OAuth (device code flow, like Hermes) ----------
+
+const XAI_ISSUER = 'https://auth.x.ai';
+const XAI_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828';
+const XAI_SCOPE = 'openid profile email offline_access grok-cli:access api:access';
+const XAI_CACHE = path.join(PRIME_DIR, 'xai-oauth.json');
+const XAI_BRIDGE = path.join(PRIME_DIR, 'xai-oauth-bridge.py');
+
+const XAI_BRIDGE_SOURCE = `#!/usr/bin/env python3
+# Prints a fresh xAI OAuth access token for prime-agent's models.json apiKey "!cmd" hook.
+import json, os, sys, time, urllib.request, urllib.parse
+CACHE = os.path.expanduser('~/.prime/agent/xai-oauth.json')
+TOKEN_URL = '${XAI_ISSUER}/oauth2/token'
+CLIENT_ID = '${XAI_CLIENT_ID}'
+def main():
+    try:
+        with open(CACHE) as f: data = json.load(f)
+    except Exception: sys.exit(1)
+    tokens = data.get('tokens') or {}
+    if time.time() > data.get('expires_at', 0) - 300:
+        try:
+            body = urllib.parse.urlencode({'grant_type': 'refresh_token', 'client_id': CLIENT_ID,
+                                           'refresh_token': tokens['refresh_token']}).encode()
+            req = urllib.request.Request(TOKEN_URL, data=body,
+                                         headers={'content-type': 'application/x-www-form-urlencoded'})
+            with urllib.request.urlopen(req, timeout=30) as r: nt = json.load(r)
+            tokens.update(nt)
+            data['tokens'] = tokens
+            data['expires_at'] = time.time() + int(nt.get('expires_in', 21600))
+            tmp = CACHE + '.tmp'
+            with open(tmp, 'w') as f: json.dump(data, f)
+            os.chmod(tmp, 0o600); os.replace(tmp, CACHE)
+        except Exception:
+            if time.time() > data.get('expires_at', 0): sys.exit(1)
+    sys.stdout.write(tokens.get('access_token', ''))
+main()
+`;
+
+function xaiPost(urlStr, params) {
+  return fetch(urlStr, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params),
+  }).then((r) => r.json().catch(() => ({})).then((j) => ({ status: r.status, json: j })));
+}
+
+function xaiEnsureOverride() {
+  const modelsJson = readJsonSafe(MODELS_PATH, { providers: {} });
+  if (!modelsJson.providers) modelsJson.providers = {};
+  const prev = modelsJson.providers.xai || {};
+  prev.apiKey = '!python3 ' + XAI_BRIDGE;
+  modelsJson.providers.xai = prev;
+  writeJsonAtomic(MODELS_PATH, modelsJson);
+}
+
+ipcMain.handle('xai:status', () => {
+  try {
+    const data = JSON.parse(fs.readFileSync(XAI_CACHE, 'utf8'));
+    return { connected: true, expiresAt: data.expires_at || 0, email: data.email || null };
+  } catch { return { connected: false }; }
+});
+
+ipcMain.handle('xai:disconnect', () => {
+  try { fs.unlinkSync(XAI_CACHE); } catch {}
+  try {
+    const modelsJson = readJsonSafe(MODELS_PATH, { providers: {} });
+    if (modelsJson.providers && modelsJson.providers.xai) {
+      delete modelsJson.providers.xai.apiKey;
+      if (!Object.keys(modelsJson.providers.xai).length) delete modelsJson.providers.xai;
+      writeJsonAtomic(MODELS_PATH, modelsJson);
+    }
+  } catch {}
+  return { ok: true };
+});
+
+ipcMain.handle('xai:connect', async () => {
+  const dc = await xaiPost(XAI_ISSUER + '/oauth2/device/code', { client_id: XAI_CLIENT_ID, scope: XAI_SCOPE });
+  if (dc.status !== 200 || !dc.json.device_code) {
+    return { ok: false, error: 'xAI device flow failed to start: ' + JSON.stringify(dc.json) };
+  }
+  const d = dc.json;
+  sendToRenderer('xai-device-code', { userCode: d.user_code, verificationUri: d.verification_uri });
+  shell.openExternal(d.verification_uri_complete || d.verification_uri);
+
+  const deadline = Date.now() + (d.expires_in || 900) * 1000;
+  let interval = (d.interval || 5) * 1000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, interval));
+    const t = await xaiPost(XAI_ISSUER + '/oauth2/token', {
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      device_code: d.device_code,
+      client_id: XAI_CLIENT_ID,
+    });
+    if (t.status === 200 && t.json.access_token) {
+      fs.writeFileSync(XAI_BRIDGE, XAI_BRIDGE_SOURCE, { mode: 0o700 });
+      const cache = {
+        tokens: t.json,
+        expires_at: Math.floor(Date.now() / 1000) + (t.json.expires_in || 21600),
+        obtained_at: new Date().toISOString(),
+      };
+      fs.writeFileSync(XAI_CACHE, JSON.stringify(cache, null, 2), { mode: 0o600 });
+      xaiEnsureOverride();
+      return { ok: true };
+    }
+    const err = t.json && t.json.error;
+    if (err === 'authorization_pending') continue;
+    if (err === 'slow_down') { interval += 5000; continue; }
+    return { ok: false, error: 'xAI authorization failed: ' + (err || t.status) };
+  }
+  return { ok: false, error: 'xAI authorization timed out' };
+});
+
 // ---------- IPC ----------
 
 // Upstream quirk: a brand-new session's file is only flushed a few seconds

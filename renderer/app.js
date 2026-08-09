@@ -831,12 +831,28 @@ async function renderProviderList() {
     const info = (cfg.auth || {})[id];
     const row = document.createElement('div');
     row.className = 'provider-row';
-    const status = info
-      ? (info.type === 'api_key' ? `<span class="p-status ok">key saved ${esc(info.masked || '')}</span>` : `<span class="p-status ok">${esc(info.type)}</span>`)
-      : '<span class="p-status">not configured</span>';
+    let status;
+    if (id === 'xai') {
+      const xs = await prime.xaiStatus();
+      if (xs.connected) status = '<span class="p-status ok">connected via xAI subscription (OAuth)</span>';
+    }
+    if (!status) {
+      status = info
+        ? (info.type === 'api_key' ? `<span class="p-status ok">key saved ${esc(info.masked || '')}</span>` : `<span class="p-status ok">${esc(info.type)}</span>`)
+        : '<span class="p-status">not configured</span>';
+    }
     row.innerHTML = `<span class="p-name">${esc(label)}</span>${status}<span class="p-actions"></span>`;
     const actions = row.querySelector('.p-actions');
     if (!info || info.type === 'api_key') {
+      if (id === 'xai') {
+        const xs = await prime.xaiStatus();
+        const oauthBtn = document.createElement('button');
+        oauthBtn.className = 's-btn';
+        oauthBtn.textContent = xs.connected ? 'Disconnect subscription' : 'Connect subscription…';
+        oauthBtn.title = 'Use your xAI/Grok subscription via browser sign-in (like Hermes)';
+        oauthBtn.onclick = () => xs.connected ? disconnectXai() : connectXai();
+        actions.appendChild(oauthBtn);
+      }
       const addModelBtn = document.createElement('button');
       addModelBtn.className = 's-btn';
       addModelBtn.textContent = 'Add model…';
@@ -1004,6 +1020,37 @@ function openCustomForm(editId, existing, isBuiltinExtension) {
     if (r.ok) { markSettingsDirty(); form.classList.add('hidden'); renderCustomList(); }
     else setBanner('Save failed: ' + r.error, true);
   };
+}
+
+// --- xAI OAuth (device code flow) ---
+async function connectXai() {
+  const log = openProgressModal('Connect xAI subscription');
+  log.textContent = 'Requesting device code from xAI…\n';
+  const off = prime.onXaiDeviceCode(({ userCode, verificationUri }) => {
+    log.textContent = 'Your browser was opened to ' + verificationUri + '\n\nEnter this code:  ' + userCode + '\n\nWaiting for authorization…';
+  });
+  const r = await prime.xaiConnect();
+  off();
+  const actions = $('#modal-actions');
+  const close = document.createElement('button');
+  close.className = r.ok ? 'primary' : 'secondary';
+  close.textContent = 'Close';
+  close.onclick = () => $('#modal-backdrop').classList.add('hidden');
+  actions.appendChild(close);
+  if (r.ok) {
+    log.textContent += '\nConnected. Grok models on your xAI subscription are now available.';
+    markSettingsDirty();
+    renderProviderList();
+  } else {
+    log.textContent += '\nFailed: ' + (r.error || 'unknown');
+  }
+}
+
+async function disconnectXai() {
+  if (!confirm('Disconnect the xAI subscription from Prime Agent?')) return;
+  await prime.xaiDisconnect();
+  markSettingsDirty();
+  renderProviderList();
 }
 
 // --- Defaults tab ---
