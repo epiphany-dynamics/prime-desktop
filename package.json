@@ -1,0 +1,41 @@
+{
+  "name": "prime-desktop",
+  "version": "0.3.0",
+  "description": "Desktop app for Prime Agent - Electron shell over prime-agent RPC mode",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "SMOKE_TEST=1 electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --mac"
+  },
+  "dependencies": {
+    "dompurify": "^3.2.4",
+    "marked": "^15.0.6"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "ai.primeintellect.prime-desktop",
+    "productName": "Prime Agent",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "node_modules/marked/**/*",
+      "node_modules/dompurify/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "target": [
+        "dir"
+      ]
+    }
+  }
+}

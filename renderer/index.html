@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;" />
+  <title>Prime Agent</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div class="sidebar-top">
+        <div class="brand">
+          <div class="brand-mark"><img src="assets/prime-butterfly.svg" alt="Prime" /></div>
+          <div class="brand-name">Prime Agent</div>
+        </div>
+        <button id="new-chat-btn" title="New session (Cmd+N)">+ New chat</button>
+      </div>
+      <div class="sidebar-search">
+        <input id="session-filter" type="text" placeholder="Filter sessions…" spellcheck="false" />
+      </div>
+      <div id="session-list"></div>
+      <div class="sidebar-bottom">
+        <div class="sidebar-bottom-row">
+          <button id="cwd-btn" class="ghost-btn" title="Working directory for new sessions">…</button>
+          <button id="settings-btn" class="ghost-btn settings-gear" title="Settings (⌘,)">⚙ Settings</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main column -->
+    <main id="main">
+      <header id="topbar">
+        <div class="topbar-left">
+          <span id="session-title">New session</span>
+        </div>
+        <div class="topbar-right">
+          <div id="thinking-picker" class="picker" title="Thinking level">
+            <button id="thinking-btn" class="picker-btn">thinking: max ▾</button>
+            <div id="thinking-menu" class="picker-menu hidden"></div>
+          </div>
+          <div id="model-picker" class="picker" title="Model">
+            <button id="model-btn" class="picker-btn">loading models… ▾</button>
+            <div id="model-menu" class="picker-menu hidden">
+              <input id="model-filter" type="text" placeholder="Search models…" spellcheck="false" />
+              <div id="model-list"></div>
+            </div>
+          </div>
+          <span id="context-meter" title="Context window usage"></span>
+        </div>
+      </header>
+
+      <div id="status-banner" class="hidden"></div>
+
+      <div id="chat-scroll">
+        <div id="chat"></div>
+        <div id="empty-state">
+          <div class="empty-mark"><img src="assets/prime-butterfly.svg" alt="Prime" /></div>
+          <h2>Prime Agent</h2>
+          <p>Ask anything, or pick a session from the sidebar.</p>
+        </div>
+      </div>
+
+      <footer id="composer">
+        <div id="queue-hint" class="hidden"></div>
+        <div class="composer-row">
+          <textarea id="input" rows="1" placeholder="Message Prime Agent…  (Enter to send, Shift+Enter for newline)"></textarea>
+          <button id="stop-btn" class="hidden" title="Stop generation">■</button>
+          <button id="send-btn" title="Send">➤</button>
+        </div>
+        <div class="composer-meta">
+          <span id="cwd-label"></span>
+          <span id="agent-state"></span>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Settings panel -->
+  <div id="settings-backdrop" class="hidden">
+    <div id="settings-panel">
+      <div id="settings-head">
+        <span>Settings</span>
+        <button id="settings-close" title="Close">✕</button>
+      </div>
+      <div id="settings-tabs">
+        <button class="stab active" data-tab="providers">Providers</button>
+        <button class="stab" data-tab="custom">Custom Providers</button>
+        <button class="stab" data-tab="defaults">Defaults</button>
+      </div>
+      <div id="settings-body">
+        <div class="stab-page" data-page="providers">
+          <p class="s-help">API keys unlock each provider's built-in model catalog. Keys are stored in
+          <code>~/.prime/agent/auth.json</code> (never displayed after saving).</p>
+          <div id="provider-list"></div>
+        </div>
+        <div class="stab-page hidden" data-page="custom">
+          <p class="s-help">Add OpenAI/Anthropic/Google-compatible endpoints (Ollama, LM Studio, vLLM, proxies) — or use a
+          built-in provider's ID (e.g. <code>minimax</code>) to add missing models to its catalog.
+          Stored in <code>~/.prime/agent/models.json</code>.</p>
+          <div id="custom-list"></div>
+          <button id="add-provider-btn" class="s-btn">+ Add custom provider</button>
+          <div id="custom-form" class="hidden"></div>
+        </div>
+        <div class="stab-page hidden" data-page="defaults">
+          <p class="s-help">New sessions start with these. Stored in <code>~/.prime/agent/settings.json</code>.</p>
+          <div class="s-field"><label>Default model</label><select id="default-model-select"></select></div>
+          <div class="s-field"><label>Default thinking level</label><select id="default-thinking-select">
+            <option>off</option><option>minimal</option><option>low</option>
+            <option>medium</option><option>high</option><option>xhigh</option><option>max</option>
+          </select></div>
+          <button id="save-defaults-btn" class="s-btn primary">Save defaults</button>
+        </div>
+      </div>
+      <div id="settings-foot" class="hidden">
+        <span>Restart the agent to apply provider changes.</span>
+        <button id="settings-restart" class="s-btn primary">Restart agent</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Extension dialog modal -->
+  <div id="modal-backdrop" class="hidden">
+    <div id="modal">
+      <div id="modal-title"></div>
+      <div id="modal-body"></div>
+      <div id="modal-actions"></div>
+    </div>
+  </div>
+
+  <script src="../node_modules/marked/marked.min.js"></script>
+  <script src="../node_modules/dompurify/dist/purify.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
