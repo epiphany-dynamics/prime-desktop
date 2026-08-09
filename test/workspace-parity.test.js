@@ -8,23 +8,25 @@ const html = read('renderer/index.html');
 const app = read('renderer/app.js');
 const main = read('main.js');
 const preload = read('preload.js');
+const attachment = read('lib/attachment-service.js');
+const workspace = read('lib/workspace-service.js');
 
-test('composer exposes attachments and inline slash/@ references', () => {
+test('composer exposes pane-scoped attachments and inline slash/@ references', () => {
   assert.match(html, /class="attach-btn"/);
   assert.match(html, /class="attachment-strip/);
   assert.match(html, /class="composer-popover/);
   assert.match(app, /type: 'get_commands'/);
-  assert.match(app, /prime\.searchFiles/);
-  assert.match(app, /<referenced_session/);
-  assert.match(app, /cmd\.images = payload\.images/);
-  assert.match(main, /dialog:pick-attachments/);
+  assert.match(app, /prime\.searchWorkspace/);
+  assert.match(app, /prime\.addSessionAttachment/);
+  assert.match(attachment, /command\.images = images\.map/);
+  assert.match(main, /secureHandle\('attachments:pick'/);
   assert.match(preload, /pickAttachments/);
 });
 
 test('workspace supports folder selection and drag-to-split sessions', () => {
   assert.match(html, /id="new-folder-chat-btn"/);
   assert.match(html, /class="picker-btn pane-folder"/);
-  assert.match(main, /Open Folder….*CmdOrCtrl\+O/);
+  assert.match(main, /Open Project….*CmdOrCtrl\+O/);
   assert.match(app, /application\/x-prime-session/);
   assert.match(app, /handlePaneDrop/);
   assert.match(app, /splitWithSession\(sessionPath\)/);
@@ -43,12 +45,12 @@ test('schedules and heartbeat rows consume current RPC shapes', () => {
   assert.match(app, /job\.nextRunAt/);
 });
 
-
-test('async suggestion invalidation, Electron file paths, and safe search are wired', () => {
+test('async suggestion invalidation, Electron file paths, and bounded safe search are wired', () => {
   assert.match(app, /hideSuggestions\(\) \{\s*this\.suggestionRequest\+\+/s);
   assert.match(preload, /webUtils\.getPathForFile/);
-  assert.match(main, /fs\.promises\.readdir/);
-  assert.match(main, /path\.relative\(canonicalHome, canonicalRoot\)/);
-  const searchHandler = main.slice(main.indexOf("ipcMain.handle('fs:search'"), main.indexOf('const IMAGE_MIME'));
-  assert.doesNotMatch(searchHandler, /readdirSync/);
+  assert.match(workspace, /await fsp\.readdir/);
+  assert.match(workspace, /isWithin\(this\.current\.root, real\)/);
+  assert.match(workspace, /visited < 2_500/);
+  assert.match(workspace, /Math\.min\(Number\(request\.limit\) \|\| 40, 100\)/);
+  assert.doesNotMatch(workspace, /readdirSync/);
 });

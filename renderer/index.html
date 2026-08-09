@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none';" />
   <title>Prime Agent</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -16,7 +16,7 @@
         </div>
         <div class="new-chat-row">
           <button id="new-chat-btn" title="New session (Cmd+N)">+ New chat</button>
-          <button id="new-folder-chat-btn" title="New chat in folder (Cmd+O)">⌁</button>
+          <button id="new-folder-chat-btn" title="Choose project (Cmd+O)" aria-haspopup="dialog">⌘</button>
         </div>
       </div>
       <div class="sidebar-nav">
@@ -43,10 +43,24 @@
     <aside id="tree-panel" class="hidden">
       <div id="tree-head">
         <span id="tree-root-label" title="">Files</span>
-        <button id="tree-close" title="Close">✕</button>
+        <span class="tree-head-actions">
+          <button id="tree-refresh" title="Refresh project files" aria-label="Refresh project files">↻</button>
+          <button id="tree-close" title="Close">✕</button>
+        </span>
       </div>
       <div id="tree-body"></div>
     </aside>
+  </div>
+
+  <!-- Dedicated pane-aware project chooser -->
+  <div id="project-surface" class="hidden" role="dialog" aria-modal="false" aria-labelledby="project-surface-title">
+    <div class="project-surface-head">
+      <div><strong id="project-surface-title">Projects &amp; Worktrees</strong><small>Opening a project creates a new cwd-bound chat in the focused pane.</small></div>
+      <button id="project-surface-close" title="Close project chooser" aria-label="Close">✕</button>
+    </div>
+    <div id="project-choice-error" class="attachment-error hidden" role="alert"></div>
+    <div id="project-choice-list"></div>
+    <button id="choose-folder-btn" class="choose-folder-btn">Choose Folder… <span>⌘O</span></button>
   </div>
 
   <!-- Pane template -->
@@ -70,7 +84,7 @@
             </div>
           </div>
           <span class="context-meter" title="Context window usage"></span>
-          <button class="picker-btn pane-folder" title="Start a new chat in a folder">⌁</button>
+          <button class="picker-btn pane-folder" title="Choose project (Cmd+O)" aria-haspopup="dialog" aria-expanded="false">Choose project</button>
           <button class="picker-btn pane-popout" title="Open this session in a new window">⧉</button>
           <button class="picker-btn pane-close hidden" title="Close pane">✕</button>
         </div>
@@ -86,7 +100,8 @@
       </div>
       <footer class="composer">
         <div class="queue-hint hidden"></div>
-        <div class="attachment-strip hidden"></div>
+        <div class="attachment-error hidden" role="alert"></div>
+        <div class="attachment-strip hidden" aria-label="Message attachments"></div>
         <div class="composer-popover hidden" role="listbox"></div>
         <div class="composer-row">
           <button class="attach-btn" title="Attach files or images">＋</button>
@@ -220,6 +235,7 @@
 
   <script src="../node_modules/marked/marked.min.js"></script>
   <script src="../node_modules/dompurify/dist/purify.min.js"></script>
+  <script src="draft-state.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

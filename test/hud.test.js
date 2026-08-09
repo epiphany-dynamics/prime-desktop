@@ -19,12 +19,12 @@ test('HUD binds to an alive client from the focused window before global recency
 });
 
 test('HUD receives only bound-client assistant lifecycle and error events', () => {
-  assert.match(main, /client !== hudClient/);
+  assert.match(main, /if \(!hudWin \|\| hudWin\.isDestroyed\(\) \|\| client !== hudClient\) return/);
   assert.match(main, /obj\.type === 'message_update'/);
   assert.match(main, /obj\.type === 'message_end'/);
   assert.match(main, /obj\.type === 'agent_end'/);
   assert.match(main, /assistantMessageEvent\.type === 'error'/);
-  assert.match(preload, /onHudEvent: \(cb\) => on\('hud-event', cb\)/);
+  assert.match(preload, /onHudEvent: \(callback\) => on\('hud-event', callback\)/);
   assert.match(js, /prime\.onHudEvent/);
   assert.match(js, /assistantText\(event\.message\)/);
 });
@@ -35,8 +35,8 @@ test('HUD keeps output visible and exposes stop and full-session actions', () =>
   assert.match(html, /id="abort"/);
   assert.match(preload, /hudAbort: \(\) => ipcRenderer\.invoke\('hud:abort'\)/);
   assert.match(preload, /hudOpenSession: \(\) => ipcRenderer\.invoke\('hud:open-session'\)/);
-  assert.match(main, /ipcMain\.handle\('hud:abort'/);
-  assert.match(main, /ipcMain\.handle\('hud:open-session'/);
+  assert.match(main, /secureHandle\('hud:abort'/);
+  assert.match(main, /secureHandle\('hud:open-session'/);
 
   const sendBody = js.match(/async function send\(\) \{([\s\S]*?)\n\}/);
   assert.ok(sendBody);
@@ -52,5 +52,6 @@ test('HUD never falls back when an explicit bound session is dead', () => {
 test('RPC events fan out to every window viewing a client', () => {
   assert.match(main, /function sendToClientWindows/);
   assert.match(main, /sendToClientWindows\(client, 'rpc-event'/);
-  assert.match(main, /client\.viewers\.add\(win\)/);
+  assert.match(main, /refreshClientViewers\(client\)/);
+  assert.match(main, /viewers\.add\(context\.ownerWin\)/);
 });

@@ -1,5 +1,5 @@
 // Prime Desktop renderer v0.6 — multi-pane, multi-process sessions.
-/* global prime, marked, DOMPurify */
+/* global prime, marked, DOMPurify, PrimeDraftState */
 
 marked.setOptions({ breaks: false, gfm: true });
 
@@ -24,6 +24,44 @@ function relTime(ts) {
   return new Date(ts).toLocaleDateString();
 }
 function baseName(p) { return p ? p.replace(/\/+$/, '').split('/').pop() : ''; }
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return value + ' B';
+  if (value < 1024 * 1024) return (value / 1024).toFixed(value < 10240 ? 1 : 0) + ' KB';
+  return (value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0) + ' MB';
+}
+const FILE_TRANSPORT_START = '[Prime Desktop local files:v1]';
+const FILE_TRANSPORT_END = '[/Prime Desktop local files]';
+function parseLocalFileTransport(input) {
+  const text = String(input || '');
+  const start = text.lastIndexOf('\n' + FILE_TRANSPORT_START + '\n');
+  const index = start >= 0 ? start + 1 : (text.startsWith(FILE_TRANSPORT_START + '\n') ? 0 : -1);
+  if (index < 0) return { text, files: [] };
+  const closing = '\n' + FILE_TRANSPORT_END;
+  const end = text.indexOf(closing, index);
+  if (end < 0) return { text, files: [] };
+  const lines = text.slice(index, end + closing.length).split('\n');
+  if (lines.length !== 4 || lines[0] !== FILE_TRANSPORT_START || lines[1] !== 'Attached local files — use file tools to inspect:' || lines[3] !== FILE_TRANSPORT_END) return { text, files: [] };
+  let records;
+  try { records = JSON.parse(lines[2]); } catch { return { text, files: [] }; }
+  if (!Array.isArray(records) || !records.length || records.length > 20) return { text, files: [] };
+  const valid = records.every((record) => {
+    if (!record || Object.getPrototypeOf(record) !== Object.prototype || !['workspace', 'external'].includes(record.scope)) return false;
+    if (Object.keys(record).sort().join(',') !== 'name,path,scope,size,type') return false;
+    if (typeof record.path !== 'string' || !record.path || record.path.length > 4096 || /[\u0000\r\n]/.test(record.path)) return false;
+    const normalized = record.path.replace(/\\/g, '/');
+    if (record.scope === 'workspace' && (normalized.startsWith('/') || normalized.split('/').includes('..'))) return false;
+    if (record.scope === 'external' && !normalized.startsWith('~/') && !normalized.startsWith('/')) return false;
+    return typeof record.name === 'string' && record.name.length > 0 && record.name.length <= 255 && !/[\u0000-\u001f\u007f]/.test(record.name)
+      && typeof record.type === 'string' && record.type.length > 0 && record.type.length <= 120 && !/[\u0000\r\n]/.test(record.type)
+      && Number.isSafeInteger(record.size) && record.size >= 0;
+  });
+  if (!valid) return { text, files: [] };
+  return {
+    text: (text.slice(0, index) + text.slice(end + closing.length)).trim(),
+    files: records.map((record) => ({ kind: 'file', name: record.name, mimeType: record.type, size: record.size, external: record.scope === 'external' })),
+  };
+}
 function extractText(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -53,15 +91,17 @@ class Pane {
   constructor(index) {
     this.index = index;
     this.key = null;            // client key (sessionFile once mapped)
+    this.paneId = null;         // opaque main-issued pane/draft scope
     this.sessionFile = null;
     this.cwd = null;
+    this.workspace = { selected: false, generation: 0 };
+    this.draftState = new PrimeDraftState.DraftState();
     this.model = null;
     this.thinkingLevel = null;
     this.isStreaming = false;
     this.stream = null;
     this.toolCards = new Map();
     this.ready = false;
-    this.attachments = [];
     this.suggestions = [];
     this.suggestionIndex = 0;
     this.commandCache = null;
@@ -80,6 +120,7 @@ class Pane {
     this.inputEl = $('.input', this.el);
     this.attachBtn = $('.attach-btn', this.el);
     this.attachmentStrip = $('.attachment-strip', this.el);
+    this.attachmentError = $('.attachment-error', this.el);
     this.composerPopover = $('.composer-popover', this.el);
     this.sendBtn = $('.send-btn', this.el);
     this.stopBtn = $('.stop-btn', this.el);
@@ -100,7 +141,7 @@ class Pane {
     this.el.addEventListener('dragover', (e) => this.handlePaneDragOver(e));
     this.el.addEventListener('dragleave', (e) => { if (!this.el.contains(e.relatedTarget)) this.el.classList.remove('drag-target'); });
     this.el.addEventListener('drop', (e) => this.handlePaneDrop(e));
-    this.inputEl.addEventListener('input', () => { this.autoSize(); this.updateSuggestions(); });
+    this.inputEl.addEventListener('input', () => { this.autoSize(); this.updateComposer(); this.updateSuggestions(); });
     this.inputEl.addEventListener('paste', (e) => this.handlePaste(e));
     this.inputEl.addEventListener('dragover', (e) => { if (e.dataTransfer && e.dataTransfer.files.length) e.preventDefault(); });
     this.inputEl.addEventListener('drop', (e) => this.handleFileDrop(e));
@@ -109,7 +150,7 @@ class Pane {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.send(); }
     });
     this.attachBtn.onclick = () => this.pickAttachments();
-    this.folderBtn.onclick = () => this.chooseFolder();
+    this.folderBtn.onclick = () => openProjectSurface(this);
     this.sendBtn.onclick = () => this.send();
     this.stopBtn.onclick = () => this.stop();
     this.modelBtn.onclick = async () => {
@@ -125,90 +166,96 @@ class Pane {
   }
 
   // ---------- composer context / workspace interactions ----------
-  async chooseFolder() {
-    const dir = await prime.pickDirectory();
-    if (dir) await this.newChat(dir);
+  async chooseFolder() { return openProjectSurface(this); }
+
+  setAttachmentError(message) {
+    this.attachmentError.textContent = message || '';
+    this.attachmentError.classList.toggle('hidden', !message);
+  }
+
+  async applyIngest(receipt, promise) {
+    let response;
+    try { response = await promise; }
+    catch { response = { error: 'That attachment could not be added' }; }
+    if (!this.draftState.applyIngest(receipt, response)) return false;
+    this.renderAttachments();
+    return !!(response && response.ok);
   }
 
   async pickAttachments() {
-    const r = await prime.pickAttachments();
-    if (r && r.ok) this.addAttachments(r.attachments || []);
-    else if (r && !r.cancelled && r.error) this.setBanner('Could not attach: ' + r.error, true);
-  }
-
-  attachmentBytes(item) {
-    if (Number.isFinite(item.size)) return item.size;
-    return item.data ? Math.ceil(item.data.length * 3 / 4) : 0;
-  }
-
-  addAttachments(items) {
-    let total = this.attachments.reduce((sum, item) => sum + this.attachmentBytes(item), 0);
-    let rejected = false;
-    for (const item of items || []) {
-      if (!item) continue;
-      const key = item.path || `${item.name}:${item.data ? item.data.slice(0, 48) : ''}`;
-      if (this.attachments.some((a) => (a.path || `${a.name}:${a.data ? a.data.slice(0, 48) : ''}`) === key)) continue;
-      const bytes = this.attachmentBytes(item);
-      if (this.attachments.length >= 8 || total + bytes > 50 * 1024 * 1024) { rejected = true; continue; }
-      this.attachments.push(item);
-      total += bytes;
-    }
-    if (rejected) this.setBanner('Attachment limit: 8 files and 50 MB total.', true);
-    this.renderAttachments();
+    if (!this.key || !this.paneId || !this.draftState.id || this.draftState.sending) return;
+    this.setAttachmentError(null);
+    const receipt = this.draftState.beginIngest();
+    await this.applyIngest(receipt, prime.pickAttachments(this.key, this.paneId, receipt.draftId));
   }
 
   renderAttachments() {
+    const snapshot = this.draftState.snapshot();
     const host = this.attachmentStrip;
     host.innerHTML = '';
-    host.classList.toggle('hidden', this.attachments.length === 0);
-    this.attachments.forEach((item, index) => {
+    host.classList.toggle('hidden', snapshot.items.length === 0);
+    for (const item of snapshot.items) {
       const chip = document.createElement('div');
-      chip.className = 'attachment-chip';
-      const icon = item.kind === 'image' ? '▧' : item.kind === 'session' ? '◫' : item.kind === 'folder' ? '▱' : '▤';
-      chip.innerHTML = `<b>${icon}</b><span title="${esc(item.path || item.name)}">${esc(item.name || baseName(item.path))}</span><button title="Remove">×</button>`;
-      chip.querySelector('button').onclick = () => { this.attachments.splice(index, 1); this.renderAttachments(); };
+      chip.className = `attachment-chip ${item.kind}${item.external ? ' external' : ''}`;
+      const visual = item.kind === 'image' && item.previewDataUrl
+        ? `<img src="${esc(item.previewDataUrl)}" alt="" />`
+        : `<b class="attachment-file-icon">${item.kind === 'image' ? 'IMG' : item.kind === 'session' ? 'CHAT' : item.kind === 'folder' ? 'DIR' : 'DOC'}</b>`;
+      chip.innerHTML = `${visual}<span class="attachment-chip-copy"><strong>${esc(item.name)}</strong><small>${esc(item.mimeType || item.kind)} · ${formatBytes(item.size)}${item.external ? ' · External' : ''}</small></span><button class="attachment-remove" aria-label="Remove ${esc(item.name)}" title="Remove attachment">✕</button>`;
+      chip.querySelector('.attachment-remove').onclick = async () => {
+        const response = await prime.removeAttachment(this.key, this.paneId, this.draftState.id, item.id);
+        if (response.ok && response.draft) {
+          this.draftState.reset(response.draft);
+          this.renderAttachments();
+          this.inputEl.focus();
+        } else this.setAttachmentError(response.error || 'That attachment could not be removed');
+      };
       host.appendChild(chip);
-    });
+    }
+    this.setAttachmentError(snapshot.error);
+    this.updateComposer();
   }
 
-  fileToImage(file) {
-    return new Promise((resolve, reject) => {
-      if (file.size > 25 * 1024 * 1024) { reject(new Error(`${file.name || 'Image'} exceeds the 25 MB limit`)); return; }
-      const reader = new FileReader();
-      reader.onerror = () => reject(reader.error || new Error('Could not read image'));
-      reader.onload = () => resolve({
-        kind: 'image', name: file.name || 'pasted-image.png', mimeType: file.type || 'image/png',
-        data: String(reader.result || '').split(',')[1] || '',
-      });
-      reader.readAsDataURL(file);
-    });
-  }
-
-  async handlePaste(e) {
-    const images = [...(e.clipboardData && e.clipboardData.files || [])].filter((f) => f.type.startsWith('image/'));
-    if (!images.length) return;
-    e.preventDefault();
-    if (images.length + this.attachments.length > 8) { this.setBanner('A prompt can include at most 8 attachments.', true); return; }
-    try { this.addAttachments(await Promise.all(images.map((f) => this.fileToImage(f)))); }
-    catch (err) { this.setBanner('Could not paste image: ' + String(err), true); }
-  }
-
-  async handleFileDrop(e) {
-    const files = [...(e.dataTransfer && e.dataTransfer.files || [])];
-    if (!files.length) return;
-    e.preventDefault(); e.stopPropagation();
-    if (files.length + this.attachments.length > 8) { this.setBanner('A prompt can include at most 8 attachments.', true); return; }
-    const images = [];
-    const paths = [];
-    for (const file of files) {
-      if (file.type.startsWith('image/')) images.push(await this.fileToImage(file));
-      else {
-        let filePath = null;
-        try { filePath = prime.pathForFile(file); } catch {}
-        if (filePath) paths.push({ kind: 'file', name: file.name, path: filePath, size: file.size });
+  async handlePaste(event) {
+    const items = [...((event.clipboardData && event.clipboardData.items) || [])];
+    const images = items.filter((item) => item.kind === 'file' && /^image\//i.test(item.type || ''));
+    if (!images.length || !this.draftState.id) return;
+    event.preventDefault();
+    this.setAttachmentError(null);
+    for (const imageItem of images.slice(0, 6)) {
+      const file = imageItem.getAsFile();
+      if (!file) { this.setAttachmentError('The pasted image could not be read'); continue; }
+      if (file.size > 20_000_000) { this.setAttachmentError('Images must be 20 MB or smaller'); continue; }
+      const receipt = this.draftState.beginIngest();
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        await this.applyIngest(receipt, prime.pasteImage(this.key, this.paneId, receipt.draftId, bytes, file.name || 'Pasted image'));
+      } catch {
+        this.draftState.applyIngest(receipt, { error: 'The pasted image could not be read' });
+        this.renderAttachments();
       }
     }
-    this.addAttachments([...images, ...paths]);
+  }
+
+  async handleFileDrop(event) {
+    const files = [...((event.dataTransfer && event.dataTransfer.files) || [])];
+    if (!files.length || !this.draftState.id) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.setAttachmentError(null);
+    const receipt = this.draftState.beginIngest();
+    await this.applyIngest(receipt, prime.dropAttachments(this.key, this.paneId, receipt.draftId, files));
+  }
+
+  async addTreeAttachment(nodeId) {
+    if (!this.draftState.id) return false;
+    const receipt = this.draftState.beginIngest();
+    return this.applyIngest(receipt, prime.addTreeAttachment(this.key, this.paneId, receipt.draftId, nodeId));
+  }
+
+  async addSessionAttachment(session) {
+    if (!session || !this.draftState.id) return false;
+    const receipt = this.draftState.beginIngest();
+    return this.applyIngest(receipt, prime.addSessionAttachment(this.key, this.paneId, receipt.draftId, session.path, session.name || session.preview || session.id));
   }
 
   handlePaneDragOver(e) {
@@ -250,19 +297,24 @@ class Pane {
         .map((c) => ({ type: 'command', label: '/' + c.name, description: c.description || c.source || '', value: '/' + c.name + ' ' }));
     } else {
       const query = token.value.slice(1).toLowerCase();
-      const sessions = G.sessions.filter((s) => {
-        const label = s.name || s.preview || s.id || '';
+      const sessions = G.sessions.filter((session) => {
+        const label = session.name || session.preview || session.id || '';
         return !query || label.toLowerCase().includes(query);
-      }).slice(0, 12).map((s) => ({
-        type: 'session', label: '@' + (s.name || s.preview || s.id.slice(0, 8)), description: 'session',
-        value: '@' + (s.name || s.id.slice(0, 8)), attachment: { kind: 'session', name: s.name || s.preview || s.id.slice(0, 8), path: s.path },
+      }).slice(0, 12).map((session) => ({
+        type: 'session', label: '@' + (session.name || session.preview || session.id.slice(0, 8)), description: 'session',
+        value: '@' + (session.name || session.id.slice(0, 8)), attachment: { kind: 'session', session },
       }));
       let files = [];
-      if (this.cwd) {
-        const r = await prime.searchFiles(this.cwd, query, 40);
-        if (r.ok) files = (r.entries || []).map((f) => ({
-          type: f.type, label: '@' + f.relative, description: f.type,
-          value: '@' + f.relative, attachment: { kind: f.type, name: f.name, path: f.path, relative: f.relative },
+      if (this.workspace.selected) {
+        const response = await prime.searchWorkspace(this.key, this.paneId, {
+          workspaceId: this.workspace.workspaceId,
+          generation: this.workspace.generation,
+          query,
+          limit: 40,
+        });
+        if (response.ok) files = (response.entries || []).map((entry) => ({
+          type: entry.type, label: '@' + entry.relativePath, description: entry.type,
+          value: '@' + entry.relativePath, attachment: { kind: entry.type, nodeId: entry.nodeId, name: entry.name },
         }));
       }
       options = [...sessions, ...files].slice(0, 50);
@@ -301,7 +353,10 @@ class Pane {
     this.inputEl.value = text.slice(0, token.start) + option.value + text.slice(token.end);
     const cursor = token.start + option.value.length;
     this.inputEl.setSelectionRange(cursor, cursor);
-    if (option.attachment) this.addAttachments([option.attachment]);
+    if (option.attachment) {
+      if (option.attachment.kind === 'session') void this.addSessionAttachment(option.attachment.session);
+      else if (option.attachment.nodeId) void this.addTreeAttachment(option.attachment.nodeId);
+    }
     this.hideSuggestions();
     this.autoSize();
     this.inputEl.focus();
@@ -322,47 +377,40 @@ class Pane {
     return false;
   }
 
-  async buildPromptContext(text) {
-    let message = text;
-    const images = [];
-    for (const item of this.attachments) {
-      if (item.kind === 'image') {
-        images.push({ type: 'image', data: item.data, mimeType: item.mimeType });
-      } else if (item.kind === 'file') {
-        const r = await prime.readFile(item.path, 300000);
-        if (r.ok) message += `\n\n<attached_file path="${item.path}">\n${r.text}${r.truncated ? '\n[truncated]' : ''}\n</attached_file>`;
-        else message += `\n\nAttached file available at: ${item.path}`;
-      } else if (item.kind === 'folder') {
-        message += `\n\nReferenced folder: ${item.path}`;
-      } else if (item.kind === 'session') {
-        const r = await prime.sessionTail(item.path, 30);
-        const transcript = r.ok ? (r.messages || []).map((m) => `${m.role}: ${m.text}`).join('\n') : '';
-        message += `\n\n<referenced_session path="${item.path}">\n${transcript}\n</referenced_session>`;
-      }
-    }
-    return { message, images };
-  }
-
   // ---------- activation ----------
-  async activate(sessionPath, cwd) {
-    this.setBanner(null);
-    this.commandCache = null;
-    this.hideSuggestions();
-    const r = await prime.activate({ sessionPath: sessionPath || undefined, cwd: cwd || undefined });
-    if (!r.ok) { this.setBanner('Could not start session: ' + (r.error || 'unknown'), true); return false; }
-    this.key = r.key;
-    this.sessionFile = r.sessionFile || sessionPath || null;
+  async applyActivation(response, sessionPath) {
+    this.key = response.key;
+    this.paneId = response.paneId;
+    this.sessionFile = response.sessionFile || sessionPath || null;
+    this.workspace = response.workspace || { selected: false, generation: 0 };
+    this.cwd = this.workspace.selected ? this.workspace.cwd : null;
+    this.draftState.reset(response.draft || null);
+    this.renderAttachments();
     await this.syncState();
-    const msgs = await prime.command(this.key, { type: 'get_messages' });
-    if (msgs.success) this.renderHistory(msgs.data.messages, { dropInFlight: this.isStreaming });
+    const messages = await prime.command(this.key, { type: 'get_messages' });
+    if (messages.success) this.renderHistory(messages.data.messages, { dropInFlight: this.isStreaming });
     this.ready = true;
     renderSidebar();
+    if (treeVisible && G.focused === this) await renderTreeRoot();
     return true;
   }
 
-  async newChat(cwd) {
-    // Fresh agent process on a brand-new session
-    return this.activate(null, cwd || this.cwd);
+  async activate(sessionPath) {
+    this.setBanner(null);
+    this.commandCache = null;
+    this.hideSuggestions();
+    const response = await prime.activate({
+      sessionPath: sessionPath || undefined,
+      paneId: this.paneId || undefined,
+      sourceKey: this.key || undefined,
+    });
+    if (!response.ok) { this.setBanner('Could not start session: ' + (response.error || 'unknown'), true); return false; }
+    return this.applyActivation(response, sessionPath);
+  }
+
+  async newChat() {
+    if (!this.workspace.selected) { await openProjectSurface(this); return false; }
+    return this.activate(null);
   }
 
   async syncState() {
@@ -384,21 +432,20 @@ class Pane {
   }
 
   async refreshGitPill() {
-    const s = G.sessions.find((x) => x.path === this.sessionFile);
-    const dir = (s && s.cwd) || this.cwd;
-    if (!dir) { this.gitPill.classList.add('hidden'); return; }
-    this.cwd = dir;
-    const g = await prime.gitInfo(dir);
-    if (g.ok && g.branch) {
-      this.gitPill.textContent = `⑂ ${g.branch}${g.dirty ? ' ±' + g.dirty : ''}`;
-      this.gitPill.title = g.root + (g.dirty ? ` — ${g.dirty} uncommitted` : ' — clean');
-      this.gitPill.classList.remove('hidden');
-    } else {
-      this.gitPill.textContent = baseName(dir);
-      this.gitPill.title = dir;
-      this.gitPill.classList.remove('hidden');
+    const workspace = this.workspace || { selected: false };
+    if (!workspace.selected) {
+      this.cwd = null;
+      this.gitPill.classList.add('hidden');
+      this.cwdLabel.textContent = 'Choose a project';
+      return;
     }
-    this.cwdLabel.textContent = 'cwd: ' + dir;
+    this.cwd = workspace.cwd;
+    const git = workspace.git;
+    const branch = git && (git.branch || (git.sha ? `detached@${git.sha}` : null));
+    this.gitPill.textContent = branch ? `⑂ ${branch}` : workspace.name;
+    this.gitPill.title = git && git.worktree ? `${git.worktree.name} — ${workspace.cwd}` : workspace.cwd;
+    this.gitPill.classList.remove('hidden');
+    this.cwdLabel.textContent = 'cwd: ' + workspace.cwd;
   }
 
   updateTopbar() {
@@ -406,10 +453,18 @@ class Pane {
     this.titleEl.textContent = s ? (s.name || s.preview || 'Untitled session') : 'New session';
     this.modelBtn.textContent = this.model ? `${this.model.provider}/${this.model.id} ▾` : '… ▾';
     this.thinkingBtn.textContent = `thinking: ${this.thinkingLevel || 'off'} ▾`;
+    const workspace = this.workspace || { selected: false };
+    const branch = workspace.git && (workspace.git.branch || (workspace.git.sha ? `detached@${workspace.git.sha}` : ''));
+    this.folderBtn.textContent = workspace.selected ? `${workspace.name}${branch ? ' · ' + branch : ''}` : 'Choose project';
+    this.folderBtn.title = workspace.selected ? `${workspace.cwd} — choose project or worktree` : 'Choose project (Cmd+O)';
+    this.folderBtn.setAttribute('aria-expanded', projectSurfacePane === this && !$('#project-surface').classList.contains('hidden') ? 'true' : 'false');
   }
 
   updateComposer() {
     this.stopBtn.classList.toggle('hidden', !this.isStreaming);
+    const sending = this.sending || this.draftState.sending;
+    this.sendBtn.disabled = sending || (!this.inputEl.value.trim() && this.draftState.items.length === 0) || !this.key;
+    this.attachBtn.disabled = sending || !this.draftState.id;
     this.inputEl.placeholder = this.isStreaming
       ? 'Agent is working - type to steer it…'
       : 'Message Prime Agent…  (Enter to send, Shift+Enter for newline)';
@@ -435,26 +490,32 @@ class Pane {
   // ---------- sending ----------
   async send() {
     const text = this.inputEl.value.trim();
-    if (this.sending || (!text && !this.attachments.length) || !this.key) return;
+    if (this.sending || this.draftState.sending || (!text && this.draftState.items.length === 0) || !this.key || !this.paneId) return;
+    const receipt = this.draftState.beginSend();
+    if (!receipt) return;
     this.sending = true;
-    this.sendBtn.disabled = true;
+    this.hideSuggestions();
+    this.setAttachmentError(null);
+    this.updateComposer();
     try {
-      this.hideSuggestions();
-      const visibleText = text || 'Attached context';
-      const payload = await this.buildPromptContext(text || 'Review the attached context.');
-      const cmd = { type: 'prompt', message: payload.message };
-      if (payload.images.length) cmd.images = payload.images;
-      if (this.isStreaming) cmd.streamingBehavior = 'steer';
-      else this.addUserBubble(visibleText);
-      const r = await prime.command(this.key, cmd);
-      if (!r.success) { this.setBanner('Prompt rejected: ' + (r.error || 'unknown'), true); return; }
+      const behavior = this.isStreaming ? 'steer' : 'prompt';
+      const response = await prime.sendChat(this.key, this.paneId, receipt.draftId, text, behavior).catch(() => ({ ok: false, error: 'The message could not be sent' }));
+      if (!response.ok || !response.accepted) {
+        this.draftState.rejected(receipt, response.error || 'Prompt rejected');
+        this.setBanner('Prompt rejected: ' + (response.error || 'unknown'), true);
+        this.renderAttachments();
+        return;
+      }
+      const rendered = response.rendered || { text, attachments: [...this.draftState.items] };
+      this.addUserBubble(rendered.text, rendered.attachments || []);
       this.inputEl.value = '';
-      this.attachments = [];
-      this.renderAttachments();
       this.autoSize();
+      this.draftState.accepted(receipt, response.draft);
+      this.renderAttachments();
+      this.setBanner(null);
     } finally {
       this.sending = false;
-      this.sendBtn.disabled = false;
+      this.updateComposer();
     }
   }
 
@@ -467,14 +528,28 @@ class Pane {
   }
 
   // ---------- rendering ----------
-  addUserBubble(text) {
+  attachmentMarkup(item) {
+    const external = item.external ? '<span class="attachment-external">External</span>' : '';
+    if (item.kind === 'image') {
+      const data = item.data || (item.source && item.source.data) || null;
+      const source = item.previewDataUrl || (data ? `data:${item.mimeType || item.mime_type || 'image/png'};base64,${data}` : '');
+      return `<div class="message-attachment image">${source ? `<img src="${esc(source)}" alt="${esc(item.name || 'Attached image')}" />` : '<span class="attachment-file-icon">IMG</span>'}<span><strong>${esc(item.name || 'Image')}</strong><small>${esc(item.mimeType || item.mime_type || 'image')} · ${formatBytes(item.size || (data ? Math.floor(data.length * 0.75) : 0))}</small></span>${external}</div>`;
+    }
+    const icon = item.kind === 'session' ? 'CHAT' : item.kind === 'folder' ? 'DIR' : 'DOC';
+    return `<div class="message-attachment file"><span class="attachment-file-icon">${icon}</span><span><strong>${esc(item.name || 'Attachment')}</strong><small>${esc(item.mimeType || item.kind || 'file')} · ${formatBytes(item.size)}</small></span>${external}</div>`;
+  }
+
+  addUserBubble(text, attachments = []) {
     this.hideEmpty();
     const div = document.createElement('div');
     div.className = 'msg user';
-    div.innerHTML = `<div class="msg-role">You</div><div class="msg-body">${esc(text)}</div>`;
+    const body = text ? `<div class="msg-body">${esc(text)}</div>` : '';
+    const tray = attachments.length ? `<div class="message-attachment-list">${attachments.map((item) => this.attachmentMarkup(item)).join('')}</div>` : '';
+    div.innerHTML = `<div class="msg-role">You</div>${body}${tray}`;
     this.chatEl.appendChild(div);
     this.scrollBottom(true);
   }
+
   addNotice(text) {
     const div = document.createElement('div');
     div.className = 'notice';
@@ -593,8 +668,14 @@ class Pane {
     }
     for (const m of list) {
       if (m.role === 'user') {
-        const text = typeof m.content === 'string' ? m.content : extractText(m.content);
-        if (text) this.addUserBubble(text);
+        const rawText = typeof m.content === 'string' ? m.content : extractText(m.content);
+        const parsed = parseLocalFileTransport(rawText);
+        const images = Array.isArray(m.content) ? m.content.filter((part) => part && part.type === 'image').map((part, index) => ({
+          kind: 'image', name: part.name || `Image ${index + 1}`, mimeType: part.mimeType || part.mime_type || 'image/png',
+          size: (part.data || (part.source && part.source.data)) ? Math.floor((part.data || part.source.data).length * 0.75) : 0,
+          data: part.data || (part.source && part.source.data) || null,
+        })) : [];
+        if (parsed.text || parsed.files.length || images.length) this.addUserBubble(parsed.text, [...images, ...parsed.files]);
       } else if (m.role === 'assistant') {
         this.hideEmpty();
         const div = document.createElement('div');
@@ -779,6 +860,8 @@ function setFocusedPane(pane) {
   G.focused = pane;
   for (const p of G.panes) p.el.classList.toggle('focused', p === pane);
   if (pane && pane.key) prime.touchClient(pane.key);
+  if (pane) pane.updateTopbar();
+  if (treeVisible) void renderTreeRoot();
 }
 
 function toggleMenu(menu, show) {
@@ -786,7 +869,7 @@ function toggleMenu(menu, show) {
   menu.classList.toggle('hidden', show === undefined ? undefined : !show);
 }
 
-async function createPane(index, sessionPath, cwd) {
+async function createPane(index, sessionPath) {
   const pane = new Pane(index);
   G.panes.push(pane);
   if (index > 0) {
@@ -794,13 +877,14 @@ async function createPane(index, sessionPath, cwd) {
     document.body.classList.add('split');
   }
   setFocusedPane(pane);
-  await pane.activate(sessionPath || null, cwd);
+  await pane.activate(sessionPath || null);
   return pane;
 }
 
 async function closePane(pane) {
   if (G.panes.length <= 1) return;
   G.panes = G.panes.filter((p) => p !== pane);
+  if (pane.key && pane.paneId) await prime.releasePane(pane.key, pane.paneId);
   pane.el.remove();
   if (!G.panes.some((p) => p.index > 0)) document.body.classList.remove('split');
   setFocusedPane(G.panes[G.panes.length - 1]);
@@ -941,7 +1025,6 @@ function renderSidebar() {
 async function loadPins() {
   const prefs = await prime.getPrefs();
   G.pinnedPaths = new Set(prefs.pins || []);
-  G.homeDir = prefs.home || null;
 }
 async function togglePin(sessionPath) {
   if (G.pinnedPaths.has(sessionPath)) G.pinnedPaths.delete(sessionPath);
@@ -1032,82 +1115,206 @@ async function openSubagentViewer(session) {
   }, 2000);
 }
 
-// ---------------- file tree ----------------
-let treeVisible = false, treeRoot = null;
-async function toggleTree() {
-  treeVisible = !treeVisible;
+// ---------------- projects / worktrees ----------------
+let projectSurfacePane = null;
+function setProjectError(message) {
+  const element = $('#project-choice-error');
+  element.textContent = message || '';
+  element.classList.toggle('hidden', !message);
+}
+function closeProjectSurface() {
+  $('#project-surface').classList.add('hidden');
+  if (projectSurfacePane) {
+    projectSurfacePane.folderBtn.setAttribute('aria-expanded', 'false');
+    projectSurfacePane.folderBtn.focus();
+  }
+  projectSurfacePane = null;
+}
+async function adoptWorkspaceActivation(pane, response) {
+  if (!response.ok) return false;
+  await pane.applyActivation(response, null);
+  await refreshSessions();
+  setFocusedPane(pane);
+  return true;
+}
+function renderProjectChoices(pane, choices) {
+  const host = $('#project-choice-list');
+  host.innerHTML = '';
+  for (const choice of choices || []) {
+    const button = document.createElement('button');
+    button.className = 'project-choice' + (choice.current ? ' current' : '');
+    const label = choice.kind === 'worktree' ? 'Worktree' : choice.kind === 'recent' ? 'Recent' : choice.kind === 'current' ? 'Current project' : 'Project';
+    button.innerHTML = `<span class="project-choice-icon">${choice.kind === 'worktree' ? '⑂' : '⌘'}</span><span><strong>${esc(choice.name)}</strong><small>${esc(choice.branch || choice.path)}</small></span><em>${label}</em>`;
+    button.onclick = async () => {
+      if (choice.current) { closeProjectSurface(); return; }
+      setProjectError(null);
+      button.disabled = true;
+      try {
+        const response = await prime.activateWorkspace(pane.key, pane.paneId, choice.id);
+        if (!response.ok) { setProjectError(response.error || 'That project could not be opened'); return; }
+        await adoptWorkspaceActivation(pane, response);
+        closeProjectSurface();
+        pane.inputEl.focus();
+      } catch { setProjectError('That project could not be opened'); }
+      finally { button.disabled = false; }
+    };
+    host.appendChild(button);
+  }
+  if (!host.children.length) host.innerHTML = '<div class="project-empty">No recent projects yet.</div>';
+}
+async function openProjectSurface(pane = G.focused) {
+  if (!pane || !pane.key || !pane.paneId) return;
+  projectSurfacePane = pane;
+  setProjectError(null);
+  const response = await prime.getWorkspace(pane.key, pane.paneId).catch(() => ({ ok: false }));
+  if (response.ok) {
+    pane.workspace = response.workspace || { selected: false, generation: 0 };
+    pane.cwd = pane.workspace.selected ? pane.workspace.cwd : null;
+    pane.updateTopbar();
+    renderProjectChoices(pane, response.choices || []);
+  }
+  $('#project-surface').classList.remove('hidden');
+  pane.folderBtn.setAttribute('aria-expanded', 'true');
+  $('#choose-folder-btn').focus();
+}
+async function chooseFolderForProjectSurface() {
+  const pane = projectSurfacePane || G.focused;
+  if (!pane) return;
+  const button = $('#choose-folder-btn');
+  setProjectError(null);
+  button.disabled = true;
+  try {
+    const response = await prime.pickWorkspace(pane.key, pane.paneId);
+    if (response.canceled) return;
+    if (!response.ok) { setProjectError(response.error || 'That project could not be opened'); return; }
+    await adoptWorkspaceActivation(pane, response);
+    closeProjectSurface();
+    pane.inputEl.focus();
+  } catch { setProjectError('That project could not be opened'); }
+  finally { button.disabled = false; }
+}
+$('#project-surface-close').onclick = closeProjectSurface;
+$('#choose-folder-btn').onclick = chooseFolderForProjectSurface;
+
+// ---------------- safe project file tree ----------------
+let treeVisible = false;
+let treeEpoch = 0;
+async function toggleTree(force) {
+  treeVisible = typeof force === 'boolean' ? force : !treeVisible;
   $('#tree-panel').classList.toggle('hidden', !treeVisible);
-  if (treeVisible) {
-    const active = G.sessions.find((s) => s.path === (G.focused && G.focused.sessionFile));
-    treeRoot = (active && active.cwd) || (G.focused && G.focused.cwd) || G.homeDir;
-    if (!treeRoot) { treeVisible = false; $('#tree-panel').classList.add('hidden'); return; }
-    $('#tree-root-label').textContent = baseName(treeRoot);
-    $('#tree-root-label').title = treeRoot;
-    renderTreeLevel($('#tree-body'), treeRoot);
-  }
+  if (treeVisible) await renderTreeRoot();
 }
-async function renderTreeLevel(container, dirPath) {
-  container.innerHTML = '<div class="tree-loading">…</div>';
-  const r = await prime.listDir(dirPath);
-  container.innerHTML = '';
-  if (!r.ok) { container.innerHTML = '<div class="tree-loading">error</div>'; return; }
-  for (const e of r.entries) {
+async function renderTreeRoot() {
+  const host = $('#tree-body');
+  const pane = G.focused;
+  const epoch = ++treeEpoch;
+  if (!pane || !pane.workspace || !pane.workspace.selected) {
+    $('#tree-root-label').textContent = 'Files';
+    $('#tree-root-label').title = '';
+    host.innerHTML = '<div class="tree-state"><strong>No project selected</strong><span>Choose a project to browse its files.</span><button class="s-btn">Choose project</button></div>';
+    host.querySelector('button').onclick = () => openProjectSurface(pane);
+    return;
+  }
+  $('#tree-root-label').textContent = pane.workspace.name;
+  $('#tree-root-label').title = pane.workspace.cwd;
+  await renderTreeLevel(pane, host, pane.workspace.rootNodeId, epoch, null, false);
+}
+async function renderTreeLevel(pane, container, nodeId, epoch, cursor = null, append = false) {
+  if (!append) container.innerHTML = '<div class="tree-loading"><span></span> Loading…</div>';
+  const workspaceSnapshot = pane.workspace;
+  const response = await prime.listWorkspaceDirectory(pane.key, pane.paneId, {
+    workspaceId: workspaceSnapshot.workspaceId,
+    generation: workspaceSnapshot.generation,
+    nodeId,
+    cursor,
+  });
+  if (epoch !== treeEpoch || !treeVisible || G.focused !== pane || pane.workspace.workspaceId !== workspaceSnapshot.workspaceId) return;
+  if (!append) container.innerHTML = '';
+  if (!response.ok) {
+    const state = document.createElement('div');
+    state.className = 'tree-state error';
+    state.innerHTML = `<strong>${response.code === 'NO_PROJECT' ? 'No project selected' : 'Folder unavailable'}</strong><span>${esc(response.error || 'This folder could not be read.')}</span><button class="s-btn">Retry</button>`;
+    state.querySelector('button').onclick = () => renderTreeLevel(pane, container, nodeId, epoch);
+    container.appendChild(state);
+    return;
+  }
+  for (const entry of response.entries || []) {
+    const group = document.createElement('div');
+    group.className = 'tree-entry';
     const row = document.createElement('div');
-    row.className = 'tree-row ' + e.type;
-    row.innerHTML = `<span class="tree-icon">${e.type === 'dir' ? '▸' : '·'}</span><span class="tree-name">${esc(e.name)}</span>`;
-    if (e.type === 'dir') {
+    row.className = 'tree-row ' + entry.type;
+    row.dataset.nodeId = entry.nodeId;
+    row.title = entry.relativePath;
+    row.tabIndex = 0;
+    row.setAttribute('role', 'button');
+    row.setAttribute('aria-label', entry.type === 'dir' ? `Toggle folder ${entry.name}` : `Add ${entry.name} to chat`);
+    row.innerHTML = `<span class="tree-icon">${entry.type === 'dir' ? '▸' : '·'}</span><span class="tree-name">${esc(entry.name)}</span>${entry.symlink ? '<span class="tree-symlink">↗</span>' : ''}${entry.type === 'file' ? '<button class="tree-preview" title="Preview file" aria-label="Preview ' + esc(entry.name) + '">⌕</button>' : ''}`;
+    row.oncontextmenu = (event) => { event.preventDefault(); prime.showWorkspaceContextMenu(pane.key, pane.paneId, entry.nodeId); };
+    row.onkeydown = (event) => {
+      if ((event.key === 'Enter' || event.key === ' ') && !event.target.closest('.tree-preview')) { event.preventDefault(); row.click(); }
+      if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); prime.showWorkspaceContextMenu(pane.key, pane.paneId, entry.nodeId); }
+    };
+    if (entry.type === 'dir') {
       row.onclick = async () => {
-        if (row.dataset.open === '1') {
-          row.dataset.open = '0';
-          row.querySelector('.tree-icon').textContent = '▸';
-          row.nextElementSibling && row.nextElementSibling.remove();
-          return;
-        }
-        row.dataset.open = '1';
-        row.querySelector('.tree-icon').textContent = '▾';
-        const child = document.createElement('div');
-        child.className = 'tree-children';
-        row.after(child);
-        renderTreeLevel(child, e.path);
+        const open = row.dataset.open === '1';
+        row.dataset.open = open ? '0' : '1';
+        row.querySelector('.tree-icon').textContent = open ? '▸' : '▾';
+        if (open) { group.querySelector('.tree-children')?.remove(); return; }
+        const children = document.createElement('div');
+        children.className = 'tree-children';
+        group.appendChild(children);
+        await renderTreeLevel(pane, children, entry.nodeId, epoch);
       };
-    } else row.onclick = () => openFileViewer(e.path);
-    container.appendChild(row);
+    } else {
+      row.onclick = async (event) => {
+        if (event.target.closest('.tree-preview')) return;
+        await pane.addTreeAttachment(entry.nodeId);
+        pane.inputEl.focus();
+      };
+      row.querySelector('.tree-preview').onclick = (event) => {
+        event.stopPropagation();
+        openWorkspaceFileViewer(pane, entry.nodeId, entry.name);
+      };
+    }
+    group.appendChild(row);
+    container.appendChild(group);
   }
-  if (!r.entries.length) container.innerHTML = '<div class="tree-loading">empty</div>';
+  if (!(response.entries || []).length && !append) container.innerHTML = '<div class="tree-state"><strong>Empty folder</strong><span>There are no visible files here.</span></div>';
+  if (response.truncated && response.nextCursor) {
+    const more = document.createElement('button');
+    more.className = 'tree-load-more';
+    more.textContent = `Load more (${Math.max(0, response.total - container.querySelectorAll('.tree-row').length)} remaining)`;
+    more.onclick = async () => { more.remove(); await renderTreeLevel(pane, container, nodeId, epoch, response.nextCursor, true); };
+    container.appendChild(more);
+  }
 }
-async function openFileViewer(p) {
-  currentViewerFile = p;
+async function openWorkspaceFileViewer(pane, nodeId, name) {
+  currentViewerFile = { pane, nodeId, name };
   $('#viewer-add-chat').classList.remove('hidden');
-  $('#viewer-title').textContent = p.split('/').pop();
+  $('#viewer-title').textContent = name || 'File preview';
   const body = $('#viewer-body');
   body.innerHTML = '<p class="s-help">Loading…</p>';
   $('#viewer-backdrop').classList.remove('hidden');
-  const r = await prime.readFile(p, 200000);
-  if (!r.ok) {
-    if (r.binary) {
-      body.innerHTML = '<p class="s-help">Binary file.</p>';
-      const b = document.createElement('button');
-      b.className = 's-btn primary';
-      b.textContent = 'Open in Finder/default app';
-      b.onclick = () => { prime.openPath(p); $('#viewer-backdrop').classList.add('hidden'); };
-      body.appendChild(b);
-    } else body.innerHTML = '<p class="s-help">Cannot read: ' + esc(r.error || '') + '</p>';
+  const response = await prime.readWorkspaceFile(pane.key, pane.paneId, nodeId, 200000);
+  if (!response.ok) {
+    body.innerHTML = response.binary
+      ? '<div class="tree-state"><strong>Preview unavailable</strong><span>This binary file can still be added to chat or revealed from its context menu.</span></div>'
+      : `<div class="tree-state error"><strong>Cannot preview file</strong><span>${esc(response.error || '')}</span></div>`;
     return;
   }
   const pre = document.createElement('pre');
   pre.className = 'viewer-pre';
-  pre.textContent = r.text + (r.truncated ? '\n\n… [truncated]' : '');
-  body.innerHTML = '';
-  body.appendChild(pre);
+  pre.textContent = response.text + (response.truncated ? '\n\n… [truncated]' : '');
+  body.replaceChildren(pre);
 }
 
 // ---------------- restart helpers ----------------
 async function restartAllAgents() {
-  const snapshot = G.panes.map((p) => ({ pane: p, sessionFile: p.sessionFile, cwd: p.cwd }));
+  const snapshot = G.panes.map((p) => ({ pane: p, sessionFile: p.sessionFile }));
   await prime.killAllAgents();
-  for (const { pane, sessionFile, cwd } of snapshot) {
-    pane.key = null; pane.ready = false; pane.isStreaming = false;
-    await pane.activate(sessionFile || null, cwd);
+  for (const { pane, sessionFile } of snapshot) {
+    pane.ready = false; pane.isStreaming = false;
+    await pane.activate(sessionFile || null);
   }
   renderSidebar();
 }
@@ -1406,9 +1613,20 @@ async function renderSkillsList() {
       <span class="p-status" style="font-family:inherit">${esc(s.description.slice(0, 70))}${s.description.length > 70 ? '…' : ''}</span>
       <span class="p-actions"><span class="s-dim">${esc(s.source)}</span></span>`;
     row.querySelector('.p-name').style.cursor = 'pointer';
-    row.querySelector('.p-name').onclick = () => openFileViewer(s.path);
+    row.querySelector('.p-name').onclick = async () => {
+      const response = await prime.readSkill(s.id);
+      if (!response.ok) return;
+      $('#viewer-title').textContent = s.name;
+      const pre = document.createElement('pre');
+      pre.className = 'viewer-pre';
+      pre.textContent = response.text + (response.truncated ? '\n\n… [truncated]' : '');
+      $('#viewer-body').replaceChildren(pre);
+      currentViewerFile = null;
+      $('#viewer-add-chat').classList.add('hidden');
+      $('#viewer-backdrop').classList.remove('hidden');
+    };
     row.querySelector('input').onchange = async (e) => {
-      const r = await prime.toggleSkill(s.dir, e.target.checked);
+      const r = await prime.toggleSkill(s.id, e.target.checked);
       if (!r.ok) { e.target.checked = !e.target.checked; alert('Toggle failed: ' + r.error); }
       else { capabilitiesDirty = true; $('#capabilities-foot').classList.remove('hidden'); }
     };
@@ -1466,7 +1684,7 @@ async function renderSchedulesList() {
   const pane = scheduleClient();
   const host = $('#schedules-list');
   host.innerHTML = '<p class="s-help">Loading…</p>';
-  const r = await prime.command(pane.key, { type: 'list_schedules', includeInactive: true });
+  const r = await prime.automationCommand(pane.key, { type: 'list_schedules', includeInactive: true });
   const jobs = (r.success && r.data.jobs) || [];
   host.innerHTML = jobs.length ? '' : '<p class="s-help">No scheduled jobs.</p>';
   for (const j of jobs) {
@@ -1481,7 +1699,7 @@ async function renderSchedulesList() {
     del.className = 's-btn danger'; del.textContent = 'Cancel';
     del.onclick = async () => {
       if (!confirm('Cancel this scheduled job?')) return;
-      await prime.command(pane.key, { type: 'cancel_schedule', jobId: j.id || j.jobId });
+      await prime.automationCommand(pane.key, { type: 'cancel_schedule', jobId: j.id || j.jobId });
       renderSchedulesList();
     };
     row.querySelector('.p-actions').appendChild(del);
@@ -1493,7 +1711,7 @@ async function renderHeartbeatsList() {
   const pane = scheduleClient();
   const host = $('#heartbeats-list');
   host.innerHTML = '<p class="s-help">Loading…</p>';
-  const r = await prime.command(pane.key, { type: 'list_heartbeats' });
+  const r = await prime.automationCommand(pane.key, { type: 'list_heartbeats' });
   const hbs = (r.success && r.data.heartbeats) || [];
   host.innerHTML = hbs.length ? '' : '<p class="s-help">No heartbeats configured.</p>';
   for (const heartbeat of hbs) {
@@ -1510,7 +1728,7 @@ async function renderHeartbeatsList() {
       b.textContent = label;
       b.disabled = (action === 'pause' && h.status === 'paused') || (action === 'resume' && h.status === 'active');
       b.onclick = async () => {
-        await prime.command(pane.key, { type: 'manage_heartbeat', activeSessionId: h.activeSessionId, jobId: h.id, action });
+        await prime.automationCommand(pane.key, { type: 'manage_heartbeat', activeSessionId: h.activeSessionId, jobId: h.id, action });
         renderHeartbeatsList();
       };
       actions.appendChild(b);
@@ -1521,11 +1739,7 @@ async function renderHeartbeatsList() {
 
 // ---------------- menu actions / wiring ----------------
 $('#new-chat-btn').onclick = () => G.focused && G.focused.newChat();
-$('#new-folder-chat-btn').onclick = async () => {
-  if (!G.focused) return;
-  const dir = await prime.pickDirectory();
-  if (dir) await G.focused.newChat(dir);
-};
+$('#new-folder-chat-btn').onclick = () => openProjectSurface(G.focused);
 $('#session-filter').addEventListener('input', renderSidebar);
 $('#settings-btn').onclick = openSettings;
 $('#settings-close').onclick = closeSettings;
@@ -1589,29 +1803,76 @@ $('#sf-save').onclick = async () => {
   const promptText = $('#sf-prompt').value.trim();
   if (!schedule || !promptText) { alert('Schedule and prompt are required.'); return; }
   const pane = scheduleClient();
-  const r = await prime.command(pane.key, { type: 'add_schedule', schedule, prompt: promptText });
+  const r = await prime.automationCommand(pane.key, { type: 'add_schedule', schedule, prompt: promptText });
   if (r.success) { $('#schedule-form').classList.add('hidden'); $('#sf-schedule').value = ''; $('#sf-prompt').value = ''; renderSchedulesList(); }
   else alert('Failed: ' + (r.error || 'unknown'));
 };
 
-$('#tree-close').onclick = toggleTree;
-$('#viewer-add-chat').onclick = () => {
-  if (!currentViewerFile || !G.focused) return;
-  G.focused.addAttachments([{ kind: 'file', name: baseName(currentViewerFile), path: currentViewerFile }]);
+$('#tree-close').onclick = () => toggleTree(false);
+$('#tree-refresh').onclick = async () => {
+  if (G.focused && G.focused.key) await prime.refreshWorkspace(G.focused.key, G.focused.paneId);
+  if (treeVisible) await renderTreeRoot();
+};
+$('#viewer-add-chat').onclick = async () => {
+  if (!currentViewerFile || !currentViewerFile.pane) return;
+  await currentViewerFile.pane.addTreeAttachment(currentViewerFile.nodeId);
   $('#viewer-backdrop').classList.add('hidden');
-  G.focused.inputEl.focus();
+  setFocusedPane(currentViewerFile.pane);
+  currentViewerFile.pane.inputEl.focus();
 };
 $('#viewer-close').onclick = () => { clearInterval(subagentPoll); $('#viewer-backdrop').classList.add('hidden'); };
 $('#viewer-backdrop').onclick = (e) => { if (e.target === $('#viewer-backdrop')) { clearInterval(subagentPoll); $('#viewer-backdrop').classList.add('hidden'); } };
 
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    $$('.picker-menu').forEach((m) => m.classList.add('hidden'));
-    $('#modal-backdrop').classList.add('hidden');
+function closeTopSurface() {
+  const surfaces = [
+    ['#modal-backdrop', () => $('#modal-backdrop').classList.add('hidden')],
+    ['#viewer-backdrop', () => { clearInterval(subagentPoll); $('#viewer-backdrop').classList.add('hidden'); }],
+    ['#schedules-backdrop', () => $('#schedules-backdrop').classList.add('hidden')],
+    ['#capabilities-backdrop', () => $('#capabilities-backdrop').classList.add('hidden')],
+    ['#settings-backdrop', closeSettings],
+    ['#project-surface', closeProjectSurface],
+  ];
+  for (const [selector, close] of surfaces) {
+    if (!$(selector).classList.contains('hidden')) { close(); if (G.focused) G.focused.inputEl.focus(); return true; }
   }
+  const openMenu = [...document.querySelectorAll('.picker-menu')].find((menu) => !menu.classList.contains('hidden'));
+  if (openMenu) { openMenu.classList.add('hidden'); if (G.focused) G.focused.inputEl.focus(); return true; }
+  return false;
+}
+document.addEventListener('keydown', (event) => {
+  const command = event.metaKey || event.ctrlKey;
+  if (command && !event.altKey && event.key.toLowerCase() === 'o') {
+    event.preventDefault();
+    void openProjectSurface(G.focused);
+    return;
+  }
+  if (command && event.shiftKey && event.key.toLowerCase() === 'a') {
+    event.preventDefault();
+    if (G.focused) void G.focused.pickAttachments();
+    return;
+  }
+  if (command && !event.shiftKey && event.key.toLowerCase() === 'n') {
+    event.preventDefault();
+    if (G.focused) void G.focused.newChat();
+    return;
+  }
+  if (event.key === 'Escape' && closeTopSurface()) event.preventDefault();
 });
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('.picker')) $$('.picker-menu').forEach((m) => m.classList.add('hidden'));
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('.picker')) $$('.picker-menu').forEach((menu) => menu.classList.add('hidden'));
+});
+for (const type of ['dragenter', 'dragover']) {
+  document.addEventListener(type, (event) => {
+    if (event.dataTransfer && [...event.dataTransfer.types].includes('Files')) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    }
+  });
+}
+document.addEventListener('drop', (event) => {
+  if (!event.dataTransfer || !event.dataTransfer.files.length) return;
+  event.preventDefault();
+  if (G.focused) void G.focused.handleFileDrop(event);
 });
 
 // tree toggle button lives per topbar? keep global keyboard: none. Add a floating button:
@@ -1627,10 +1888,23 @@ $('#sidebar').querySelector('.sidebar-bottom-row').appendChild(treeBtn);
 prime.onRpcEvent(({ key, event }) => {
   for (const pane of G.panes.filter((p) => p.key === key)) pane.handleEvent(event);
 });
-prime.onKeyMapped(({ oldKey, key }) => {
-  for (const pane of G.panes.filter((p) => p.key === oldKey)) { pane.key = key; pane.sessionFile = key; }
-});
 prime.onSessionsChanged((list) => refreshSessions(list));
+prime.onWorkspaceInvalidated(({ key }) => {
+  if (treeVisible && G.focused && G.focused.key === key) void renderTreeRoot();
+});
+prime.onWorkspaceChanged(({ key, paneId, workspace }) => {
+  const pane = G.panes.find((candidate) => candidate.paneId === paneId && candidate.key === key);
+  if (!pane || !workspace) return;
+  pane.workspace = workspace;
+  pane.cwd = workspace.selected ? workspace.cwd : null;
+  pane.updateTopbar();
+});
+prime.onAttachmentsReset(({ paneId, draft }) => {
+  const pane = G.panes.find((candidate) => candidate.paneId === paneId);
+  if (!pane || !draft) return;
+  pane.draftState.reset(draft);
+  pane.renderAttachments();
+});
 prime.onRpcExit(({ key, code, error }) => {
   for (const pane of G.panes.filter((p) => p.key === key)) {
     pane.setBanner(`${error || 'Agent process exited'} (code ${code}). Click to restart.`, true);
@@ -1647,7 +1921,8 @@ prime.onFlushWait(({ key }) => {
 });
 prime.onMenuAction(({ id }) => {
   if (id === 'new-chat') G.focused && G.focused.newChat();
-  else if (id === 'new-folder-chat') G.focused && G.focused.chooseFolder();
+  else if (id === 'open-project') openProjectSurface(G.focused);
+  else if (id === 'attach-files') G.focused && G.focused.pickAttachments();
   else if (id === 'open-settings') openSettings();
   else if (id === 'install-agent' || id === 'update-agent') runAgentInstall(id === 'install-agent' ? 'Install Prime Agent' : 'Update Prime Agent');
   else if (id === 'restart-agent') restartAllAgents();

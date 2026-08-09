@@ -5,10 +5,11 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "smoke": "SMOKE_TEST=1 electron .",
+    "smoke": "node scripts/smoke.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --mac",
-    "test": "node --test"
+    "test": "node --test test/*.test.js",
+    "ui-smoke": "node scripts/ui-smoke.js"
   },
   "dependencies": {
     "dompurify": "^3.2.4",
@@ -28,6 +29,7 @@
       "main.js",
       "daemon-launch.js",
       "session-handoff.js",
+      "lib/**/*",
       "preload.js",
       "renderer/**/*",
       "node_modules/marked/**/*",

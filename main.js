@@ -1,21 +1,35 @@
 // Prime Desktop - Electron main process
-// Multi-session architecture: one `prime-agent --mode rpc` process per live session,
-// routed per window/pane. Hermes-style isolated sessions with per-session cwd/git context.
-const { app, BrowserWindow, Menu, ipcMain, dialog, shell, screen, globalShortcut } = require('electron');
+// v0.6 multi-session architecture with pane-scoped workspaces and drafts.
+"use strict";
+const { app, BrowserWindow, Menu, ipcMain, dialog, shell, screen, globalShortcut, nativeImage, clipboard } = require('electron');
 const { spawn, execSync } = require('child_process');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const fsp = fs.promises;
 const os = require('os');
+const { pathToFileURL } = require('url');
 
 const { primeDaemonLaunchConfig } = require('./daemon-launch');
 const { prepareSessionHandoff } = require('./session-handoff');
+const { RpcManager, canonicalDirectory } = require('./lib/rpc-manager');
+const { WorkspaceService, isWithin } = require('./lib/workspace-service');
+const { AttachmentService, AttachmentError, MAX_DIMENSION, MAX_IMAGE_BASE64, sniffImageMime, parseFileTransport } = require('./lib/attachment-service');
+const { canonicalSessionsRoot, canonicalSessionPath, validateSessionHeader, safeDeleteSession, cleanupTrackedEmptySessions, countSessionMessages } = require('./lib/session-utils');
 
-const HOME = os.homedir();
+const TEST_MODE = !app.isPackaged && process.env.PRIME_DESKTOP_TEST_MODE === '1';
+const HOME_INPUT = TEST_MODE && process.env.PRIME_DESKTOP_TEST_HOME ? path.resolve(process.env.PRIME_DESKTOP_TEST_HOME) : os.homedir();
+if (TEST_MODE) fs.mkdirSync(HOME_INPUT, { recursive: true });
+const HOME = fs.realpathSync(HOME_INPUT);
+if (TEST_MODE) app.setPath('userData', path.join(HOME, '.prime-desktop-test-user-data'));
 const SESSIONS_DIR = path.join(HOME, '.prime', 'agent', 'sessions');
 const COMMAND_TIMEOUT_MS = 30000;
 const SWITCH_SESSION_TIMEOUT_MS = 90000;
 const MAX_CLIENTS = 8;
+const MAX_IPC_JSON_BYTES = 2 * 1024 * 1024;
+const WORKSPACE_STATE_PATH = path.join(app.getPath('userData'), 'workspaces.json');
 const DAEMON_LAUNCH = primeDaemonLaunchConfig();
+fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
 // ---------- Agent binary resolution ----------
 
@@ -25,18 +39,23 @@ function loginShellPath() {
 }
 
 function buildChildEnv() {
+  const extra = [path.join(HOME, '.hermes', 'node', 'bin'), path.join(HOME, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin'];
+  if (TEST_MODE) {
+    const current = process.env.PATH || '/usr/bin:/bin:/usr/sbin:/sbin';
+    return {
+      HOME,
+      USER: 'prime-desktop-test',
+      LOGNAME: 'prime-desktop-test',
+      PATH: [...extra, ...current.split(':')].filter(Boolean).join(':'),
+      SHELL: '/bin/zsh',
+      TMPDIR: process.env.TMPDIR || os.tmpdir(),
+      PRIME_DESKTOP_TEST_HOME: HOME,
+    };
+  }
   const env = { ...process.env };
-  const extra = [
-    path.join(HOME, '.hermes', 'node', 'bin'),
-    path.join(HOME, '.local', 'bin'),
-    '/opt/homebrew/bin',
-    '/usr/local/bin',
-  ];
   const current = (env.PATH && env.PATH.length > 10 ? env.PATH : loginShellPath()) || '/usr/bin:/bin:/usr/sbin:/sbin';
   env.PATH = [...extra, ...current.split(':')].filter(Boolean).join(':');
   if (!env.SHELL) env.SHELL = '/bin/zsh';
-  // Finder/Electron can expose /tmp while terminal clients use macOS's
-  // DARWIN_USER_TEMP_DIR. Normalize it so every client reaches one daemon.
   env.TMPDIR = DAEMON_LAUNCH.tempDir;
   return env;
 }
@@ -46,6 +65,7 @@ function findNode(childEnv) {
     path.join(HOME, '.hermes', 'node', 'bin', 'node'),
     '/usr/local/bin/node',
     '/opt/homebrew/bin/node',
+    process.execPath,
   ];
   for (const c of candidates) if (fs.existsSync(c)) return c;
   try { return execSync('which node', { env: childEnv, encoding: 'utf8' }).trim(); }
@@ -53,6 +73,9 @@ function findNode(childEnv) {
 }
 
 function resolveAgentInvocation(childEnv) {
+  if (TEST_MODE && process.env.PRIME_DESKTOP_AGENT_SCRIPT) {
+    return { command: findNode(childEnv), args: [path.resolve(process.env.PRIME_DESKTOP_AGENT_SCRIPT)], display: 'offline fixture' };
+  }
   const binCandidates = [
     path.join(HOME, '.local', 'bin', 'prime-agent'),
     path.join(HOME, '.local', 'lib', 'node_modules', 'prime-agent', 'dist', 'bundle', 'cli.js'),
@@ -76,298 +99,389 @@ function resolveAgentInvocation(childEnv) {
 }
 
 // ---------- Multi-client RPC manager ----------
-// clients: Map<key, client>. key = session file path (or 'new:<n>' before known).
-// A client owns one prime-agent RPC process bound to one session.
+// One hardened RpcManager per live session, routed by opaque pane contexts.
 
 const clients = new Map();
-let requestSeq = 0;
-let tempSeq = 0;
+const paneContexts = new Map();
 const createdSessionFiles = new Set();
+const securityEvents = [];
+let tempSeq = 0;
+let paneTransitionTail = Promise.resolve();
 
+function boundedText(value, cap = 8_192) {
+  return String(value == null ? '' : value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').slice(0, cap);
+}
+function publicError(error, fallback = 'That action could not be completed') {
+  if (error instanceof AttachmentError) return { ok: false, code: error.code, error: error.message };
+  const message = error && error.message;
+  return { ok: false, error: typeof message === 'string' && message.length < 500 && !message.includes(HOME) ? message : fallback };
+}
+function assertSmallDto(value, cap = MAX_IPC_JSON_BYTES) {
+  let encoded;
+  try { encoded = JSON.stringify(value); } catch { throw new Error('Invalid request'); }
+  if (Buffer.byteLength(encoded || '', 'utf8') > cap) throw new Error('Request is too large');
+}
+function isTrustedIpc(event) {
+  if (!event || !event.sender || !event.senderFrame) return false;
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  return !!owner && event.senderFrame === event.sender.mainFrame;
+}
+function secureHandle(channel, handler) {
+  ipcMain.handle(channel, async (event, ...args) => {
+    if (!isTrustedIpc(event)) throw new Error('Untrusted IPC sender');
+    return handler(event, ...args);
+  });
+}
+function rememberSecurityEvent(type, target) {
+  securityEvents.push({ type, target: boundedText(target, 300), at: Date.now() });
+  if (securityEvents.length > 50) securityEvents.shift();
+}
 function sendToWindow(win, channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
 function sendToClientWindows(client, channel, payload) {
-  const viewers = client.viewers || new Set(client.ownerWin ? [client.ownerWin] : []);
-  for (const win of viewers) sendToWindow(win, channel, payload);
+  for (const win of client.viewers || []) sendToWindow(win, channel, payload);
 }
 function broadcast(channel, payload) {
   for (const win of BrowserWindow.getAllWindows()) sendToWindow(win, channel, payload);
 }
-
-function spawnClient({ sessionPath, cwd, ownerWin }) {
-  const childEnv = buildChildEnv();
-  const invocation = resolveAgentInvocation(childEnv);
-  const key = sessionPath || ('new:' + (++tempSeq));
-  if (!invocation) {
-    sendToWindow(ownerWin, 'rpc-error', { key, message: 'prime-agent binary not found.' });
-    return null;
-  }
-  const args = [...invocation.args, '--mode', 'rpc', '--daemon-socket', DAEMON_LAUNCH.socketPath];
-  if (sessionPath) args.push('--resume', sessionPath);
-  let proc;
-  try {
-    proc = spawn(invocation.command, args, { cwd: cwd || HOME, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
-  } catch (err) {
-    sendToWindow(ownerWin, 'rpc-error', { key, message: 'Failed to spawn prime-agent: ' + String(err) });
-    return null;
-  }
-  const client = {
-    key, proc, pending: new Map(), buffer: '', alive: true,
-    sessionFile: sessionPath || null, cwd: cwd || HOME,
-    ownerWin, viewers: new Set(ownerWin ? [ownerWin] : []), streaming: false, lastUsed: Date.now(), autoCreated: !sessionPath,
-  };
-  clients.set(key, client);
-
-  proc.stdout.setEncoding('utf8');
-  proc.stdout.on('data', (chunk) => {
-    client.buffer += chunk;
-    let idx;
-    while ((idx = client.buffer.indexOf('\n')) !== -1) {
-      let line = client.buffer.slice(0, idx);
-      client.buffer = client.buffer.slice(idx + 1);
-      if (line.endsWith('\r')) line = line.slice(0, -1);
-      if (!line.trim()) continue;
-      let obj;
-      try { obj = JSON.parse(line); } catch { continue; }
-      handleClientMessage(client, obj);
-    }
-  });
-  proc.stderr.on('data', (d) => sendToClientWindows(client, 'rpc-stderr', { key: client.key, text: d.toString() }));
-  const onDead = (code, errMsg) => {
-    client.alive = false;
-    for (const { reject, timer } of client.pending.values()) {
-      clearTimeout(timer);
-      reject(new Error(errMsg || ('RPC process exited (' + code + ')')));
-    }
-    client.pending.clear();
-    sendToClientWindows(client, 'rpc-exit', { key: client.key, code: code == null ? -1 : code, error: errMsg || null });
-    sendHudEvent(client, { type: 'error', error: errMsg || ('Agent process exited (' + (code == null ? -1 : code) + ')') });
-  };
-  proc.on('exit', (code) => onDead(code, null));
-  proc.on('error', (err) => onDead(null, 'Failed to start prime-agent: ' + String(err)));
-
-  // Learn the session file (new sessions get one assigned at spawn)
-  if (!sessionPath) {
-    (async () => {
-      for (let i = 0; i < 60; i++) {
-        try {
-          const r = await clientCommand(client, { type: 'get_state' });
-          if (r.success && r.data.sessionFile) {
-            client.sessionFile = r.data.sessionFile;
-            createdSessionFiles.add(r.data.sessionFile);
-            if (client.key !== client.sessionFile) {
-              clients.delete(key);
-              client.key = client.sessionFile;
-              clients.set(client.key, client);
-              sendToClientWindows(client, 'rpc-key-mapped', { oldKey: key, key: client.key });
-            }
-            break;
-          }
-        } catch {}
-        await new Promise((r2) => setTimeout(r2, 250));
-      }
-    })();
-  } else {
-    createdSessionFiles.add(sessionPath);
-  }
-  evictIdleClients();
-  return client;
+function clientIsCurrent(client) {
+  return !!client && client.committed && clients.get(client.key) === client;
 }
-
-function evictIdleClients() {
-  if (clients.size <= MAX_CLIENTS) return;
-  const idle = [...clients.values()].filter((c) => !c.streaming).sort((a, b) => a.lastUsed - b.lastUsed);
-  while (clients.size > MAX_CLIENTS && idle.length) {
-    const c = idle.shift();
-    clients.delete(c.key);
-    try { c.proc.kill(); } catch {}
-  }
+function clientCommand(client, command, timeoutMs) {
+  if (!client || !client.alive) return Promise.reject(new Error('Agent process is not running'));
+  return client.rpc.command(command, timeoutMs ? { timeoutMs } : {});
 }
+function getClient(key) { return typeof key === 'string' ? clients.get(key) : null; }
 
+function refreshClientViewers(client) {
+  if (!client) return;
+  const viewers = new Set();
+  for (const context of paneContexts.values()) if (context.client === client && context.ownerWin && !context.ownerWin.isDestroyed()) viewers.add(context.ownerWin);
+  client.viewers = viewers;
+}
+function trackCreatedSession(sessionPath) {
+  if (typeof sessionPath === 'string') createdSessionFiles.add(sessionPath);
+}
 function handleClientMessage(client, obj) {
-  if (obj.type === 'response' && obj.id && client.pending.has(obj.id)) {
-    const { resolve, timer } = client.pending.get(obj.id);
-    clearTimeout(timer);
-    client.pending.delete(obj.id);
-    resolve(obj);
-    return;
-  }
+  if (!clientIsCurrent(client)) return;
   if (obj.type === 'agent_start') client.streaming = true;
-  if (obj.type === 'agent_end') client.streaming = false;
-  if (obj.type === 'response' && obj.command === 'new_session' && obj.success) {
-    clientCommand(client, { type: 'get_state' }).then((r) => {
-      if (r.success && r.data.sessionFile) createdSessionFiles.add(r.data.sessionFile);
-    }).catch(() => {});
+  if (obj.type === 'agent_end') {
+    client.streaming = false;
+    if (client.workspace) client.workspace.refresh('agent');
   }
   sendToClientWindows(client, 'rpc-event', { key: client.key, event: obj });
-  const assistantEvent = (obj.type === 'message_update' || obj.type === 'message_end')
-    && (!obj.message || obj.message.role === 'assistant');
-  const errorEvent = obj.type === 'error'
-    || (obj.type === 'message_update' && obj.assistantMessageEvent && obj.assistantMessageEvent.type === 'error');
+  const assistantEvent = (obj.type === 'message_update' || obj.type === 'message_end') && (!obj.message || obj.message.role === 'assistant');
+  const errorEvent = obj.type === 'error' || (obj.type === 'message_update' && obj.assistantMessageEvent && obj.assistantMessageEvent.type === 'error');
   if (assistantEvent || errorEvent || obj.type === 'agent_end') sendHudEvent(client, obj);
 }
 
-function clientCommand(client, cmd, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    if (!client || !client.alive) return reject(new Error('Agent process is not running'));
-    const id = 'req-' + (++requestSeq);
-    cmd.id = id;
-    const timer = setTimeout(() => {
-      if (client.pending.has(id)) {
-        client.pending.delete(id);
-        reject(new Error('Command timed out: ' + (cmd.type || 'unknown')));
-      }
-    }, timeoutMs || COMMAND_TIMEOUT_MS);
-    client.pending.set(id, { resolve, reject, timer });
-    try { client.proc.stdin.write(JSON.stringify(cmd) + '\n'); }
-    catch (e) { clearTimeout(timer); client.pending.delete(id); reject(e); }
+function createWorkspaceService(client) {
+  return new WorkspaceService({
+    homeDir: HOME,
+    statePath: WORKSPACE_STATE_PATH,
+    onInvalidated: (payload) => {
+      if (clientIsCurrent(client)) sendToClientWindows(client, 'workspace-invalidated', { key: client.key, ...payload });
+    },
   });
 }
 
-function getClient(key) {
-  return clients.get(key);
+async function disposeClient(client, reason = 'shutdown', remove = true) {
+  if (!client) return;
+  if (remove) for (const [key, value] of clients) if (value === client) clients.delete(key);
+  client.committed = false;
+  client.alive = false;
+  if (client.workspace) client.workspace.dispose();
+  await client.rpc.stop(reason);
 }
 
-// Ensure a client exists for a session; spawn with --resume if needed.
-function ensureClient({ key, sessionPath, cwd, ownerWin }) {
-  const existing = getClient(key) || (sessionPath && getClient(sessionPath));
+async function evictIdleClients() {
+  while (clients.size > MAX_CLIENTS) {
+    const referenced = new Set([...paneContexts.values()].map((context) => context.client));
+    const candidate = [...new Set(clients.values())]
+      .filter((client) => !client.streaming && !referenced.has(client))
+      .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+    if (!candidate) return;
+    await disposeClient(candidate, 'idle eviction');
+  }
+}
+
+async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspace = null }) {
+  const targetCwd = canonicalDirectory(cwd || HOME);
+  const temporaryKey = `new:${++tempSeq}`;
+  const rpc = new RpcManager({
+    defaultCwd: targetCwd,
+    resolveInvocation: resolveAgentInvocation,
+    buildEnv: buildChildEnv,
+    extraArgs: ['--daemon-socket', DAEMON_LAUNCH.socketPath],
+  });
+  const client = {
+    key: temporaryKey,
+    rpc,
+    sessionFile: sessionPath,
+    cwd: targetCwd,
+    viewers: new Set(ownerWin ? [ownerWin] : []),
+    streaming: false,
+    lastUsed: Date.now(),
+    autoCreated: !sessionPath,
+    alive: true,
+    committed: false,
+    workspace: null,
+  };
+  rpc.on('event', (event) => handleClientMessage(client, event));
+  // Never mirror provider stderr into the renderer; it can contain paths or credentials.
+  rpc.on('stderr', () => {});
+  rpc.on('error-event', (payload) => {
+    if (clientIsCurrent(client)) sendToClientWindows(client, 'rpc-error', { key: client.key, message: boundedText(payload.message, 500) });
+  });
+  rpc.on('exit', (payload) => {
+    if (!clientIsCurrent(client)) return;
+    client.alive = false;
+    sendToClientWindows(client, 'rpc-exit', { key: client.key, code: payload.code, error: payload.error });
+    sendHudEvent(client, { type: 'error', error: payload.error || `Agent process exited (${payload.code})` });
+  });
+
+  try {
+    await rpc.start({ cwd: targetCwd, sessionPath, reason: 'client activation' });
+    const ready = await rpc.waitUntilReady();
+    const reported = ready.data && ready.data.sessionFile;
+    if (typeof reported !== 'string') throw new Error('Agent did not report a session file');
+    const canonicalSession = await canonicalSessionPath(SESSIONS_DIR, reported);
+    if (sessionPath && canonicalSession !== sessionPath) throw new Error('Agent resumed a different session than requested');
+    client.sessionFile = canonicalSession;
+    client.key = canonicalSession;
+    client.streaming = !!(ready.data && ready.data.isStreaming);
+    client.workspace = createWorkspaceService(client);
+    if (targetCwd !== HOME) {
+      const inspected = inspectedWorkspace || await client.workspace.inspectPath(targetCwd);
+      await client.workspace.activatePath(targetCwd, { inspected, recordRecent: true });
+    } else client.workspace.clear('home-session');
+    const collision = clients.get(client.key);
+    if (collision && collision !== client && collision.alive) {
+      await disposeClient(client, 'duplicate session', false);
+      return collision;
+    }
+    client.committed = true;
+    clients.set(client.key, client);
+    if (client.autoCreated) trackCreatedSession(client.sessionFile);
+    await evictIdleClients();
+    return client;
+  } catch (error) {
+    if (client.workspace) client.workspace.dispose();
+    await rpc.stop('failed activation').catch(() => {});
+    throw error;
+  }
+}
+
+async function ensureClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspace = null }) {
+  const existing = sessionPath && getClient(sessionPath);
   if (existing && existing.alive) {
-    if (ownerWin) existing.viewers.add(ownerWin);
+    existing.lastUsed = Date.now();
     return existing;
   }
-  return spawnClient({ sessionPath: sessionPath || (key && key.startsWith('/') ? key : null), cwd, ownerWin });
+  if (existing) await disposeClient(existing, 'dead client replacement');
+  return spawnClient({ sessionPath, cwd, ownerWin, inspectedWorkspace });
 }
 
-function runAgentCliJson(args, timeoutMs = 8000) {
+function runAgentCliJson(args, timeoutMs = 8_000) {
   return new Promise((resolve, reject) => {
     const childEnv = buildChildEnv();
     const invocation = resolveAgentInvocation(childEnv);
     if (!invocation) return reject(new Error('prime-agent binary not found'));
     let stdout = '', stderr = '', settled = false;
-    const proc = spawn(invocation.command, [
-      ...invocation.args,
-      args[0],
-      '--daemon-socket', DAEMON_LAUNCH.socketPath,
-      ...args.slice(1),
-    ], { cwd: HOME, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn(invocation.command, [...invocation.args, args[0], '--daemon-socket', DAEMON_LAUNCH.socketPath, ...args.slice(1)], {
+      cwd: HOME, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'],
+    });
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      try { proc.kill(); } catch {}
+      try { proc.kill('SIGKILL'); } catch {}
       reject(new Error(`prime-agent ${args[0]} timed out`));
     }, timeoutMs);
-    proc.stdout.on('data', (d) => { stdout += d.toString(); });
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('error', (err) => { if (settled) return; settled = true; clearTimeout(timer); reject(err); });
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => { stderr += data.toString(); });
+    proc.on('error', (error) => { if (!settled) { settled = true; clearTimeout(timer); reject(error); } });
     proc.on('exit', (code) => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
+      settled = true; clearTimeout(timer);
       if (code !== 0) return reject(new Error(stderr.trim() || `prime-agent ${args[0]} exited with code ${code}`));
       try { resolve(stdout.trim() ? JSON.parse(stdout) : {}); }
       catch { reject(new Error(`prime-agent ${args[0]} returned invalid JSON`)); }
     });
   });
 }
-
 async function prepareTargetSession(sessionPath) {
   return prepareSessionHandoff(sessionPath, {
     list: async () => (await runAgentCliJson(['list', '--json'])).sessions || [],
     stop: async (activeSessionId) => { await runAgentCliJson(['stop', activeSessionId, '--json']); },
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    timeoutMs: 5000,
+    timeoutMs: 5_000,
   });
 }
-
-// Upstream quirk guard: new-session files flush a few seconds after the first
-// prompt; switching away before the flush orphans the session. Wait for it.
-async function waitForSessionPersisted(filePath, timeoutMs = 20000) {
+async function waitForSessionPersisted(filePath, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      if (fs.existsSync(filePath) && fs.readFileSync(filePath, 'utf8').includes('"type":"message"')) return true;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 300));
+    if (countSessionMessages(filePath) > 0) return true;
+    await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return false;
 }
 
-ipcMain.handle('rpc:command', async (e, { key, cmd }) => {
+function ownerForEvent(event) { return BrowserWindow.fromWebContents(event.sender); }
+function paneContextFor(event, request = {}, options = {}) {
+  assertSmallDto(request, options.cap || 64 * 1024);
+  const context = paneContexts.get(request.paneId);
+  const owner = ownerForEvent(event);
+  if (!context || context.ownerWin !== owner) throw new Error('This pane is no longer available');
+  if (request.key && context.client.key !== request.key) throw new Error('This pane changed sessions; retry the action');
+  return context;
+}
+function bindPane(event, requestedPaneId, client) {
+  const ownerWin = ownerForEvent(event);
+  let paneId = typeof requestedPaneId === 'string' && requestedPaneId.length <= 100 ? requestedPaneId : null;
+  const previous = paneId && paneContexts.get(paneId);
+  if (previous && previous.ownerWin !== ownerWin) throw new Error('This pane is no longer available');
+  if (!paneId || !previous) paneId = `pane_${crypto.randomUUID()}`;
+  if (previous) {
+    previous.attachmentService.deleteDraft(previous.draft.id);
+    paneContexts.delete(paneId);
+    refreshClientViewers(previous.client);
+  }
+  const attachmentService = new AttachmentService({
+    homeDir: HOME,
+    getWorkspace: () => client.workspace.describe(),
+    normalizeImage: normalizeImageWithElectron,
+  });
+  const draft = attachmentService.createDraft();
+  const context = { id: paneId, ownerWin, client, attachmentService, draft };
+  paneContexts.set(paneId, context);
+  refreshClientViewers(client);
+  return context;
+}
+function describeActivation(context, state) {
+  return {
+    ok: true,
+    key: context.client.key,
+    paneId: context.id,
+    sessionFile: context.client.sessionFile,
+    state,
+    workspace: context.client.workspace.describe(),
+    draft: context.draft,
+  };
+}
+async function stateForClient(client) {
+  const response = await clientCommand(client, { type: 'get_state' });
+  if (!response.success) throw new Error(response.error || 'Agent state is unavailable');
+  client.streaming = !!response.data.isStreaming;
+  client.sessionFile = response.data.sessionFile || client.sessionFile;
+  return response.data;
+}
+async function requireIdleClient(client, action) {
+  const state = await stateForClient(client);
+  if (state.isStreaming) throw new Error(`Stop the current response before ${action}`);
+  return state;
+}
+function runPaneTransition(task) {
+  const run = paneTransitionTail.then(task, task);
+  paneTransitionTail = run.catch(() => {});
+  return run;
+}
+
+const GENERIC_RPC_COMMANDS = new Set([
+  'get_messages', 'get_state', 'get_session_stats', 'get_tree', 'get_branch', 'navigate_tree',
+  'list_agents', 'get_active_subagents', 'get_commands', 'get_available_models', 'set_model',
+  'set_thinking_level', 'set_service_tier', 'set_streaming_behavior', 'set_follow_up_mode',
+  'set_retry_settings', 'set_compaction_settings', 'set_session_name', 'abort', 'abort_retry',
+  'abort_compaction', 'abort_branch_summary', 'reload', 'compact', 'extension_ui_response',
+]);
+const AUTOMATION_RPC_COMMANDS = new Set([
+  'list_schedules', 'add_schedule', 'cancel_schedule', 'list_heartbeats', 'manage_heartbeat',
+]);
+
+secureHandle('rpc:command', async (_event, request) => {
   try {
-    const client = getClient(key);
-    if (!client) throw new Error('No agent for this pane (key ' + key + ')');
-    if (cmd.type === 'switch_session' && cmd.sessionPath) {
-      try {
-        const prep = await prepareTargetSession(cmd.sessionPath);
-        if (!prep.ok) throw new Error(prep.error);
-      } catch (err) {
-        if (err && err.message) return { type: 'response', success: false, error: err.message };
+    assertSmallDto(request);
+    if (!request || typeof request.key !== 'string' || !request.cmd || !GENERIC_RPC_COMMANDS.has(request.cmd.type)) {
+      throw new Error('Use the dedicated chat or session action for that command');
+    }
+    if (Object.prototype.hasOwnProperty.call(request.cmd, 'images')) throw new Error('Image data must use the attachment service');
+    const client = getClient(request.key);
+    if (!client) throw new Error('No agent is attached to this pane');
+    client.lastUsed = Date.now();
+    return await clientCommand(client, { ...request.cmd });
+  } catch (error) { return { type: 'response', success: false, error: publicError(error).error }; }
+});
+
+secureHandle('automation:command', async (_event, request) => {
+  try {
+    assertSmallDto(request, 128 * 1024);
+    if (!request || typeof request.key !== 'string' || !request.cmd || !AUTOMATION_RPC_COMMANDS.has(request.cmd.type)) {
+      throw new Error('Unsupported automation action');
+    }
+    const client = getClient(request.key);
+    if (!client) throw new Error('No agent is attached to this pane');
+    return await clientCommand(client, { ...request.cmd });
+  } catch (error) { return { type: 'response', success: false, error: publicError(error).error }; }
+});
+
+secureHandle('rpc:activate', async (event, request = {}) => {
+  try {
+    assertSmallDto(request, 32 * 1024);
+    const ownerWin = ownerForEvent(event);
+    let sessionPath = null;
+    let targetCwd = HOME;
+    if (request.sessionPath) {
+      const verified = await validateSessionHeader(SESSIONS_DIR, request.sessionPath);
+      sessionPath = verified.sessionPath;
+      targetCwd = verified.header.cwd;
+      if (!clients.has(sessionPath) && !TEST_MODE) {
+        const prepared = await prepareTargetSession(sessionPath);
+        if (!prepared.ok) throw new Error(prepared.error);
       }
+    } else {
+      const sourceContext = request.paneId && paneContexts.get(request.paneId);
+      const sourceClient = sourceContext && sourceContext.ownerWin === ownerWin
+        ? sourceContext.client
+        : getClient(request.sourceKey);
+      if (sourceClient) targetCwd = sourceClient.cwd;
     }
-    if (cmd.type === 'switch_session' || cmd.type === 'new_session') {
-      try {
-        const st = await clientCommand(client, { type: 'get_state' });
-        if (st.success && st.data.isStreaming && st.data.sessionFile) {
-          sendToClientWindows(client, 'rpc-flush-wait', { key: client.key, sessionFile: st.data.sessionFile });
-          await waitForSessionPersisted(st.data.sessionFile);
-        }
-      } catch {}
-    }
-    const timeout = cmd.type === 'switch_session' ? SWITCH_SESSION_TIMEOUT_MS : COMMAND_TIMEOUT_MS;
-    return await clientCommand(client, cmd, timeout);
-  } catch (err) { return { type: 'response', success: false, error: String(err && err.message || err) }; }
+    const client = await ensureClient({ sessionPath, cwd: targetCwd, ownerWin });
+    const state = await stateForClient(client);
+    const context = bindPane(event, request.paneId, client);
+    if (ownerWin) lastFocusedMainWin = ownerWin;
+    return describeActivation(context, state);
+  } catch (error) { return publicError(error, 'The session could not be opened'); }
 });
 
-// Activate a session for a pane: returns client key after ensuring the process exists.
-ipcMain.handle('rpc:activate', async (e, { sessionPath, cwd }) => {
-  const win = BrowserWindow.fromWebContents(e.sender);
-  if (sessionPath && !clients.has(sessionPath)) {
-    try {
-      const prep = await prepareTargetSession(sessionPath);
-      if (!prep.ok) return { ok: false, error: prep.error };
-    } catch {}
-  }
-  const client = ensureClient({ sessionPath, cwd, ownerWin: win });
-  if (!client) return { ok: false, error: 'failed to spawn agent' };
-  if (win) client.viewers.add(win);
-  client.lastUsed = Date.now();
-  if (win) lastFocusedMainWin = win;
-  for (let i = 0; i < 60; i++) {
-    try {
-      const r = await clientCommand(client, { type: 'get_state' });
-      if (r.success) return { ok: true, key: client.key, sessionFile: client.sessionFile, state: r.data };
-    } catch {}
-    await new Promise((r2) => setTimeout(r2, 250));
-  }
-  return { ok: false, error: 'agent did not become ready' };
+secureHandle('rpc:list-clients', async () => [...new Set(clients.values())].map((client) => ({
+  key: client.key, sessionFile: client.sessionFile, streaming: client.streaming, alive: client.alive, cwd: client.cwd,
+})));
+secureHandle('rpc:touch-client', (event, request) => {
+  try {
+    assertSmallDto(request, 8 * 1024);
+    const client = getClient(request && request.key);
+    if (!client) return { ok: false };
+    client.lastUsed = Date.now();
+    const owner = ownerForEvent(event);
+    if (owner) lastFocusedMainWin = owner;
+    return { ok: true };
+  } catch { return { ok: false }; }
 });
-
-ipcMain.handle('rpc:list-clients', () =>
-  [...clients.values()].map((c) => ({ key: c.key, sessionFile: c.sessionFile, streaming: c.streaming, alive: c.alive, cwd: c.cwd })));
-ipcMain.handle('rpc:touch-client', (e, key) => {
-  const client = getClient(key);
-  if (!client) return { ok: false };
-  const win = BrowserWindow.fromWebContents(e.sender);
-  client.lastUsed = Date.now();
-  if (win) { client.viewers.add(win); lastFocusedMainWin = win; }
-  return { ok: true };
+secureHandle('pane:release', async (event, request) => {
+  try {
+    const context = paneContextFor(event, request, { cap: 8 * 1024 });
+    context.attachmentService.deleteDraft(context.draft.id);
+    paneContexts.delete(context.id);
+    refreshClientViewers(context.client);
+    await evictIdleClients();
+    return { ok: true };
+  } catch (error) { return publicError(error); }
 });
 
 // ---------- Empty-session cleanup ----------
 
-function countMessagesInSession(filePath) {
-  try {
-    for (const line of fs.readFileSync(filePath, 'utf8').split('\n')) {
-      if (line.includes('"type":"message"')) return 1;
-    }
-    return 0;
-  } catch { return -1; }
-}
-function cleanupAutoCreatedSessions() {
-  for (const f of createdSessionFiles) {
-    if (countMessagesInSession(f) === 0) { try { fs.unlinkSync(f); } catch {} }
-  }
+async function cleanupAutoCreatedSessions() {
+  await cleanupTrackedEmptySessions(SESSIONS_DIR, createdSessionFiles, countSessionMessages);
 }
 
 // ---------- Session listing ----------
@@ -406,7 +520,7 @@ async function listSessions() {
             const text = typeof m.content === 'string'
               ? m.content
               : (Array.isArray(m.content) ? (m.content.find((c) => c.type === 'text') || {}).text : '');
-            if (text) preview = String(text).replace(/\s+/g, ' ').slice(0, 140);
+            if (text) preview = parseFileTransport(String(text)).text.replace(/\s+/g, ' ').slice(0, 140);
           }
         }
       }
@@ -434,51 +548,41 @@ function watchSessions() {
   } catch {}
 }
 
-ipcMain.handle('sessions:list', () => listSessions());
-ipcMain.handle('sessions:delete', async (_e, sessionPath) => {
+secureHandle('sessions:list', () => listSessions());
+secureHandle('sessions:delete', async (_event, sessionPath) => {
   try {
-    if (!sessionPath.startsWith(SESSIONS_DIR)) throw new Error('refusing to delete outside sessions dir');
-    const c = clients.get(sessionPath);
-    if (c) { clients.delete(sessionPath); try { c.proc.kill(); } catch {} }
-    fs.unlinkSync(sessionPath);
+    const canonical = await canonicalSessionPath(SESSIONS_DIR, sessionPath);
+    const client = clients.get(canonical);
+    if (client) {
+      if (client.streaming) throw new Error('Stop the current response before deleting this session');
+      await disposeClient(client, 'session deletion');
+    }
+    await safeDeleteSession(SESSIONS_DIR, canonical);
     return { ok: true };
-  } catch (err) { return { ok: false, error: String(err) }; }
+  } catch (error) { return publicError(error, 'That session could not be deleted'); }
 });
-ipcMain.handle('sessions:tail', (_e, { path: p, max }) => {
+secureHandle('sessions:tail', async (_event, request) => {
   try {
-    if (!p.startsWith(SESSIONS_DIR)) throw new Error('outside sessions dir');
-    const lines = fs.readFileSync(p, 'utf8').split('\n');
-    const msgs = [];
-    for (const line of lines) {
-      if (!line.includes('"type":"message"')) continue;
+    assertSmallDto(request, 16 * 1024);
+    const sessionPath = await canonicalSessionPath(SESSIONS_DIR, request && request.path);
+    const maximum = Math.max(1, Math.min(Number(request.max) || 50, 100));
+    const messages = [];
+    for (const line of (await fsp.readFile(sessionPath, 'utf8')).split('\n')) {
+      if (!line.trim() || line[0] !== '{') continue;
       try {
-        const obj = JSON.parse(line);
-        if (obj.type !== 'message') continue;
-        const m = obj.message || {};
-        let text = '';
-        if (typeof m.content === 'string') text = m.content;
-        else if (Array.isArray(m.content)) {
-          text = m.content.map((c) => c.type === 'text' ? c.text : (c.type === 'toolCall' ? '[tool: ' + c.name + ']' : '')).filter(Boolean).join('\n');
-        }
-        msgs.push({ role: m.role, text: text.slice(0, 2000), timestamp: m.timestamp });
+        const record = JSON.parse(line);
+        if (record.type !== 'message') continue;
+        const message = record.message || {};
+        const raw = typeof message.content === 'string'
+          ? message.content
+          : Array.isArray(message.content)
+            ? message.content.map((part) => part.type === 'text' ? part.text : part.type === 'toolCall' ? `[tool: ${part.name}]` : '').filter(Boolean).join('\n')
+            : '';
+        messages.push({ role: boundedText(message.role, 40), text: boundedText(parseFileTransport(raw).text, 2_000), timestamp: message.timestamp });
       } catch {}
     }
-    return { ok: true, messages: msgs.slice(-(max || 50)) };
-  } catch (err) { return { ok: false, error: String(err) }; }
-});
-
-// ---------- Git context ----------
-
-ipcMain.handle('git:info', (_e, dir) => {
-  try {
-    if (typeof dir !== 'string' || !dir.startsWith(HOME)) throw new Error('bad dir');
-    const opts = { cwd: dir, timeout: 3000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] };
-    const branch = execSync('git branch --show-current', opts).trim();
-    const root = execSync('git rev-parse --show-toplevel', opts).trim();
-    let dirty = 0;
-    try { dirty = execSync('git status --porcelain | wc -l', { ...opts, shell: '/bin/sh' }).trim(); } catch {}
-    return { ok: true, branch, root, dirty: Number(dirty) || 0 };
-  } catch { return { ok: false }; }
+    return { ok: true, messages: messages.slice(-maximum) };
+  } catch (error) { return publicError(error, 'That session could not be read'); }
 });
 
 // ---------- Agent self-repair / update ----------
@@ -499,10 +603,11 @@ function runAgentInstaller() {
     proc.on('exit', (code) => resolve(code === 0 ? { ok: true } : { ok: false, error: 'Installer exited with code ' + code }));
   });
 }
-ipcMain.handle('agent:install', () => runAgentInstaller());
+secureHandle('agent:install', () => runAgentInstaller());
 
-ipcMain.handle('agent:kill-all', () => {
-  for (const c of clients.values()) { try { c.proc.kill(); } catch {} }
+secureHandle('agent:kill-all', async () => {
+  const unique = [...new Set(clients.values())];
+  await Promise.all(unique.map((client) => disposeClient(client, 'manual restart')));
   clients.clear();
   return { ok: true };
 });
@@ -525,46 +630,86 @@ function writeJsonAtomic(p, obj) {
   fs.renameSync(tmp, p);
 }
 function maskKey(key) {
-  if (!key || typeof key !== 'string') return null;
-  if (key.length <= 8) return '••••';
-  return key.slice(0, 4) + '…' + key.slice(-4);
+  return typeof key === 'string' && key ? '••••' : null;
 }
-
-ipcMain.handle('config:read', () => {
+function sanitizeModelsForRenderer(modelsJson) {
+  const value = modelsJson && typeof modelsJson === 'object' ? JSON.parse(JSON.stringify(modelsJson)) : { providers: {} };
+  if (!value.providers || typeof value.providers !== 'object') value.providers = {};
+  for (const provider of Object.values(value.providers)) {
+    if (!provider || typeof provider !== 'object') continue;
+    provider.hasApiKey = typeof provider.apiKey === 'string' && provider.apiKey !== 'none' && provider.apiKey.length > 0;
+    provider.apiKeyMasked = provider.hasApiKey ? '••••' : null;
+    delete provider.apiKey;
+  }
+  return value;
+}
+function readConfigForRenderer() {
   const settings = readJsonSafe(SETTINGS_PATH, {});
-  const modelsJson = readJsonSafe(MODELS_PATH, { providers: {} });
+  const modelsJson = sanitizeModelsForRenderer(readJsonSafe(MODELS_PATH, { providers: {} }));
   const auth = readJsonSafe(AUTH_PATH, {});
   const authSummary = {};
   for (const [provider, entry] of Object.entries(auth)) {
-    if (entry && typeof entry === 'object') {
-      authSummary[provider] = { type: entry.type || 'unknown', masked: entry.type === 'api_key' ? maskKey(entry.key) : null };
-    } else authSummary[provider] = { type: 'unknown', masked: null };
+    authSummary[provider] = entry && typeof entry === 'object'
+      ? { type: entry.type || 'unknown', masked: entry.type === 'api_key' ? maskKey(entry.key) : null }
+      : { type: 'unknown', masked: null };
   }
   return { settings, modelsJson, auth: authSummary };
-});
-ipcMain.handle('config:write-settings', (_e, patch) => {
-  try { const s = readJsonSafe(SETTINGS_PATH, {}); Object.assign(s, patch); writeJsonAtomic(SETTINGS_PATH, s); return { ok: true }; }
-  catch (err) { return { ok: false, error: String(err) }; }
-});
-ipcMain.handle('config:write-models', (_e, modelsJson) => {
+}
+function writeModelsPreservingSecrets(incoming) {
+  assertSmallDto(incoming);
+  if (!incoming || typeof incoming !== 'object' || !incoming.providers || typeof incoming.providers !== 'object' || Array.isArray(incoming.providers)) {
+    throw new Error('models.json must contain a providers map');
+  }
+  const existing = readJsonSafe(MODELS_PATH, { providers: {} });
+  const providers = {};
+  for (const [id, raw] of Object.entries(incoming.providers)) {
+    if (!/^[a-z0-9][a-z0-9._-]{0,79}$/i.test(id) || !raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid provider entry');
+    const entry = { ...raw };
+    delete entry.hasApiKey;
+    delete entry.apiKeyMasked;
+    if ((entry.apiKey == null || entry.apiKey === '') && existing.providers && existing.providers[id] && typeof existing.providers[id].apiKey === 'string') {
+      entry.apiKey = existing.providers[id].apiKey;
+    }
+    providers[id] = entry;
+  }
+  writeJsonAtomic(MODELS_PATH, { ...incoming, providers });
+  return { ok: true };
+}
+
+secureHandle('config:read', () => readConfigForRenderer());
+secureHandle('config:write-settings', (_event, patch) => {
   try {
-    if (!modelsJson || typeof modelsJson !== 'object' || typeof modelsJson.providers !== 'object') throw new Error('models.json must have a providers map');
-    writeJsonAtomic(MODELS_PATH, modelsJson);
+    assertSmallDto(patch, 64 * 1024);
+    const allowed = new Set(['defaultProvider', 'defaultModel', 'defaultThinkingLevel']);
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch) || Object.keys(patch).some((key) => !allowed.has(key))) throw new Error('Unsupported settings field');
+    const settings = readJsonSafe(SETTINGS_PATH, {});
+    Object.assign(settings, patch);
+    writeJsonAtomic(SETTINGS_PATH, settings);
     return { ok: true };
-  } catch (err) { return { ok: false, error: String(err) }; }
+  } catch (error) { return publicError(error, 'Settings could not be saved'); }
 });
-ipcMain.handle('config:set-api-key', (_e, { provider, key }) => {
+secureHandle('config:write-models', (_event, modelsJson) => {
+  try { return writeModelsPreservingSecrets(modelsJson); }
+  catch (error) { return publicError(error, 'Provider settings could not be saved'); }
+});
+secureHandle('config:set-api-key', (_event, request) => {
   try {
-    if (!provider || !key) throw new Error('provider and key required');
+    assertSmallDto(request, 64 * 1024);
+    if (!request || !/^[a-z0-9][a-z0-9._-]{0,79}$/i.test(request.provider) || typeof request.key !== 'string' || !request.key.trim() || request.key.length > 32_000) throw new Error('Provider and key are required');
     const auth = readJsonSafe(AUTH_PATH, {});
-    auth[provider] = { type: 'api_key', key };
+    auth[request.provider] = { type: 'api_key', key: request.key.trim() };
     writeJsonAtomic(AUTH_PATH, auth);
     return { ok: true };
-  } catch (err) { return { ok: false, error: String(err) }; }
+  } catch (error) { return publicError(error, 'The provider key could not be saved'); }
 });
-ipcMain.handle('config:delete-api-key', (_e, { provider }) => {
-  try { const auth = readJsonSafe(AUTH_PATH, {}); delete auth[provider]; writeJsonAtomic(AUTH_PATH, auth); return { ok: true }; }
-  catch (err) { return { ok: false, error: String(err) }; }
+secureHandle('config:delete-api-key', (_event, request) => {
+  try {
+    if (!request || typeof request.provider !== 'string') throw new Error('Provider is required');
+    const auth = readJsonSafe(AUTH_PATH, {});
+    delete auth[request.provider];
+    writeJsonAtomic(AUTH_PATH, auth);
+    return { ok: true };
+  } catch (error) { return publicError(error, 'The provider key could not be removed'); }
 });
 
 // ---------- xAI OAuth (device code flow) ----------
@@ -618,13 +763,13 @@ function xaiEnsureOverride() {
   modelsJson.providers.xai = prev;
   writeJsonAtomic(MODELS_PATH, modelsJson);
 }
-ipcMain.handle('xai:status', () => {
+secureHandle('xai:status', () => {
   try {
     const data = JSON.parse(fs.readFileSync(XAI_CACHE, 'utf8'));
     return { connected: true, expiresAt: data.expires_at || 0, email: data.email || null };
   } catch { return { connected: false }; }
 });
-ipcMain.handle('xai:disconnect', () => {
+secureHandle('xai:disconnect', () => {
   try { fs.unlinkSync(XAI_CACHE); } catch {}
   try {
     const modelsJson = readJsonSafe(MODELS_PATH, { providers: {} });
@@ -636,12 +781,17 @@ ipcMain.handle('xai:disconnect', () => {
   } catch {}
   return { ok: true };
 });
-ipcMain.handle('xai:connect', async () => {
+secureHandle('xai:connect', async () => {
   const dc = await xaiPost(XAI_ISSUER + '/oauth2/device/code', { client_id: XAI_CLIENT_ID, scope: XAI_SCOPE });
-  if (dc.status !== 200 || !dc.json.device_code) return { ok: false, error: 'xAI device flow failed: ' + JSON.stringify(dc.json) };
+  if (dc.status !== 200 || !dc.json.device_code) return { ok: false, error: `xAI device flow failed (HTTP ${dc.status})` };
   const d = dc.json;
-  broadcast('xai-device-code', { userCode: d.user_code, verificationUri: d.verification_uri });
-  shell.openExternal(d.verification_uri_complete || d.verification_uri);
+  let verificationUrl;
+  try {
+    verificationUrl = new URL(d.verification_uri_complete || d.verification_uri);
+    if (verificationUrl.protocol !== 'https:') throw new Error();
+  } catch { return { ok: false, error: 'xAI returned an invalid verification URL' }; }
+  broadcast('xai-device-code', { userCode: boundedText(d.user_code, 100), verificationUri: verificationUrl.origin + verificationUrl.pathname });
+  shell.openExternal(verificationUrl.href);
   const deadline = Date.now() + (d.expires_in || 900) * 1000;
   let interval = (d.interval || 5) * 1000;
   while (Date.now() < deadline) {
@@ -668,160 +818,361 @@ ipcMain.handle('xai:connect', async () => {
 // ---------- App prefs ----------
 
 const APP_SETTINGS_PATH = path.join(app.getPath('userData'), 'app-settings.json');
-function readAppSettings() { return readJsonSafe(APP_SETTINGS_PATH, { pins: [] }); }
-ipcMain.handle('prefs:get', () => ({ ...readAppSettings(), home: HOME }));
-ipcMain.handle('prefs:write', (_e, patch) => {
-  try { const s = readAppSettings(); Object.assign(s, patch); writeJsonAtomic(APP_SETTINGS_PATH, s); return { ok: true }; }
-  catch (err) { return { ok: false, error: String(err) }; }
+function readAppSettings() {
+  const value = readJsonSafe(APP_SETTINGS_PATH, { pins: [] });
+  return { pins: Array.isArray(value.pins) ? value.pins.filter((item) => typeof item === 'string').slice(0, 500) : [] };
+}
+secureHandle('prefs:get', () => readAppSettings());
+secureHandle('prefs:write', (_event, patch) => {
+  try {
+    assertSmallDto(patch, 256 * 1024);
+    const current = readAppSettings();
+    if (patch && Array.isArray(patch.pins)) current.pins = patch.pins.filter((item) => typeof item === 'string').slice(0, 500);
+    writeJsonAtomic(APP_SETTINGS_PATH, current);
+    return { ok: true };
+  } catch (error) { return publicError(error, 'Preferences could not be saved'); }
 });
 
-// ---------- File tree ----------
+// ---------- Pane workspaces, safe tree, and attachment registry ----------
 
-const TREE_SKIP = new Set(['node_modules', '.git', 'dist', '.worktrees', '__pycache__', '.DS_Store']);
-ipcMain.handle('fs:list-dir', (_e, dirPath) => {
+function resizeWithin(width, height, maxDimension) {
+  const scale = Math.min(1, maxDimension / Math.max(width, height));
+  return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) };
+}
+async function normalizeImageWithElectron({ buffer, mimeType, maxDimension = MAX_DIMENSION, maxBase64 = MAX_IMAGE_BASE64 }) {
+  const image = nativeImage.createFromBuffer(buffer);
+  if (image.isEmpty()) throw new AttachmentError('IMAGE_DECODE', 'That image could not be decoded safely');
+  const sourceSize = image.getSize();
+  if (!sourceSize.width || !sourceSize.height || sourceSize.width * sourceSize.height > 36_000_000) {
+    throw new AttachmentError('IMAGE_DIMENSIONS', 'That image is too large to decode safely (36 megapixels maximum)');
+  }
+  const target = resizeWithin(sourceSize.width, sourceSize.height, maxDimension);
+  let normalizedImage = target.width === sourceSize.width && target.height === sourceSize.height
+    ? image
+    : image.resize({ width: target.width, height: target.height, quality: 'best' });
+  let output = buffer;
+  let outputMime = mimeType;
+  if (target.width !== sourceSize.width || target.height !== sourceSize.height || buffer.toString('base64').length >= maxBase64 || mimeType === 'image/gif') {
+    output = mimeType === 'image/png' ? normalizedImage.toPNG() : normalizedImage.toJPEG(90);
+    outputMime = mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
+  }
+  let quality = 88;
+  for (let round = 0; output.toString('base64').length >= maxBase64 && round < 12; round += 1) {
+    const size = normalizedImage.getSize();
+    if (round >= 4) normalizedImage = normalizedImage.resize({ width: Math.max(1, Math.round(size.width * 0.86)), height: Math.max(1, Math.round(size.height * 0.86)), quality: 'best' });
+    output = normalizedImage.toJPEG(Math.max(45, quality));
+    outputMime = 'image/jpeg';
+    quality -= 7;
+  }
+  if (!output.length || output.toString('base64').length >= maxBase64 || !sniffImageMime(output)) {
+    throw new AttachmentError('IMAGE_NORMALIZE_LIMIT', 'That image remains too large after resizing');
+  }
+  const size = normalizedImage.getSize();
+  const previewSize = resizeWithin(size.width, size.height, 180);
+  const preview = normalizedImage.resize({ ...previewSize, quality: 'good' }).toPNG();
+  return { buffer: output, mimeType: outputMime, width: size.width, height: size.height, previewBuffer: preview, previewMimeType: 'image/png' };
+}
+
+function requireCurrentDraft(context, draftId) {
+  if (!context || !context.draft || context.draft.id !== draftId) throw new AttachmentError('STALE_DRAFT', 'This attachment draft is no longer available');
+}
+function updateContextDraft(context) {
+  context.draft = context.attachmentService.describeDraft(context.draft.id);
+  return context.draft;
+}
+function rotateContextDraft(context) {
+  if (context.draft && context.draft.id) context.attachmentService.deleteDraft(context.draft.id);
+  context.draft = context.attachmentService.createDraft();
+  sendToWindow(context.ownerWin, 'attachments-reset', { paneId: context.id, draft: context.draft });
+  return context.draft;
+}
+
+async function activateProjectForPane(event, context, inspected) {
+  let client = null;
   try {
-    if (typeof dirPath !== 'string' || !dirPath.startsWith(HOME)) throw new Error('outside home');
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-    const out = [];
-    for (const e of entries) {
-      if (TREE_SKIP.has(e.name)) continue;
-      if (e.name.startsWith('.') && !['.prime', '.agents', '.hermes', '.env', '.gitignore'].includes(e.name)) continue;
-      const p = path.join(dirPath, e.name);
-      let stat = null;
-      try { stat = fs.statSync(p); } catch { continue; }
-      out.push({ name: e.name, path: p, type: e.isDirectory() ? 'dir' : 'file', size: stat.size, mtime: stat.mtimeMs });
+    client = await spawnClient({ cwd: inspected.root, ownerWin: context.ownerWin, inspectedWorkspace: inspected });
+    const state = await stateForClient(client);
+    const replacement = bindPane(event, context.id, client);
+    sendToWindow(replacement.ownerWin, 'workspace-changed', { key: client.key, paneId: replacement.id, workspace: client.workspace.describe() });
+    return describeActivation(replacement, state);
+  } catch (error) {
+    // Rollback is simple and complete: bindPane commits only after both the RPC
+    // client and workspace watcher are ready, so the prior pane/context remains.
+    if (client && (!paneContexts.get(context.id) || paneContexts.get(context.id).client !== client)) {
+      await disposeClient(client, 'failed workspace activation rollback').catch(() => {});
     }
-    out.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
-    return { ok: true, entries: out };
-  } catch (err) { return { ok: false, error: String(err) }; }
-});
-const TEXT_EXT = new Set(['.md','.txt','.json','.jsonl','.js','.ts','.py','.sh','.css','.html','.yaml','.yml','.toml','.xml','.svg','.csv','.log','.env','.gitignore','.cjs','.mjs','.jsx','.tsx','.sql','.rb','.go','.rs','.java','.c','.h','.cpp','.plist']);
-ipcMain.handle('fs:read-file', (_e, { path: p, maxBytes }) => {
-  try {
-    if (typeof p !== 'string' || !p.startsWith(HOME)) throw new Error('outside home');
-    const ext = path.extname(p).toLowerCase();
-    if (!TEXT_EXT.has(ext) && ext !== '') return { ok: false, binary: true };
-    const cap = Math.min(maxBytes || 200000, 1000000);
-    const fd = fs.openSync(p, 'r');
-    const buf = Buffer.alloc(cap);
-    const bytes = fs.readSync(fd, buf, 0, cap, 0);
-    fs.closeSync(fd);
-    const stat = fs.statSync(p);
-    return { ok: true, text: buf.slice(0, bytes).toString('utf8'), truncated: stat.size > bytes };
-  } catch (err) { return { ok: false, error: String(err) }; }
-});
+    throw error;
+  }
+}
 
-ipcMain.handle('fs:search', async (_e, { root, query, limit }) => {
+secureHandle('workspace:get', async (event, request) => {
   try {
-    if (typeof root !== 'string') throw new Error('invalid root');
-    const canonicalHome = fs.realpathSync(HOME);
-    const canonicalRoot = fs.realpathSync(root);
-    const fromHome = path.relative(canonicalHome, canonicalRoot);
-    if (fromHome === '..' || fromHome.startsWith('..' + path.sep) || path.isAbsolute(fromHome)) throw new Error('outside home');
-    const needle = String(query || '').toLowerCase();
-    const cap = Math.min(Math.max(Number(limit) || 40, 1), 100);
-    const out = [];
-    const stack = [canonicalRoot];
-    let visited = 0;
-    while (stack.length && out.length < cap && visited < 2500) {
-      const dir = stack.pop();
-      let entries;
-      try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { continue; }
-      for (const entry of entries) {
-        if (++visited > 2500) break;
-        if (TREE_SKIP.has(entry.name)) continue;
-        if (entry.name.startsWith('.') && entry.isDirectory()) continue;
-        const p = path.join(dir, entry.name);
-        if (entry.isDirectory() && !entry.isSymbolicLink()) stack.push(p);
-        const relative = path.relative(canonicalRoot, p);
-        if (!needle || relative.toLowerCase().includes(needle)) {
-          out.push({ name: entry.name, path: p, relative, type: entry.isDirectory() ? 'folder' : 'file' });
-          if (out.length >= cap) break;
-        }
-      }
-    }
-    return { ok: true, entries: out };
-  } catch (err) { return { ok: false, error: String(err), entries: [] }; }
+    const context = paneContextFor(event, request, { cap: 16 * 1024 });
+    return { ok: true, workspace: context.client.workspace.describe(), choices: await context.client.workspace.choicesForRenderer() };
+  } catch (error) { return publicError(error, 'Project details are unavailable'); }
 });
-
-const IMAGE_MIME = new Map([
-  ['.png', 'image/png'], ['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg'],
-  ['.gif', 'image/gif'], ['.webp', 'image/webp'],
-]);
-ipcMain.handle('dialog:pick-attachments', async () => {
+secureHandle('workspace:pick', async (event, request) => {
   try {
-    const r = await dialog.showOpenDialog(null, { properties: ['openFile', 'multiSelections'] });
-    if (r.canceled) return { ok: false, cancelled: true, attachments: [] };
-    const attachments = r.filePaths.map((p) => {
-      const stat = fs.statSync(p);
-      const mimeType = IMAGE_MIME.get(path.extname(p).toLowerCase());
-      if (mimeType) {
-        if (stat.size > 25 * 1024 * 1024) throw new Error(`${path.basename(p)} exceeds the 25 MB image limit`);
-        return { kind: 'image', name: path.basename(p), path: p, mimeType, data: fs.readFileSync(p).toString('base64') };
+    const context = paneContextFor(event, request, { cap: 16 * 1024 });
+    return await runPaneTransition(async () => {
+      await requireIdleClient(context.client, 'changing projects');
+      let selected;
+      if (TEST_MODE && process.env.PRIME_DESKTOP_TEST_PROJECT) selected = path.resolve(process.env.PRIME_DESKTOP_TEST_PROJECT);
+      else {
+        const result = await dialog.showOpenDialog(context.ownerWin, { properties: ['openDirectory', 'createDirectory'] });
+        if (result.canceled) return { ok: false, canceled: true };
+        selected = result.filePaths[0];
       }
-      return { kind: 'file', name: path.basename(p), path: p, size: stat.size };
+      const choice = await context.client.workspace.issuePickerChoice(selected);
+      const inspected = await context.client.workspace.resolveChoice(choice.id);
+      // A response may have started while the native picker was open.
+      await requireIdleClient(context.client, 'changing projects');
+      return await activateProjectForPane(event, context, inspected);
     });
-    return { ok: true, attachments };
-  } catch (err) { return { ok: false, error: String(err), attachments: [] }; }
+  } catch (error) { return publicError(error, 'That project could not be opened'); }
 });
+secureHandle('workspace:activate', async (event, request) => {
+  try {
+    const context = paneContextFor(event, request, { cap: 16 * 1024 });
+    return await runPaneTransition(async () => {
+      await requireIdleClient(context.client, 'changing projects');
+      const inspected = await context.client.workspace.resolveChoice(request.choiceId);
+      return await activateProjectForPane(event, context, inspected);
+    });
+  } catch (error) { return publicError(error, 'That project could not be opened'); }
+});
+secureHandle('workspace:list-dir', async (event, request) => {
+  try {
+    const context = paneContextFor(event, request, { cap: 32 * 1024 });
+    return await context.client.workspace.listDirectory(request.request || {});
+  } catch (error) { return publicError(error, 'That folder could not be read'); }
+});
+secureHandle('workspace:search', async (event, request) => {
+  try {
+    const context = paneContextFor(event, request, { cap: 32 * 1024 });
+    return await context.client.workspace.search(request.request || {});
+  } catch (error) { return { ...publicError(error, 'Project files could not be searched'), entries: [] }; }
+});
+secureHandle('workspace:read-file', async (event, request) => {
+  try {
+    const context = paneContextFor(event, request, { cap: 16 * 1024 });
+    return await context.client.workspace.readFile(request.nodeId, request.maxBytes);
+  } catch (error) { return publicError(error, 'That file could not be read'); }
+});
+secureHandle('workspace:refresh', (event, request) => {
+  try { const context = paneContextFor(event, request, { cap: 8 * 1024 }); context.client.workspace.refresh('manual'); return { ok: true }; }
+  catch (error) { return publicError(error); }
+});
+secureHandle('workspace:context-menu', async (event, request) => {
+  try {
+    const context = paneContextFor(event, request, { cap: 16 * 1024 });
+    const paths = await context.client.workspace.contextPaths(request.nodeId);
+    const menu = Menu.buildFromTemplate([
+      { label: 'Copy Relative Path', click: () => clipboard.writeText(paths.relative) },
+      { label: 'Copy Absolute Path', click: () => clipboard.writeText(paths.absolute) },
+      { type: 'separator' },
+      { label: 'Reveal in Finder', click: () => shell.showItemInFolder(paths.absolute) },
+    ]);
+    menu.popup({ window: context.ownerWin });
+    return { ok: true };
+  } catch (error) { return publicError(error, 'That file action is no longer available'); }
+});
+
+secureHandle('attachments:get', (event, request) => {
+  try { const context = paneContextFor(event, request, { cap: 8 * 1024 }); return { ok: true, draft: context.draft }; }
+  catch (error) { return publicError(error); }
+});
+secureHandle('attachments:pick', async (event, request) => {
+  let context = null;
+  try {
+    context = paneContextFor(event, request, { cap: 16 * 1024 });
+    requireCurrentDraft(context, request.draftId);
+    let paths;
+    if (TEST_MODE && process.env.PRIME_DESKTOP_TEST_ATTACH_PATHS) paths = JSON.parse(process.env.PRIME_DESKTOP_TEST_ATTACH_PATHS);
+    else {
+      const result = await dialog.showOpenDialog(context.ownerWin, { properties: ['openFile', 'multiSelections'] });
+      if (result.canceled) return { ok: true, canceled: true, draft: context.draft };
+      paths = result.filePaths;
+    }
+    const result = await context.attachmentService.ingestPaths({ draftId: request.draftId, paths, source: 'picker' });
+    return { ok: true, ...result, draft: updateContextDraft(context) };
+  } catch (error) { return { ...publicError(error, 'A selected file could not be attached'), draft: context && context.draft }; }
+});
+secureHandle('attachments:drop', async (event, request) => {
+  let context = null;
+  try {
+    context = paneContextFor(event, request, { cap: 128 * 1024 });
+    requireCurrentDraft(context, request.draftId);
+    if (!Array.isArray(request.paths) || request.paths.some((value) => typeof value !== 'string')) throw new AttachmentError('INVALID_SELECTION', 'That dropped file selection is invalid');
+    const result = await context.attachmentService.ingestPaths({ draftId: request.draftId, paths: request.paths, source: 'drop' });
+    return { ok: true, ...result, draft: updateContextDraft(context) };
+  } catch (error) { return { ...publicError(error, 'A dropped file could not be attached'), draft: context && context.draft }; }
+});
+secureHandle('attachments:paste-image', async (event, request) => {
+  let context = null;
+  try {
+    if (!request || typeof request.paneId !== 'string' || typeof request.draftId !== 'string' || typeof request.name !== 'string') throw new AttachmentError('INVALID_IMAGE', 'The pasted image could not be read');
+    context = paneContextFor(event, { paneId: request.paneId, key: request.key }, { cap: 16 * 1024 });
+    requireCurrentDraft(context, request.draftId);
+    const raw = request.bytes;
+    const length = raw && typeof raw.byteLength === 'number' ? raw.byteLength : -1;
+    if (length < 0) throw new AttachmentError('INVALID_IMAGE', 'The pasted image could not be read');
+    if (length > 20_000_000) throw new AttachmentError('IMAGE_TOO_LARGE', 'Images must be 20 MB or smaller');
+    const bytes = Buffer.from(raw.buffer || raw, raw.byteOffset || 0, length);
+    const result = await context.attachmentService.ingestClipboardImage({ draftId: request.draftId, bytes, name: request.name });
+    return { ok: true, item: result.item, duplicate: result.duplicate, draft: updateContextDraft(context) };
+  } catch (error) { return { ...publicError(error, 'The pasted image could not be attached'), draft: context && context.draft }; }
+});
+secureHandle('attachments:add-tree-node', async (event, request) => {
+  let context = null;
+  try {
+    context = paneContextFor(event, request, { cap: 16 * 1024 });
+    requireCurrentDraft(context, request.draftId);
+    const node = await context.client.workspace.contextPaths(request.nodeId);
+    let result;
+    if (node.isDirectory) {
+      result = context.attachmentService.ingestReference({
+        draftId: request.draftId,
+        kind: 'folder',
+        name: path.basename(node.relative) || context.client.workspace.describe().name,
+        dedupeKey: `folder:${node.relative}`,
+        text: `Referenced workspace folder: ${node.relative}`,
+      });
+      result = { items: result.duplicate ? [] : [result.item], duplicates: result.duplicate ? 1 : 0, errors: [] };
+    } else {
+      const file = await context.client.workspace.attachmentPath(request.nodeId);
+      result = await context.attachmentService.ingestPaths({ draftId: request.draftId, paths: [file.path], source: 'tree' });
+    }
+    return { ok: true, ...result, draft: updateContextDraft(context) };
+  } catch (error) { return { ...publicError(error, 'That project entry could not be attached'), draft: context && context.draft }; }
+});
+secureHandle('attachments:add-session', async (event, request) => {
+  let context = null;
+  try {
+    context = paneContextFor(event, request, { cap: 16 * 1024 });
+    requireCurrentDraft(context, request.draftId);
+    const sessionPath = await canonicalSessionPath(SESSIONS_DIR, request.sessionPath);
+    const lines = (await fsp.readFile(sessionPath, 'utf8')).split('\n');
+    const transcript = [];
+    for (const line of lines) {
+      if (!line.trim() || line[0] !== '{') continue;
+      try {
+        const record = JSON.parse(line);
+        if (record.type !== 'message') continue;
+        const message = record.message || {};
+        const text = typeof message.content === 'string' ? message.content : Array.isArray(message.content) ? message.content.filter((part) => part.type === 'text').map((part) => part.text).join('') : '';
+        if (text) transcript.push(`${boundedText(message.role, 40)}: ${boundedText(parseFileTransport(text).text, 2_000)}`);
+      } catch {}
+      if (transcript.length >= 30) break;
+    }
+    const result = context.attachmentService.ingestReference({
+      draftId: request.draftId,
+      kind: 'session',
+      name: boundedText(request.name || path.basename(sessionPath), 255),
+      dedupeKey: `session:${sessionPath}`,
+      text: `<referenced_session>\n${transcript.join('\n')}\n</referenced_session>`,
+    });
+    return { ok: true, items: result.duplicate ? [] : [result.item], duplicates: result.duplicate ? 1 : 0, errors: [], draft: updateContextDraft(context) };
+  } catch (error) { return { ...publicError(error, 'That session could not be attached'), draft: context && context.draft }; }
+});
+secureHandle('attachments:remove', async (event, request) => {
+  let context = null;
+  try {
+    context = paneContextFor(event, request, { cap: 16 * 1024 });
+    requireCurrentDraft(context, request.draftId);
+    context.draft = context.attachmentService.remove({ draftId: request.draftId, attachmentId: request.attachmentId });
+    return { ok: true, draft: context.draft };
+  } catch (error) { return { ...publicError(error, 'That attachment could not be removed'), draft: context && context.draft }; }
+});
+secureHandle('chat:send', async (event, request) => {
+  let context = null;
+  try {
+    context = paneContextFor(event, request, { cap: 256 * 1024 });
+    requireCurrentDraft(context, request.draftId);
+    if (context.sending) throw new Error('A message is already being sent from this pane');
+    context.sending = true;
+    const behavior = request.behavior === 'steer' ? 'steer' : request.behavior === 'followUp' ? 'followUp' : 'prompt';
+    const sent = await context.attachmentService.sendDraft(
+      { draftId: request.draftId, text: request.text || '', behavior },
+      (command) => clientCommand(context.client, command),
+    );
+    if (!sent.accepted) return { ok: false, accepted: false, error: boundedText(sent.error, 500), draft: context.draft };
+    const rendered = { text: sent.serialized.visibleText, attachments: sent.serialized.attachments };
+    const draft = rotateContextDraft(context);
+    return { ok: true, accepted: true, response: sent.response, rendered, draft };
+  } catch (error) { return { ...publicError(error, 'The message could not be sent'), accepted: false, draft: context && context.draft }; }
+  finally { if (context) context.sending = false; }
+});
+secureHandle('security:get-events', () => ({ events: TEST_MODE ? [...securityEvents] : [] }));
 
 // ---------- Skills (list / toggle / add) ----------
 
 const SKILL_DIRS = [path.join(HOME, '.agents', 'skills'), path.join(PRIME_DIR, 'skills')];
+const skillTokens = new Map();
 function scanSkills() {
-  const out = [];
+  skillTokens.clear();
+  const output = [];
   for (const base of SKILL_DIRS) {
     let names;
     try { names = fs.readdirSync(base); } catch { continue; }
-    for (const n of names) {
-      const dir = path.join(base, n);
-      let stat;
-      try { stat = fs.statSync(dir); } catch { continue; }
-      if (!stat.isDirectory()) continue;
-      const enabled = path.join(dir, 'SKILL.md');
-      const disabled = path.join(dir, 'SKILL.md.disabled');
-      let file = null, isEnabled = false;
-      if (fs.existsSync(enabled)) { file = enabled; isEnabled = true; }
-      else if (fs.existsSync(disabled)) { file = disabled; isEnabled = false; }
-      else continue;
+    for (const name of names.slice(0, 1_000)) {
+      const dir = path.join(base, name);
+      const enabledPath = path.join(dir, 'SKILL.md');
+      const disabledPath = path.join(dir, 'SKILL.md.disabled');
+      const file = fs.existsSync(enabledPath) ? enabledPath : fs.existsSync(disabledPath) ? disabledPath : null;
+      if (!file) continue;
       try {
-        const head = fs.readFileSync(file, 'utf8').slice(0, 2000);
-        const nameM = head.match(/^name:\s*(.+)$/m);
-        const descM = head.match(/^description:\s*(.+)$/m);
-        out.push({
-          id: n,
-          name: nameM ? nameM[1].trim() : n,
-          description: descM ? descM[1].trim().slice(0, 300) : '',
-          path: file, dir, enabled: isEnabled,
+        const realDir = fs.realpathSync(dir);
+        const realFile = fs.realpathSync(file);
+        if (!SKILL_DIRS.some((root) => isWithin(fs.realpathSync(root), realDir))) continue;
+        const head = fs.readFileSync(realFile, 'utf8').slice(0, 4_000);
+        const nameMatch = head.match(/^name:\s*(.+)$/m);
+        const descriptionMatch = head.match(/^description:\s*(.+)$/m);
+        const id = `skill_${crypto.randomUUID()}`;
+        skillTokens.set(id, { dir: realDir, file: realFile, enabled: file === enabledPath });
+        output.push({
+          id,
+          name: boundedText(nameMatch ? nameMatch[1].trim() : name, 200),
+          description: boundedText(descriptionMatch ? descriptionMatch[1].trim() : '', 300),
+          enabled: file === enabledPath,
           source: base.includes('.agents') ? 'user' : 'prime',
         });
       } catch {}
     }
   }
-  out.sort((a, b) => a.name.localeCompare(b.name));
-  return out;
+  output.sort((a, b) => a.name.localeCompare(b.name));
+  return output;
 }
-ipcMain.handle('skills:list', () => scanSkills());
-ipcMain.handle('skills:toggle', (_e, { dir, enable }) => {
+secureHandle('skills:list', () => scanSkills());
+secureHandle('skills:read', (_event, id) => {
   try {
-    if (typeof dir !== 'string' || !SKILL_DIRS.some((b) => dir.startsWith(b))) throw new Error('outside skill dirs');
-    const from = path.join(dir, enable ? 'SKILL.md.disabled' : 'SKILL.md');
-    const to = path.join(dir, enable ? 'SKILL.md' : 'SKILL.md.disabled');
+    const entry = skillTokens.get(id);
+    if (!entry) throw new Error('That skill is no longer available');
+    const text = fs.readFileSync(entry.file, 'utf8');
+    return { ok: true, text: text.slice(0, 200_000), truncated: text.length > 200_000 };
+  } catch (error) { return publicError(error, 'That skill could not be read'); }
+});
+secureHandle('skills:toggle', (_event, request) => {
+  try {
+    const entry = skillTokens.get(request && request.id);
+    if (!entry || typeof request.enable !== 'boolean') throw new Error('That skill is no longer available');
+    const from = path.join(entry.dir, request.enable ? 'SKILL.md.disabled' : 'SKILL.md');
+    const to = path.join(entry.dir, request.enable ? 'SKILL.md' : 'SKILL.md.disabled');
     fs.renameSync(from, to);
     return { ok: true };
-  } catch (err) { return { ok: false, error: String(err) }; }
+  } catch (error) { return publicError(error, 'That skill could not be changed'); }
 });
-ipcMain.handle('skills:add-from-folder', async () => {
+secureHandle('skills:add-from-folder', async (event) => {
   try {
-    const r = await dialog.showOpenDialog(null, { properties: ['openDirectory'] });
-    if (r.canceled || !r.filePaths.length) return { ok: false, cancelled: true };
-    const src = r.filePaths[0];
-    if (!fs.existsSync(path.join(src, 'SKILL.md'))) throw new Error('No SKILL.md in that folder');
-    const dest = path.join(PRIME_DIR, 'skills', path.basename(src));
-    if (fs.existsSync(dest)) throw new Error('A skill with that name already exists');
-    fs.cpSync(src, dest, { recursive: true });
-    return { ok: true, dest };
-  } catch (err) { return { ok: false, error: String(err) }; }
+    const result = await dialog.showOpenDialog(ownerForEvent(event), { properties: ['openDirectory'] });
+    if (result.canceled || !result.filePaths.length) return { ok: false, cancelled: true };
+    const source = canonicalDirectory(result.filePaths[0]);
+    if (!fs.existsSync(path.join(source, 'SKILL.md'))) throw new Error('No SKILL.md in that folder');
+    const destination = path.join(PRIME_DIR, 'skills', path.basename(source));
+    if (fs.existsSync(destination)) throw new Error('A skill with that name already exists');
+    fs.cpSync(source, destination, { recursive: true });
+    return { ok: true };
+  } catch (error) { return publicError(error, 'That skill could not be installed'); }
 });
 
 // ---------- HUD ----------
@@ -830,13 +1181,40 @@ let hudWin = null;
 let hudClient = null;
 let lastFocusedMainWin = null;
 const HUD_WIDTH = 620, HUD_HEIGHT = 480;
+function installNavigationPolicy(window, localFile) {
+  const allowed = pathToFileURL(localFile);
+  const localPath = allowed.pathname;
+  const isLocal = (target) => {
+    try { const parsed = new URL(target); return parsed.protocol === 'file:' && parsed.pathname === localPath; }
+    catch { return false; }
+  };
+  const deny = (target, kind) => {
+    rememberSecurityEvent(kind, target);
+    if (!TEST_MODE && /^https?:\/\//i.test(String(target || ''))) shell.openExternal(target).catch(() => {});
+  };
+  window.webContents.on('will-navigate', (event, target) => {
+    if (isLocal(target)) return;
+    event.preventDefault();
+    deny(target, 'navigation-denied');
+  });
+  window.webContents.on('will-redirect', (event, target) => {
+    if (isLocal(target)) return;
+    event.preventDefault();
+    deny(target, 'redirect-denied');
+  });
+  window.webContents.setWindowOpenHandler(({ url }) => { deny(url, 'window-open-denied'); return { action: 'deny' }; });
+  window.webContents.on('will-attach-webview', (event) => event.preventDefault());
+}
+
 function createHud() {
   hudWin = new BrowserWindow({
     width: HUD_WIDTH, height: HUD_HEIGHT, frame: false, resizable: false,
     alwaysOnTop: true, skipTaskbar: true, show: false, backgroundColor: '#0f1011',
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
-  hudWin.loadFile(path.join(__dirname, 'renderer', 'hud.html'));
+  const hudFile = path.join(__dirname, 'renderer', 'hud.html');
+  installNavigationPolicy(hudWin, hudFile);
+  hudWin.loadFile(hudFile);
   hudWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   hudWin.on('blur', () => { if (hudWin && !hudWin.webContents.isDevToolsOpened()) hudWin.hide(); });
 }
@@ -872,8 +1250,8 @@ function toggleHud() {
     streaming: !!(hudClient && hudClient.streaming),
   });
 }
-ipcMain.handle('hud:hide', () => { if (hudWin) hudWin.hide(); });
-ipcMain.handle('hud:prompt', async (_e, { key, text }) => {
+secureHandle('hud:hide', () => { if (hudWin) hudWin.hide(); });
+secureHandle('hud:prompt', async (_e, { key, text }) => {
   try {
     const client = key ? selectHudClient(key) : (hudClient && hudClient.alive ? hudClient : selectHudClient(null));
     if (!client) return { ok: false, error: 'no agent running' };
@@ -890,14 +1268,14 @@ ipcMain.handle('hud:prompt', async (_e, { key, text }) => {
     };
   } catch (err) { return { ok: false, error: String(err && err.message || err) }; }
 });
-ipcMain.handle('hud:abort', async () => {
+secureHandle('hud:abort', async () => {
   try {
     if (!hudClient || !hudClient.alive) return { ok: false, error: 'no agent running' };
     const r = await clientCommand(hudClient, { type: 'abort' });
     return { ok: !!r.success, error: r.error || null };
   } catch (err) { return { ok: false, error: String(err && err.message || err) }; }
 });
-ipcMain.handle('hud:open-session', () => {
+secureHandle('hud:open-session', () => {
   if (!hudClient) return { ok: false, error: 'no session selected' };
   const owner = (lastFocusedMainWin && hudClient.viewers && hudClient.viewers.has(lastFocusedMainWin))
     ? lastFocusedMainWin
@@ -919,54 +1297,63 @@ const wins = new Set();
 function createWindow(sessionQuery) {
   const win = new BrowserWindow({
     width: 1280, height: 840, minWidth: 940, minHeight: 600,
-    title: 'Prime Agent', backgroundColor: '#08090a',
+    title: 'Prime Agent', backgroundColor: '#08090a', show: !TEST_MODE,
     titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 14, y: 14 },
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   wins.add(win);
+  if (TEST_MODE) win.webContents.on('console-message', (_event, details) => {
+    if (details && ['warning', 'error'].includes(details.level)) console.error('RENDERER_CONSOLE', boundedText(details.message, 2_000), boundedText(details.sourceId, 300), Number(details.lineNumber) || 0);
+  });
   win.on('focus', () => { lastFocusedMainWin = win; });
   win.on('closed', () => {
     wins.delete(win);
-    for (const client of clients.values()) client.viewers && client.viewers.delete(win);
+    const affected = new Set();
+    for (const [paneId, context] of paneContexts) {
+      if (context.ownerWin !== win) continue;
+      context.attachmentService.deleteDraft(context.draft.id);
+      paneContexts.delete(paneId);
+      affected.add(context.client);
+    }
+    for (const client of affected) refreshClientViewers(client);
+    void evictIdleClients();
     if (lastFocusedMainWin === win) lastFocusedMainWin = null;
   });
   const file = path.join(__dirname, 'renderer', 'index.html');
+  installNavigationPolicy(win, file);
   if (sessionQuery) win.loadFile(file, { query: { session: sessionQuery } });
   else win.loadFile(file);
-  if (process.env.PRIME_DESKTOP_DEVTOOLS) win.webContents.openDevTools({ mode: 'detach' });
-  if (process.env.PRIME_DESKTOP_CAPTURE) {
+  if (!app.isPackaged && !TEST_MODE && process.env.PRIME_DESKTOP_DEVTOOLS) win.webContents.openDevTools({ mode: 'detach' });
+  if (TEST_MODE && process.env.PRIME_DESKTOP_EVAL) {
     win.webContents.once('did-finish-load', () => {
-      if (process.env.PRIME_DESKTOP_EVAL) {
-        setTimeout(() => {
-          win.webContents.executeJavaScript(process.env.PRIME_DESKTOP_EVAL)
-            .then((r) => { if (r !== undefined) console.log('EVAL_RESULT', JSON.stringify(r)); })
-            .catch((e) => console.error('eval hook failed', e));
-        }, Number(process.env.PRIME_DESKTOP_EVAL_DELAY || 1500));
-      }
       setTimeout(async () => {
         try {
-          const img = await win.webContents.capturePage();
-          fs.writeFileSync(process.env.PRIME_DESKTOP_CAPTURE, img.toPNG());
-          console.log('CAPTURED', process.env.PRIME_DESKTOP_CAPTURE);
-        } catch (e) { console.error('capture failed', e); }
-        if (process.env.PRIME_DESKTOP_QUIT_AFTER_CAPTURE) app.quit();
-      }, Number(process.env.PRIME_DESKTOP_CAPTURE_DELAY || 2500));
+          const result = await win.webContents.executeJavaScript(process.env.PRIME_DESKTOP_EVAL, true);
+          console.log('EVAL_RESULT', JSON.stringify(result));
+        } catch (error) {
+          console.error('EVAL_ERROR', boundedText(error && error.message));
+          process.exitCode = 1;
+        }
+        if (process.env.PRIME_DESKTOP_QUIT_AFTER_EVAL === '1') app.quit();
+      }, Math.max(100, Number(process.env.PRIME_DESKTOP_EVAL_DELAY) || 800));
     });
+  }
+  if (TEST_MODE && process.env.PRIME_DESKTOP_CAPTURE) {
+    win.webContents.once('did-finish-load', () => setTimeout(async () => {
+      try { fs.writeFileSync(process.env.PRIME_DESKTOP_CAPTURE, (await win.webContents.capturePage()).toPNG()); }
+      catch {}
+    }, 1_000));
   }
   return win;
 }
 
-ipcMain.handle('window:pop-out', (_e, sessionPath) => {
-  createWindow(sessionPath || undefined);
-  return { ok: true };
+secureHandle('window:pop-out', async (_event, sessionPath) => {
+  try {
+    const canonical = sessionPath ? await canonicalSessionPath(SESSIONS_DIR, sessionPath) : null;
+    createWindow(canonical || undefined);
+    return { ok: true };
+  } catch (error) { return publicError(error, 'That session could not be opened in a new window'); }
 });
-
-ipcMain.handle('dialog:pick-directory', async (e) => {
-  const win = BrowserWindow.fromWebContents(e.sender);
-  const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] });
-  return r.canceled ? null : r.filePaths[0];
-});
-ipcMain.handle('shell:open-path', (_e, p) => shell.openPath(p));
 
 // ---------- Menu ----------
 
@@ -982,7 +1369,8 @@ function buildMenu() {
     ] },
     { label: 'File', submenu: [
       { label: 'New Chat', accelerator: 'CmdOrCtrl+N', click: send('new-chat') },
-      { label: 'Open Folder…', accelerator: 'CmdOrCtrl+O', click: send('new-folder-chat') },
+      { label: 'Open Project…', accelerator: 'CmdOrCtrl+O', click: send('open-project') },
+      { label: 'Attach Files…', accelerator: 'CmdOrCtrl+Shift+A', click: send('attach-files') },
       { label: 'New Window', accelerator: 'CmdOrCtrl+Shift+N', click: () => createWindow() },
       { type: 'separator' },
       { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: send('open-settings') },
@@ -999,37 +1387,35 @@ function buildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-// ---------- Smoke test / boot ----------
-
-async function smokeTest() {
-  const win = null;
-  const client = spawnClient({ ownerWin: null });
-  try {
-    const state = await clientCommand(client, { type: 'get_state' });
-    console.log('SMOKE get_state:', state.success, state.data && state.data.model && state.data.model.id);
-    const models = await clientCommand(client, { type: 'get_available_models' });
-    console.log('SMOKE models:', models.success, models.data && models.data.models.length);
-    const sessions = await listSessions();
-    console.log('SMOKE sessions listed:', sessions.length);
-    console.log('SMOKE OK');
-    process.exit(0);
-  } catch (err) { console.error('SMOKE FAIL', err); process.exit(1); }
-}
+// ---------- Boot ----------
 
 app.whenReady().then(async () => {
-  if (process.env.SMOKE_TEST) { smokeTest(); return; }
   buildMenu();
   createHud();
-  globalShortcut.register('CommandOrControl+Shift+Space', toggleHud);
+  if (!TEST_MODE) globalShortcut.register('CommandOrControl+Shift+Space', toggleHud);
   createWindow();
   watchSessions();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
 app.on('window-all-closed', () => { /* HUD hotkey keeps app alive; Cmd+Q to quit */ });
-app.on('before-quit', () => {
+let shutdownStarted = false;
+let shutdownComplete = false;
+app.on('before-quit', (event) => {
+  if (shutdownComplete) return;
+  event.preventDefault();
+  if (shutdownStarted) return;
+  shutdownStarted = true;
   globalShortcut.unregisterAll();
-  cleanupAutoCreatedSessions();
-  for (const c of clients.values()) { try { c.proc.kill(); } catch {} }
-  clients.clear();
+  const unique = [...new Set(clients.values())];
+  void (async () => {
+    try {
+      await Promise.all(unique.map((client) => disposeClient(client, 'shutdown')));
+      await cleanupAutoCreatedSessions();
+    } finally {
+      clients.clear();
+      shutdownComplete = true;
+      app.quit();
+    }
+  })();
 });

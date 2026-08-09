@@ -1,74 +1,65 @@
 # Prime Desktop
 
-A native macOS desktop app for [Prime Agent](https://primeintellect.ai) — modeled after Hermes.app (Nous Research), skinned with the Linear desktop-app design system (dark-native `#08090a` canvas, fully achromatic — emphasis comes from white luminance steps, not hue; translucent white borders) and the official Prime butterfly mark (`assets/brand/prime-butterfly.svg` from PrimeIntellect-ai/prime-agent). Electron shell over `prime-agent --mode rpc`.
+A native macOS Electron client for [Prime Agent](https://primeintellect.ai), with a dark desktop workflow modeled after Hermes. It speaks to `prime-agent --mode rpc` over bounded JSONL stdio and intentionally excludes voice.
 
-Product direction and the complete no-voice Hermes parity contract are tracked in [`HERMES_PARITY.md`](HERMES_PARITY.md). This is the build baseline, not an optional backlog.
+The current Hermes-minus-voice contract and honest completion states live in [`PARITY.md`](PARITY.md).
 
 ![stack](https://img.shields.io/badge/electron-35-blue) ![status](https://img.shields.io/badge/status-v0.6.1-green)
 
-## Features
+## v0.6.1 highlights
 
-- **Sidebar session navigation** — every `~/.prime/agent/sessions/*.jsonl` session listed with name/preview, cwd, relative time, and message count; live-refreshes via `fs.watch`; filter box; hover-to-delete
-- **Easy model switching** — searchable picker with all ~296 configured models grouped by provider; thinking-level picker alongside it
-- **Streaming chat** — markdown rendering (marked + DOMPurify), collapsible thinking blocks, live tool-call cards with streaming output (bash, ipython, edits, etc.)
-- **Steering** — type while the agent works to steer it; stop button aborts; queued-message hint
-- **Session ops** — new chat (⌘N), switch, delete, context-window % and cost meter
-- **Extension UI protocol** — confirm/select/input/editor dialogs from extensions render as native-feeling modals; notifications as banners
-- **Crash resilience** — RPC process exit shows a banner with one-click restart
+- **Concurrent sessions** — two independent panes, drag-to-split, pop-outs, pane focus, and live event fanout when panes/windows view the same session.
+- **Project-aware chats** — per-pane Choose Project, recents, linked Git worktrees/branch identity, Cmd+O, and cwd-pinned process/session activation.
+- **Safe file explorer** — lazy ignored tree, symlink confinement, cached pagination, refresh watching, text preview, Add to chat, copy path, and Finder reveal.
+- **Attachment drafts** — image paste/picker/drop with decode/resize and caps; general-file, folder, and session references; thumbnails/chips/removal; attachment-only turns; retention when a prompt is rejected.
+- **Inline context** — keyboard-navigable `/` command and `@` workspace/session suggestions.
+- **Prime controls** — model/thinking pickers, steering and stop, context/cost, schedules/heartbeats, capabilities, settings, and focused-session HUD.
+- **Hardened boundaries** — sandboxed renderer, narrow sender-validated IPC, bounded DTOs/JSONL, write-only credentials, navigation denial, sensitive-path policy, transactional project changes, and awaited RPC teardown.
 
 No voice integration, by design.
-
-## Launch
-
-The app is installed at `/Applications/Prime Agent.app`:
-
-- **Spotlight**: ⌘Space → type "Prime Agent" → Enter
-- **Finder**: Applications → Prime Agent (drag to Dock to pin it)
-- **Terminal**: `open -a "Prime Agent"`
 
 ## Run from source
 
 ```bash
 npm install
-npm start            # dev
-npm run smoke        # headless protocol self-test
-npm run dist         # build dist/mac-arm64/Prime Agent.app
+npm test
+npm run smoke
+npm run ui-smoke
+npm run pack
+npm start
 ```
 
-Requires `prime-agent` on PATH (auto-detects `~/.hermes/node/bin/prime-agent`).
-
-## Dev hooks (env vars)
-
-| Var | Effect |
-|---|---|
-| `SMOKE_TEST=1` | Headless: checks get_state / models / session listing, exits |
-| `PRIME_DESKTOP_DEVTOOLS=1` | Open devtools detached |
-| `PRIME_DESKTOP_CAPTURE=/path.png` | Screenshot the window after load |
-| `PRIME_DESKTOP_EVAL="js"` | Run JS in the renderer after load (UI automation) |
+The app locates `prime-agent` from standard local install paths or `PATH`. Finder/Spotlight launches do not depend on an interactive shell PATH.
 
 ## Architecture
 
+```text
+main.js               Electron authority boundary, pane/client routing, IPC, settings/HUD
+lib/rpc-manager.js    generation-safe JSONL RPC and awaited TERM→KILL lifecycle
+lib/workspace-service.js
+                      safe projects/worktrees, tree/search/watch/cache services
+lib/attachment-service.js
+                      draft ownership, image normalization policy, file/reference transport
+lib/session-utils.js  canonical session validation and cleanup
+preload.js            narrow pane-aware contextBridge
+renderer/             sandboxed multi-pane UI and draft reducer
+scripts/               offline fake agent plus protocol and Electron UI smoke tests
 ```
-main.js            Electron main: spawns `prime-agent --mode rpc`, strict JSONL framing
-                   (LF-only splitting), request/response correlation, session-file scanner
-preload.js         contextBridge: prime.command / listSessions / events
-renderer/          sandboxed UI: sidebar, streaming chat, pickers, modals
+
+```text
+sandboxed renderer <-- validated IPC --> Electron main <-- bounded JSONL --> prime-agent RPC
 ```
 
-The renderer never touches Node. All agent traffic flows:
+The renderer does not receive arbitrary shell or filesystem APIs. Project/file operations use opaque pane, workspace, choice, and node IDs. User-selected external files are explicitly labeled; dropped files remain confined to the selected project.
 
-```
-renderer <--IPC--> main.js <--JSONL stdio--> prime-agent --mode rpc
-```
+## Offline verification
 
-## Notes
+`npm run smoke` and `npm run ui-smoke` use `scripts/fake-agent.js`, an isolated temporary HOME, and local fixtures. They require no network or provider credentials. The UI smoke covers project/worktree selection, multi-pane isolation, tree and attachment flows, rejection retention, streaming transition guards, drop policy, credential redaction, sandboxing, and navigation denial.
 
-- **Mid-stream switching works**: the daemon keeps a switched-away session running in a resident worker. The app guards one upstream quirk — a brand-new session's file is flushed a few seconds after the first prompt, and switching away before that flush would orphan it — so a switch may pause briefly with "saving session before switching…".
-- **Finder launches**: the app resolves `prime-agent` via explicit node + bundle path (`~/.local/lib/node_modules/prime-agent/dist/bundle/cli.js`), so it works from Spotlight/Finder where PATH is sparse.
-- **Housekeeping**: empty sessions created by the app are deleted on quit. Double-click a session name in the sidebar to rename it.
+## Current limitations
 
-## Known limitations (v0.6.1)
-
-- No branch/tree view, no fork UI (RPC supports it — `fork`, `get_fork_messages`)
-- No RLM subagent tree view (RPC `observe` command exists for this)
-- Unsigned build: fine locally; for distribution add a Developer ID cert
+- Two panes maximum; arbitrary persisted split trees are not implemented.
+- General files are local references, not remote uploads (Prime RPC has no generic file-upload object).
+- One active cwd per RPC client; project switching starts/rebinds a client rather than mutating another live chat.
+- Workspace editing/diffs, integrated terminals, session export, full branch management, and signed self-update remain future work.
+- Unsigned local build; distribution requires Apple signing/notarization.

@@ -1,0 +1,46 @@
+# Prime Desktop Hermes-Parity Matrix
+
+Prime Desktop treats **Hermes desktop parity, minus voice**, as a standing product target. This file is the repository-local source of truth for what exists, what remains partial, and what is intentionally excluded. States describe this commit; they do not infer backend/provider success from visible UI strings.
+
+## State vocabulary
+
+- `done` — the core surface is implemented and covered by automated verification.
+- `partial` — useful behavior exists, but material Hermes behavior remains.
+- `next` — accepted direction, not implemented in this release.
+- `unsupported` — not promised by the current public Prime Agent RPC contract.
+- `excluded` — deliberately outside the product target.
+
+## Matrix
+
+| Surface | State | Prime Desktop v0.6.1 status | Remaining boundary |
+|---|---|---|---|
+| Chat rendering and streaming | done | Markdown, thinking, tool cards, prompt/steer/follow-up transport, stop, queue notices, and attachment-only turns. | Richer artifact/tool renderers remain incremental. |
+| Sessions and history | done | New/switch/delete/rename, pins, search, cwd-aware resume, safe header/deletion validation, and history attachment reconstruction. | Export and branch-from-message remain `next`. |
+| Concurrent panes | partial | Two independently focused panes, drag/split, pop-outs, shared-client event fanout, pane-scoped drafts, and safe independent project rebinding. | Persisted arbitrary split trees and more than two panes remain `next`. |
+| Models and reasoning | done | Searchable provider/model and thinking-level controls with session fidelity. | Provider availability is backend-owned. |
+| Provider settings | partial | Built-in/custom providers, masked key state, xAI device OAuth, write-only secret handling, and cwd-preserving restart. | Broader account/gateway lifecycle remains `next`. |
+| Image paste and image files | done | Paste, picker, and drop; byte sniffing; decode/resize; thumbnails; removal; dedupe; caps; and exact bare-base64 Prime image RPC blocks. | Prime RPC publishes no server-side image limits, so the documented Desktop limits apply. |
+| General file attachments | partial | Picker/drop/tree chips, workspace-relative and explicit external refs, exact structured transport parsing, dedupe/caps, and rejection retention. | Prime RPC has no generic upload object; refs require local file-tool access and are not remote uploads. |
+| Folder and session references | partial | Workspace-folder and bounded session transcript context can be attached with pane-scoped chips. | Arbitrary external folder uploads and richer context objects are not supported by public RPC. |
+| Project selection and recents | done | Obvious project button, native Choose Folder, merged recents, Cmd+O, opaque choice IDs, and per-pane transactional activation. | Multi-root workspaces remain `next`; one Prime runtime is pinned to one cwd. |
+| Git branch/worktree selection | done | Branch/detached identity and linked-worktree choices use argument-array git calls. | Branch/worktree create/remove/mutation UI remains `next`. |
+| File explorer | done | Root-confined lazy tree, ignores, symlink containment, cached opaque pagination, watch refresh, preview, Add to chat, copy path, and Finder reveal. | Editing, rename/Trash, diffs, and terminal remain `next`. |
+| Inline commands and references | done | Async-invalidated `/` command suggestions plus `@` workspace/session/folder suggestions with keyboard navigation. | A unified global Cmd+K/Cmd+P palette remains `next`. |
+| Conversation branch/tree | partial | Existing tree/branch RPC compatibility and subagent/session context are preserved. | Full visual lineage navigation and fork workflows remain `next`. |
+| Schedules and heartbeats | partial | Current RPC shapes render with create/edit/pause/resume/run/delete entry points. | Delivery/history depth and exhaustive error/status UX need further parity work. |
+| Agents and messaging | partial | Existing agent/subagent summaries and transcript surfaces are preserved. | Full live nested worker lifecycle controls remain `next`. |
+| Capabilities / skills / commands | partial | Discoverable capabilities panel, safe skill preview tokens, and public RPC command list. | Plugin/MCP lifecycle administration remains `next`. |
+| HUD | partial | Focused-session binding, assistant lifecycle/error output, stop, and open-full-session actions. | Shared attachment/reference composition and richer window behavior remain `next`. |
+| Activity and usage | partial | Per-session context and cost appear in each pane. | Cross-session 7/30/90-day usage and system activity views remain `next`. |
+| Notifications | partial | Inline banners, attachment errors, streaming state, and empty/loading/retry states. | Native completion/error notification preferences remain `next`. |
+| Keybindings | partial | Cmd+N, Cmd+O, Cmd+Shift+A, settings, HUD, Escape, tree keyboard/context actions, and menu accelerators. | Editable keybinding registry remains `next`. |
+| Artifacts | next | Project preview is workspace-scoped, not a cross-session artifact index. | Add an artifact index with source-session linkage. |
+| Export | next | No session export UI. | Add safe export formats and destinations. |
+| Update / repair | partial | Agent install/repair/update and controlled restart surfaces are retained. | Signed app self-update/distribution remains incomplete. |
+| Voice | excluded | No capture, dictation, wake word, TTS, or voice settings will be added for parity. | Deliberate product rule. |
+
+## Current security and ownership boundary
+
+The renderer is sandboxed and receives bounded descriptors or opaque IDs for filesystem authority. Main-process IPC validates the sender and DTO size; high-authority operations have dedicated handlers. Workspace changes are serialized and transactional, never mutate another pane's live client, and never replace an old RPC generation until TERM→KILL teardown is awaited. Broad roots, HOME, private credential paths, escaping symlinks, remote navigation, remote Markdown media, malformed attachment markers, and accidental dropped external files are denied.
+
+Prime Agent 0.7.1 does not document attachment limits, so Desktop owns these limits: 20 MB and 36 megapixels per source image, normalization to at most 1568×1568 and under 4.5 MiB of base64, six images and 18 MiB normalized image base64 per draft, twenty file/context refs per draft, 200 visible file-tree entries per page, and bounded workspace search.
