@@ -502,3 +502,84 @@ details.thinking .thinking-body {
 
 /* neutralize legacy absolute positioning for action buttons inside .s-actions */
 .s-actions .s-act, .s-actions .s-delete { position: static; display: block; }
+
+/* ---------- v0.6 panes ---------- */
+#panes { flex: 1; display: flex; min-width: 0; }
+.pane {
+  flex: 1; display: flex; flex-direction: column; min-width: 0;
+  border-left: 1px solid transparent;
+}
+body.split .pane:first-child { border-right: 1px solid var(--border); }
+.pane.focused .pane-topbar { box-shadow: inset 0 1px 0 rgba(255,255,255,0.10); }
+.pane-topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 16px; padding-top: 38px;
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
+}
+.pane-topbar button, .pane-topbar input, .pane-topbar .picker-menu { -webkit-app-region: no-drag; }
+.topbar-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.pane-title {
+  font-weight: 510; font-size: 13px; color: var(--text-dim); letter-spacing: -0.13px;
+  max-width: 240px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: inline-block;
+}
+.git-pill {
+  font-size: 11px; font-family: var(--mono); color: var(--text-dim);
+  background: rgba(255,255,255,0.04); border: 1px solid var(--border-solid);
+  padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+}
+.topbar-right { display: flex; align-items: center; gap: 6px; }
+.pane-banner {
+  padding: 7px 16px; font-size: 12.5px;
+  background: rgba(210,153,34,.10); color: var(--amber);
+  border-bottom: 1px solid var(--border);
+}
+.pane-banner.error { background: rgba(235,87,87,.10); color: var(--red); }
+.chat-scroll { flex: 1; overflow-y: auto; position: relative; }
+.chat { max-width: 860px; margin: 0 auto; padding: 24px 24px 12px; }
+body.split .chat { padding: 18px 16px 10px; }
+.empty-state {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; color: var(--text-dim); gap: 10px;
+  pointer-events: none;
+}
+.composer { border-top: 1px solid var(--border); padding: 12px 16px 8px; }
+
+/* panel head/tabs (shared by settings/capabilities/schedules) */
+.panel-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 18px 10px; font-weight: 590; font-size: 15px; letter-spacing: -0.13px;
+}
+.panel-head button { color: var(--text-dim); padding: 2px 6px; border-radius: 4px; }
+.panel-head button:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+.panel-tabs { display: flex; gap: 4px; padding: 0 18px; border-bottom: 1px solid var(--border); }
+.panel-body { flex: 1; overflow-y: auto; padding: 14px 18px; }
+#schedules-panel {
+  background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 12px;
+  width: 640px; max-width: 92vw; height: 540px; max-height: 88vh;
+  display: flex; flex-direction: column; box-shadow: var(--shadow-dialog);
+}
+#schedules-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 90;
+  display: flex; align-items: center; justify-content: center;
+}
+#capabilities-foot, #settings-foot {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 18px; border-top: 1px solid var(--border);
+  font-size: 12px; color: var(--amber);
+}
+
+/* skill toggle switch */
+.skill-toggle { display: flex; align-items: center; cursor: pointer; margin-right: 4px; }
+.skill-toggle input { display: none; }
+.toggle-track {
+  width: 28px; height: 16px; border-radius: 999px;
+  background: rgba(255,255,255,0.10); position: relative; transition: background .15s;
+}
+.toggle-track::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--text-dim); transition: transform .15s, background .15s;
+}
+.skill-toggle input:checked + .toggle-track { background: rgba(255,255,255,0.35); }
+.skill-toggle input:checked + .toggle-track::after { transform: translateX(12px); background: var(--text); }

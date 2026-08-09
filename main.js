@@ -7,10 +7,15 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+const { primeDaemonLaunchConfig } = require('./daemon-launch');
+const { prepareSessionHandoff } = require('./session-handoff');
+
 const HOME = os.homedir();
 const SESSIONS_DIR = path.join(HOME, '.prime', 'agent', 'sessions');
 const COMMAND_TIMEOUT_MS = 30000;
+const SWITCH_SESSION_TIMEOUT_MS = 90000;
 const MAX_CLIENTS = 8;
+const DAEMON_LAUNCH = primeDaemonLaunchConfig();
 
 // ---------- Agent binary resolution ----------
 
@@ -30,6 +35,9 @@ function buildChildEnv() {
   const current = (env.PATH && env.PATH.length > 10 ? env.PATH : loginShellPath()) || '/usr/bin:/bin:/usr/sbin:/sbin';
   env.PATH = [...extra, ...current.split(':')].filter(Boolean).join(':');
   if (!env.SHELL) env.SHELL = '/bin/zsh';
+  // Finder/Electron can expose /tmp while terminal clients use macOS's
+  // DARWIN_USER_TEMP_DIR. Normalize it so every client reaches one daemon.
+  env.TMPDIR = DAEMON_LAUNCH.tempDir;
   return env;
 }
 
@@ -91,7 +99,7 @@ function spawnClient({ sessionPath, cwd, ownerWin }) {
     sendToWindow(ownerWin, 'rpc-error', { key, message: 'prime-agent binary not found.' });
     return null;
   }
-  const args = [...invocation.args, '--mode', 'rpc'];
+  const args = [...invocation.args, '--mode', 'rpc', '--daemon-socket', DAEMON_LAUNCH.socketPath];
   if (sessionPath) args.push('--resume', sessionPath);
   let proc;
   try {
@@ -190,7 +198,7 @@ function handleClientMessage(client, obj) {
   sendToWindow(client.ownerWin, 'rpc-event', { key: client.key, event: obj });
 }
 
-function clientCommand(client, cmd) {
+function clientCommand(client, cmd, timeoutMs) {
   return new Promise((resolve, reject) => {
     if (!client || !client.alive) return reject(new Error('Agent process is not running'));
     const id = 'req-' + (++requestSeq);
@@ -200,7 +208,7 @@ function clientCommand(client, cmd) {
         client.pending.delete(id);
         reject(new Error('Command timed out: ' + (cmd.type || 'unknown')));
       }
-    }, COMMAND_TIMEOUT_MS);
+    }, timeoutMs || COMMAND_TIMEOUT_MS);
     client.pending.set(id, { resolve, reject, timer });
     try { client.proc.stdin.write(JSON.stringify(cmd) + '\n'); }
     catch (e) { clearTimeout(timer); client.pending.delete(id); reject(e); }
@@ -220,6 +228,47 @@ function ensureClient({ key, sessionPath, cwd, ownerWin }) {
   return spawnClient({ sessionPath: sessionPath || (key && key.startsWith('/') ? key : null), cwd, ownerWin });
 }
 
+function runAgentCliJson(args, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const childEnv = buildChildEnv();
+    const invocation = resolveAgentInvocation(childEnv);
+    if (!invocation) return reject(new Error('prime-agent binary not found'));
+    let stdout = '', stderr = '', settled = false;
+    const proc = spawn(invocation.command, [
+      ...invocation.args,
+      args[0],
+      '--daemon-socket', DAEMON_LAUNCH.socketPath,
+      ...args.slice(1),
+    ], { cwd: HOME, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill(); } catch {}
+      reject(new Error(`prime-agent ${args[0]} timed out`));
+    }, timeoutMs);
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', (err) => { if (settled) return; settled = true; clearTimeout(timer); reject(err); });
+    proc.on('exit', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(stderr.trim() || `prime-agent ${args[0]} exited with code ${code}`));
+      try { resolve(stdout.trim() ? JSON.parse(stdout) : {}); }
+      catch { reject(new Error(`prime-agent ${args[0]} returned invalid JSON`)); }
+    });
+  });
+}
+
+async function prepareTargetSession(sessionPath) {
+  return prepareSessionHandoff(sessionPath, {
+    list: async () => (await runAgentCliJson(['list', '--json'])).sessions || [],
+    stop: async (activeSessionId) => { await runAgentCliJson(['stop', activeSessionId, '--json']); },
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    timeoutMs: 5000,
+  });
+}
+
 // Upstream quirk guard: new-session files flush a few seconds after the first
 // prompt; switching away before the flush orphans the session. Wait for it.
 async function waitForSessionPersisted(filePath, timeoutMs = 20000) {
@@ -237,6 +286,14 @@ ipcMain.handle('rpc:command', async (e, { key, cmd }) => {
   try {
     const client = getClient(key);
     if (!client) throw new Error('No agent for this pane (key ' + key + ')');
+    if (cmd.type === 'switch_session' && cmd.sessionPath) {
+      try {
+        const prep = await prepareTargetSession(cmd.sessionPath);
+        if (!prep.ok) throw new Error(prep.error);
+      } catch (err) {
+        if (err && err.message) return { type: 'response', success: false, error: err.message };
+      }
+    }
     if (cmd.type === 'switch_session' || cmd.type === 'new_session') {
       try {
         const st = await clientCommand(client, { type: 'get_state' });
@@ -246,13 +303,20 @@ ipcMain.handle('rpc:command', async (e, { key, cmd }) => {
         }
       } catch {}
     }
-    return await clientCommand(client, cmd);
+    const timeout = cmd.type === 'switch_session' ? SWITCH_SESSION_TIMEOUT_MS : COMMAND_TIMEOUT_MS;
+    return await clientCommand(client, cmd, timeout);
   } catch (err) { return { type: 'response', success: false, error: String(err && err.message || err) }; }
 });
 
 // Activate a session for a pane: returns client key after ensuring the process exists.
 ipcMain.handle('rpc:activate', async (e, { sessionPath, cwd }) => {
   const win = BrowserWindow.fromWebContents(e.sender);
+  if (sessionPath && !clients.has(sessionPath)) {
+    try {
+      const prep = await prepareTargetSession(sessionPath);
+      if (!prep.ok) return { ok: false, error: prep.error };
+    } catch {}
+  }
   const client = ensureClient({ sessionPath, cwd, ownerWin: win });
   if (!client) return { ok: false, error: 'failed to spawn agent' };
   client.ownerWin = win;
