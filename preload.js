@@ -23,6 +23,21 @@ contextBridge.exposeInMainWorld('prime', {
   },
   installAgent: () => ipcRenderer.invoke('agent:install'),
 
+  hudPrompt: (text) => ipcRenderer.invoke('hud:prompt', text),
+  hudHide: () => ipcRenderer.invoke('hud:hide'),
+  onHudOpened: (cb) => {
+    const listener = () => cb();
+    ipcRenderer.on('hud-opened', listener);
+    return () => ipcRenderer.removeListener('hud-opened', listener);
+  },
+
+  getPrefs: () => ipcRenderer.invoke('prefs:get'),
+  writePrefs: (patch) => ipcRenderer.invoke('prefs:write', patch),
+  listDir: (p) => ipcRenderer.invoke('fs:list-dir', p),
+  readFile: (p, maxBytes) => ipcRenderer.invoke('fs:read-file', { path: p, maxBytes }),
+  listSkills: () => ipcRenderer.invoke('skills:list'),
+  sessionTail: (p, max) => ipcRenderer.invoke('sessions:tail', { path: p, max }),
+
   xaiStatus: () => ipcRenderer.invoke('xai:status'),
   xaiConnect: () => ipcRenderer.invoke('xai:connect'),
   xaiDisconnect: () => ipcRenderer.invoke('xai:disconnect'),

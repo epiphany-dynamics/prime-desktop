@@ -17,10 +17,17 @@
         </div>
         <button id="new-chat-btn" title="New session (Cmd+N)">+ New chat</button>
       </div>
+      <div class="sidebar-nav">
+        <button id="capabilities-btn" class="nav-item" title="Skills, commands and capabilities">⚡ Capabilities</button>
+      </div>
       <div class="sidebar-search">
         <input id="session-filter" type="text" placeholder="Filter sessions…" spellcheck="false" />
       </div>
       <div id="session-list"></div>
+      <div id="subagent-section" class="hidden">
+        <div class="section-label">SUBAGENTS</div>
+        <div id="subagent-list"></div>
+      </div>
       <div class="sidebar-bottom">
         <div class="sidebar-bottom-row">
           <button id="cwd-btn" class="ghost-btn" title="Working directory for new sessions">…</button>
@@ -48,6 +55,7 @@
             </div>
           </div>
           <span id="context-meter" title="Context window usage"></span>
+          <button id="tree-toggle" class="picker-btn" title="Toggle file tree">🗂</button>
         </div>
       </header>
 
@@ -75,6 +83,44 @@
         </div>
       </footer>
     </main>
+
+    <!-- Right: file tree panel -->
+    <aside id="tree-panel" class="hidden">
+      <div id="tree-head">
+        <span id="tree-root-label" title="">Files</span>
+        <button id="tree-close" title="Close">✕</button>
+      </div>
+      <div id="tree-body"></div>
+    </aside>
+  </div>
+
+  <!-- Capabilities modal -->
+  <div id="capabilities-backdrop" class="hidden">
+    <div id="capabilities-panel">
+      <div id="settings-head">
+        <span>Capabilities</span>
+        <button id="capabilities-close" title="Close">✕</button>
+      </div>
+      <div id="settings-tabs">
+        <button class="ctab active" data-tab="skills">Skills</button>
+        <button class="ctab" data-tab="commands">Prompts &amp; Commands</button>
+      </div>
+      <div id="settings-body">
+        <div class="ctab-page" data-page="skills"><div id="skills-list"></div></div>
+        <div class="ctab-page hidden" data-page="commands"><div id="commands-list"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- File / subagent viewer modal -->
+  <div id="viewer-backdrop" class="hidden">
+    <div id="viewer-panel">
+      <div id="settings-head">
+        <span id="viewer-title">Viewer</span>
+        <button id="viewer-close" title="Close">✕</button>
+      </div>
+      <div id="viewer-body"></div>
+    </div>
   </div>
 
   <!-- Settings panel -->

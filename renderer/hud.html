@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline';" />
+  <title>Prime HUD</title>
+  <style>
+    :root {
+      --bg: #0f1011; --border: rgba(255,255,255,0.08); --text: #f7f8f8;
+      --text-dim: #8a8f98; --text-faint: #62666d;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: "Inter Variable", "SF Pro Display", -apple-system, system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
+      display: flex; flex-direction: column;
+      -webkit-app-region: drag;
+    }
+    .hud-top { display: flex; align-items: center; gap: 8px; padding: 10px 14px 0; }
+    .hud-mark { width: 18px; height: 18px; }
+    .hud-title { font-size: 12px; font-weight: 600; color: var(--text-dim); flex: 1; }
+    .hud-hint { font-size: 10px; color: var(--text-faint); }
+    textarea {
+      flex: 1; margin: 10px 14px; padding: 10px 12px; resize: none;
+      background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 10px;
+      color: var(--text); font: inherit; font-size: 13.5px; line-height: 1.5; outline: none;
+      -webkit-app-region: no-drag;
+    }
+    textarea:focus { border-color: rgba(255,255,255,0.2); }
+    .hud-bottom { display: flex; align-items: center; justify-content: space-between; padding: 0 14px 10px; }
+    #status { font-size: 11px; color: var(--text-faint); }
+    #status.ok { color: #10b981; }
+    #status.err { color: #eb5757; }
+    #send {
+      padding: 5px 14px; border-radius: 6px; border: none; cursor: pointer;
+      background: var(--text); color: #08090a; font-weight: 600; font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="hud-top">
+    <img class="hud-mark" src="assets/prime-butterfly.svg" alt="" />
+    <span class="hud-title">Prime HUD</span>
+    <span class="hud-hint">⏎ send · esc close</span>
+  </div>
+  <textarea id="input" placeholder="Quick prompt for the current session…" autofocus></textarea>
+  <div class="hud-bottom">
+    <span id="status"></span>
+    <button id="send">Send</button>
+  </div>
+  <script src="hud.js"></script>
+</body>
+</html>

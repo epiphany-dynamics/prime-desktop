@@ -261,6 +261,8 @@ async function listSessions() {
       if (!header) continue;
       out.push({
         path: p, id: header.id, cwd: header.cwd, name, preview, messageCount,
+        rlmDepth: header.rlmDepth || 0,
+        parentSession: header.parentSession || null,
         createdAt: Date.parse(header.timestamp) || stat.birthtimeMs,
         updatedAt: lastTs,
       });
@@ -406,6 +408,114 @@ ipcMain.handle('config:delete-api-key', (_e, { provider }) => {
     delete auth[provider];
     writeJsonAtomic(AUTH_PATH, auth);
     return { ok: true };
+  } catch (err) { return { ok: false, error: String(err) }; }
+});
+
+// ---------- App prefs (pins etc.) ----------
+
+const APP_SETTINGS_PATH = path.join(app.getPath('userData'), 'app-settings.json');
+function readAppSettings() { return readJsonSafe(APP_SETTINGS_PATH, { pins: [] }); }
+ipcMain.handle('prefs:get', () => ({ ...readAppSettings(), home: HOME }));
+ipcMain.handle('prefs:write', (_e, patch) => {
+  try {
+    const s = readAppSettings();
+    Object.assign(s, patch);
+    writeJsonAtomic(APP_SETTINGS_PATH, s);
+    return { ok: true };
+  } catch (err) { return { ok: false, error: String(err) }; }
+});
+
+// ---------- File tree ----------
+
+const TREE_SKIP = new Set(['node_modules', '.git', 'dist', '.worktrees', '__pycache__', '.DS_Store']);
+ipcMain.handle('fs:list-dir', (_e, dirPath) => {
+  try {
+    if (typeof dirPath !== 'string' || !dirPath.startsWith(HOME)) throw new Error('outside home');
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    const out = [];
+    for (const e of entries) {
+      if (TREE_SKIP.has(e.name)) continue;
+      if (e.name.startsWith('.') && !['.prime', '.agents', '.hermes', '.env', '.gitignore'].includes(e.name)) continue;
+      const p = path.join(dirPath, e.name);
+      let stat = null;
+      try { stat = fs.statSync(p); } catch { continue; }
+      out.push({
+        name: e.name, path: p,
+        type: e.isDirectory() ? 'dir' : 'file',
+        size: stat.size, mtime: stat.mtimeMs,
+      });
+    }
+    out.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
+    return { ok: true, entries: out };
+  } catch (err) { return { ok: false, error: String(err) }; }
+});
+
+const TEXT_EXT = new Set(['.md','.txt','.json','.jsonl','.js','.ts','.py','.sh','.css','.html','.yaml','.yml','.toml','.xml','.svg','.csv','.log','.env','.gitignore','.cjs','.mjs','.jsx','.tsx','.sql','.rb','.go','.rs','.java','.c','.h','.cpp','.plist']);
+ipcMain.handle('fs:read-file', (_e, { path: p, maxBytes }) => {
+  try {
+    if (typeof p !== 'string' || !p.startsWith(HOME)) throw new Error('outside home');
+    const ext = path.extname(p).toLowerCase();
+    if (!TEXT_EXT.has(ext) && ext !== '') return { ok: false, binary: true };
+    const cap = Math.min(maxBytes || 200000, 1000000);
+    const fd = fs.openSync(p, 'r');
+    const buf = Buffer.alloc(cap);
+    const bytes = fs.readSync(fd, buf, 0, cap, 0);
+    fs.closeSync(fd);
+    const stat = fs.statSync(p);
+    return { ok: true, text: buf.slice(0, bytes).toString('utf8'), truncated: stat.size > bytes };
+  } catch (err) { return { ok: false, error: String(err) }; }
+});
+
+// ---------- Skills scan ----------
+
+ipcMain.handle('skills:list', () => {
+  const dirs = [path.join(HOME, '.agents', 'skills'), path.join(PRIME_DIR, 'skills')];
+  const out = [];
+  for (const base of dirs) {
+    let names;
+    try { names = fs.readdirSync(base); } catch { continue; }
+    for (const n of names) {
+      const skillMd = path.join(base, n, 'SKILL.md');
+      try {
+        const head = fs.readFileSync(skillMd, 'utf8').slice(0, 2000);
+        const nameM = head.match(/^name:\s*(.+)$/m);
+        const descM = head.match(/^description:\s*(.+)$/m);
+        out.push({
+          id: n,
+          name: nameM ? nameM[1].trim() : n,
+          description: descM ? descM[1].trim().slice(0, 300) : '',
+          path: skillMd,
+          source: base.includes('.agents') ? 'user' : 'prime',
+        });
+      } catch { /* no SKILL.md */ }
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+});
+
+// ---------- Session tail (subagent viewer) ----------
+
+ipcMain.handle('sessions:tail', (_e, { path: p, max }) => {
+  try {
+    if (!p.startsWith(SESSIONS_DIR)) throw new Error('outside sessions dir');
+    const lines = fs.readFileSync(p, 'utf8').split('\n');
+    const msgs = [];
+    for (const line of lines) {
+      if (!line.includes('"type":"message"')) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (obj.type !== 'message') continue;
+        const m = obj.message || {};
+        let text = '';
+        if (typeof m.content === 'string') text = m.content;
+        else if (Array.isArray(m.content)) {
+          text = m.content.map((c) => c.type === 'text' ? c.text : (c.type === 'toolCall' ? '[tool: ' + c.name + ']' : '')).filter(Boolean).join('\n');
+        }
+        msgs.push({ role: m.role, text: text.slice(0, 2000), timestamp: m.timestamp });
+      } catch {}
+    }
+    return { ok: true, messages: msgs.slice(-(max || 50)) };
   } catch (err) { return { ok: false, error: String(err) }; }
 });
 
@@ -634,6 +744,57 @@ ipcMain.handle('dialog:pick-directory', async () => {
 
 ipcMain.handle('shell:open-path', (_e, p) => shell.openPath(p));
 
+// ---------- HUD (global quick-prompt, like Hermes) ----------
+
+let hudWin = null;
+const HUD_WIDTH = 620;
+const HUD_HEIGHT = 320;
+
+function createHud() {
+  hudWin = new BrowserWindow({
+    width: HUD_WIDTH, height: HUD_HEIGHT,
+    frame: false,
+    resizable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    show: false,
+    backgroundColor: '#0f1011',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  hudWin.loadFile(path.join(__dirname, 'renderer', 'hud.html'));
+  hudWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  hudWin.on('blur', () => { if (hudWin && !hudWin.webContents.isDevToolsOpened()) hudWin.hide(); });
+}
+
+function toggleHud() {
+  if (!hudWin) return;
+  if (hudWin.isVisible()) { hudWin.hide(); return; }
+  // Position bottom-center of the display containing the cursor (Hermes style)
+  const { screen } = require('electron');
+  const cursor = screen.getCursorScreenPoint();
+  const display = screen.getDisplayNearestPoint(cursor);
+  const { x, y, width, height } = display.workArea;
+  hudWin.setPosition(Math.round(x + (width - HUD_WIDTH) / 2), Math.round(y + height - HUD_HEIGHT - 72));
+  hudWin.show();
+  hudWin.focus();
+  hudWin.webContents.send('hud-opened');
+}
+
+ipcMain.handle('hud:hide', () => { if (hudWin) hudWin.hide(); });
+ipcMain.handle('hud:prompt', async (_e, text) => {
+  try {
+    const st = await rpcCommand({ type: 'get_state' });
+    const cmd = { type: 'prompt', message: text };
+    if (st.success && st.data.isStreaming) cmd.streamingBehavior = 'steer';
+    const r = await rpcCommand(cmd);
+    return { ok: !!r.success, error: r.error || null, streaming: !!(st.success && st.data.isStreaming) };
+  } catch (err) { return { ok: false, error: String(err && err.message || err) }; }
+});
+
 // ---------- Window ----------
 
 function createWindow() {
@@ -695,6 +856,9 @@ async function smokeTest() {
 app.whenReady().then(async () => {
   if (process.env.SMOKE_TEST) { smokeTest(); return; }
   buildMenu();
+  createHud();
+  const { globalShortcut } = require('electron');
+  globalShortcut.register('CommandOrControl+Shift+Space', toggleHud);
   startRpc();
   // Learn the auto-created session file so we can clean it up if unused
   for (let i = 0; i < 60; i++) {
@@ -712,7 +876,16 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+  // Keep running for the HUD hotkey unless explicitly quit
+  if (hudWin) { return; }
   cleanupAutoCreatedSession();
   stopRpc();
   app.quit();
+});
+
+app.on('before-quit', () => {
+  const { globalShortcut } = require('electron');
+  globalShortcut.unregisterAll();
+  cleanupAutoCreatedSession();
+  stopRpc();
 });

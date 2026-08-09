@@ -286,68 +286,59 @@ function renderSidebar() {
   const filter = $('#session-filter').value.trim().toLowerCase();
   const host = $('#session-list');
   host.innerHTML = '';
-  for (const s of S.sessions) {
+  const matches = (s) => {
     const label = s.name || s.preview || 'Untitled session';
-    if (filter && !label.toLowerCase().includes(filter) && !(s.cwd || '').toLowerCase().includes(filter)) continue;
+    return !filter || label.toLowerCase().includes(filter) || (s.cwd || '').toLowerCase().includes(filter);
+  };
+  const pinned = S.sessions.filter((s) => pinnedPaths.has(s.path) && matches(s));
+  const rest = S.sessions.filter((s) => !pinnedPaths.has(s.path) && matches(s));
+
+  const makeItem = (s) => {
+    const label = s.name || s.preview || 'Untitled session';
     const item = document.createElement('div');
     item.className = 'session-item' + (s.path === S.activeSessionFile ? ' active' : '');
     item.innerHTML = `
       <div class="s-name">${(s.path === S.activeSessionFile && S.isStreaming) ? '<span class="live-dot"></span>' : ''}${esc(label)}</div>
       <div class="s-meta">${esc(baseName(s.cwd))} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs</div>
-      <button class="s-delete" title="Delete session">✕</button>`;
-    item.onclick = () => switchSession(s.path);
-    item.querySelector('.s-name').ondblclick = (e) => {
-      e.stopPropagation();
-      startRename(item, s);
+      <div class="s-actions">
+        <button class="s-act s-pin ${pinnedPaths.has(s.path) ? 'pinned' : ''}" title="${pinnedPaths.has(s.path) ? 'Unpin' : 'Pin'} session">⌃</button>
+        <button class="s-act s-edit" title="Rename session">✎</button>
+        <button class="s-act s-delete" title="Delete session">✕</button>
+      </div>`;
+    item.onclick = (e) => {
+      if (e.shiftKey) { togglePin(s.path); return; }
+      switchSession(s.path);
     };
+    item.querySelector('.s-name').ondblclick = (e) => { e.stopPropagation(); startRename(item, s); };
+    item.querySelector('.s-pin').onclick = (e) => { e.stopPropagation(); togglePin(s.path); };
+    item.querySelector('.s-edit').onclick = (e) => { e.stopPropagation(); startRename(item, s); };
     item.querySelector('.s-delete').onclick = async (e) => {
       e.stopPropagation();
       if (!confirm('Delete this session? This cannot be undone.')) return;
       await prime.deleteSession(s.path);
+      if (pinnedPaths.has(s.path)) { pinnedPaths.delete(s.path); await prime.writePrefs({ pins: [...pinnedPaths] }); }
       if (s.path === S.activeSessionFile) await newSession();
       refreshSessions();
     };
-    host.appendChild(item);
-  }
-}
+    return item;
+  };
 
-async function startRename(item, session) {
-  const nameEl = item.querySelector('.s-name');
-  const current = session.name || '';
-  const inp = document.createElement('input');
-  inp.className = 'rename-input';
-  inp.value = current;
-  inp.placeholder = session.preview || 'Session name';
-  nameEl.replaceWith(inp);
-  inp.focus();
-  inp.select();
-  const commit = async () => {
-    const v = inp.value.trim();
-    if (v && v !== current) {
-      const wasActive = session.path === S.activeSessionFile;
-      if (wasActive) {
-        await prime.command({ type: 'set_session_name', name: v });
-      } else {
-        // set_session_name only affects the attached session; write the
-        // session_info entry via a quick switch + restore.
-        const prev = S.activeSessionFile;
-        await prime.command({ type: 'switch_session', sessionPath: session.path });
-        await prime.command({ type: 'set_session_name', name: v });
-        if (prev) await prime.command({ type: 'switch_session', sessionPath: prev });
-        await syncState();
-        const msgs = await prime.command({ type: 'get_messages' });
-        if (msgs.success) renderHistory(msgs.data.messages, { dropInFlight: S.isStreaming });
-      }
-    }
-    refreshSessions();
-  };
-  inp.onkeydown = (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); commit(); }
-    if (e.key === 'Escape') refreshSessions();
-    e.stopPropagation();
-  };
-  inp.onblur = commit;
-  inp.onclick = (e) => e.stopPropagation();
+  if (pinned.length) {
+    const label = document.createElement('div');
+    label.className = 'section-label';
+    label.textContent = 'PINNED';
+    host.appendChild(label);
+    pinned.forEach((s) => host.appendChild(makeItem(s)));
+  }
+  if (pinned.length && rest.length) {
+    const label = document.createElement('div');
+    label.className = 'section-label';
+    label.textContent = 'SESSIONS';
+    host.appendChild(label);
+  }
+  rest.forEach((s) => host.appendChild(makeItem(s)));
+
+  renderSubagents();
 }
 
 // ---------------- session ops ----------------
@@ -1108,6 +1099,198 @@ $('#settings-restart').onclick = async () => {
 
 $('#settings-btn').onclick = openSettings;
 
+
+// ---------------- Pinned sessions ----------------
+let pinnedPaths = new Set();
+
+async function loadPins() {
+  const prefs = await prime.getPrefs();
+  pinnedPaths = new Set(prefs.pins || []);
+  S.homeDir = prefs.home || null;
+}
+async function togglePin(sessionPath) {
+  if (pinnedPaths.has(sessionPath)) pinnedPaths.delete(sessionPath);
+  else pinnedPaths.add(sessionPath);
+  await prime.writePrefs({ pins: [...pinnedPaths] });
+  renderSidebar();
+}
+
+// ---------------- Subagents ----------------
+function subagentsOfActive() {
+  if (!S.activeSessionFile) return [];
+  return S.sessions.filter((s) => s.parentSession === S.activeSessionFile).slice(0, 20);
+}
+
+function renderSubagents() {
+  const subs = subagentsOfActive();
+  const sec = $('#subagent-section');
+  if (!subs.length) { sec.classList.add('hidden'); return; }
+  sec.classList.remove('hidden');
+  const host = $('#subagent-list');
+  host.innerHTML = '';
+  for (const s of subs) {
+    const item = document.createElement('div');
+    item.className = 'session-item subagent-item';
+    const label = s.name || s.preview || ('subagent depth ' + s.rlmDepth);
+    item.innerHTML = `
+      <div class="s-name"><span class="sub-dot"></span>${esc(label)}</div>
+      <div class="s-meta">depth ${s.rlmDepth} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs</div>`;
+    item.onclick = () => openSubagentViewer(s);
+    host.appendChild(item);
+  }
+}
+
+async function openSubagentViewer(session) {
+  $('#viewer-title').textContent = 'Subagent — ' + (session.name || session.id.slice(0, 8));
+  const body = $('#viewer-body');
+  body.innerHTML = '<p class="s-help">Loading…</p>';
+  $('#viewer-backdrop').classList.remove('hidden');
+  const r = await prime.sessionTail(session.path, 60);
+  body.innerHTML = '';
+  if (!r.ok || !r.messages.length) {
+    body.innerHTML = '<p class="s-help">No messages yet.</p>';
+  }
+  for (const msg of (r.messages || [])) {
+    const div = document.createElement('div');
+    div.className = 'viewer-msg';
+    div.innerHTML = `<div class="vm-role">${esc(msg.role)}</div><div class="vm-text">${esc(msg.text)}</div>`;
+    body.appendChild(div);
+  }
+  const hint = document.createElement('p');
+  hint.className = 's-help';
+  hint.textContent = 'Read-only view. Live observation of running subagents comes with the agent tree feature.';
+  body.appendChild(hint);
+}
+
+// ---------------- File tree ----------------
+let treeVisible = false;
+let treeRoot = null;
+
+async function toggleTree() {
+  treeVisible = !treeVisible;
+  $('#tree-panel').classList.toggle('hidden', !treeVisible);
+  if (treeVisible) {
+    const active = S.sessions.find((s) => s.path === S.activeSessionFile);
+    treeRoot = (active && active.cwd) || S.homeDir;
+    if (!treeRoot) { treeVisible = false; $('#tree-panel').classList.add('hidden'); return; }
+    $('#tree-root-label').textContent = baseName(treeRoot);
+    $('#tree-root-label').title = treeRoot;
+    renderTreeLevel($('#tree-body'), treeRoot);
+  }
+}
+
+async function renderTreeLevel(container, dirPath) {
+  container.innerHTML = '<div class="tree-loading">…</div>';
+  const r = await prime.listDir(dirPath);
+  container.innerHTML = '';
+  if (!r.ok) { container.innerHTML = '<div class="tree-loading">error</div>'; return; }
+  for (const e of r.entries) {
+    const row = document.createElement('div');
+    row.className = 'tree-row ' + e.type;
+    row.innerHTML = `<span class="tree-icon">${e.type === 'dir' ? '▸' : '·'}</span><span class="tree-name">${esc(e.name)}</span>`;
+    if (e.type === 'dir') {
+      row.onclick = async () => {
+        if (row.dataset.open === '1') {
+          row.dataset.open = '0';
+          row.querySelector('.tree-icon').textContent = '▸';
+          row.nextElementSibling?.remove();
+          return;
+        }
+        row.dataset.open = '1';
+        row.querySelector('.tree-icon').textContent = '▾';
+        const child = document.createElement('div');
+        child.className = 'tree-children';
+        row.after(child);
+        renderTreeLevel(child, e.path);
+      };
+    } else {
+      row.onclick = () => openFileViewer(e.path);
+    }
+    container.appendChild(row);
+  }
+  if (!r.entries.length) container.innerHTML = '<div class="tree-loading">empty</div>';
+}
+
+async function openFileViewer(p) {
+  $('#viewer-title').textContent = p.split('/').pop();
+  const body = $('#viewer-body');
+  body.innerHTML = '<p class="s-help">Loading…</p>';
+  $('#viewer-backdrop').classList.remove('hidden');
+  const r = await prime.readFile(p, 200000);
+  if (!r.ok) {
+    if (r.binary) {
+      body.innerHTML = '<p class="s-help">Binary file.</p>';
+      const b = document.createElement('button');
+      b.className = 's-btn primary';
+      b.textContent = 'Open in Finder/default app';
+      b.onclick = () => { prime.openPath(p); $('#viewer-backdrop').classList.add('hidden'); };
+      body.appendChild(b);
+    } else {
+      body.innerHTML = '<p class="s-help">Cannot read: ' + esc(r.error || '') + '</p>';
+    }
+    return;
+  }
+  const pre = document.createElement('pre');
+  pre.className = 'viewer-pre';
+  pre.textContent = r.text + (r.truncated ? '\n\n… [truncated]' : '');
+  body.innerHTML = '';
+  body.appendChild(pre);
+}
+
+// ---------------- Capabilities ----------------
+async function openCapabilities() {
+  $('#capabilities-backdrop').classList.remove('hidden');
+  const skills = await prime.listSkills();
+  const shost = $('#skills-list');
+  shost.innerHTML = '';
+  for (const s of skills) {
+    const row = document.createElement('div');
+    row.className = 'provider-row';
+    row.innerHTML = `<span class="p-name">${esc(s.name)}</span>
+      <span class="p-status" style="font-family:inherit">${esc(s.description.slice(0, 90))}${s.description.length > 90 ? '…' : ''}</span>
+      <span class="p-actions"><span class="s-dim">${esc(s.source)}</span></span>`;
+    row.style.cursor = 'pointer';
+    row.onclick = () => openFileViewer(s.path);
+    shost.appendChild(row);
+  }
+  if (!skills.length) shost.innerHTML = '<p class="s-help">No skills found.</p>';
+
+  const cmds = await prime.command({ type: 'get_commands' });
+  const chost = $('#commands-list');
+  chost.innerHTML = '';
+  const list = (cmds.success && cmds.data.commands) || [];
+  for (const c of list) {
+    const row = document.createElement('div');
+    row.className = 'provider-row';
+    row.innerHTML = `<span class="p-name" style="font-family:var(--mono)">/${esc(c.name)}</span>
+      <span class="p-status" style="font-family:inherit">${esc((c.description || '').slice(0, 90))}</span>
+      <span class="p-actions"><span class="s-dim">${esc(c.source)}</span></span>`;
+    row.style.cursor = 'pointer';
+    row.title = 'Click to run /' + c.name;
+    row.onclick = () => {
+      $('#capabilities-backdrop').classList.add('hidden');
+      inputEl.value = '/' + c.name + ' ';
+      inputEl.focus();
+    };
+    chost.appendChild(row);
+  }
+  if (!list.length) chost.innerHTML = '<p class="s-help">No commands registered.</p>';
+}
+
+document.querySelectorAll('.ctab').forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll('.ctab').forEach((x) => x.classList.toggle('active', x === b));
+    document.querySelectorAll('.ctab-page').forEach((p) => p.classList.toggle('hidden', p.dataset.page !== b.dataset.tab));
+  };
+});
+$('#capabilities-btn').onclick = openCapabilities;
+$('#capabilities-close').onclick = () => $('#capabilities-backdrop').classList.add('hidden');
+$('#capabilities-backdrop').onclick = (e) => { if (e.target === $('#capabilities-backdrop')) $('#capabilities-backdrop').classList.add('hidden'); };
+$('#tree-toggle').onclick = toggleTree;
+$('#tree-close').onclick = toggleTree;
+$('#viewer-close').onclick = () => $('#viewer-backdrop').classList.add('hidden');
+$('#viewer-backdrop').onclick = (e) => { if (e.target === $('#viewer-backdrop')) $('#viewer-backdrop').classList.add('hidden'); };
+
 prime.onMenuAction(({ id }) => {
   if (id === 'new-chat') newSession();
   else if (id === 'install-agent') runAgentInstall('Install Prime Agent');
@@ -1133,6 +1316,7 @@ prime.onRpcExit(({ code, error }) => {
 
 (async function init() {
   // Each step is independent — one failure must not block the others.
+  await loadPins();
   await refreshSessions();
   await Promise.allSettled([syncState(), loadModels()]);
   updateTopbar();
