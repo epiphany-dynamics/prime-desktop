@@ -5,10 +5,14 @@ const { spawn, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { primeDaemonLaunchConfig } = require('./daemon-launch');
+const { prepareSessionHandoff } = require('./session-handoff');
 
 const HOME = os.homedir();
 const SESSIONS_DIR = path.join(HOME, '.prime', 'agent', 'sessions');
 const COMMAND_TIMEOUT_MS = 30000;
+const SWITCH_SESSION_TIMEOUT_MS = 90000;
+const DAEMON_LAUNCH = primeDaemonLaunchConfig();
 
 let win = null;
 let rpc = null; // { proc, pending: Map, buffer, alive, sessionFile }
@@ -36,6 +40,9 @@ function buildChildEnv() {
   const current = (env.PATH && env.PATH.length > 10 ? env.PATH : loginShellPath()) || '/usr/bin:/bin:/usr/sbin:/sbin';
   env.PATH = [...extra, ...current.split(':')].filter(Boolean).join(':');
   if (!env.SHELL) env.SHELL = '/bin/zsh';
+  // Finder/Electron can expose /tmp while terminal clients use macOS's
+  // DARWIN_USER_TEMP_DIR. Normalize it so every client reaches one daemon.
+  env.TMPDIR = DAEMON_LAUNCH.tempDir;
   return env;
 }
 
@@ -82,6 +89,54 @@ function resolveAgentInvocation(childEnv) {
   return { command: found, args: [], display: found };
 }
 
+function runAgentCliJson(args, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const childEnv = buildChildEnv();
+    const invocation = resolveAgentInvocation(childEnv);
+    if (!invocation) return reject(new Error('prime-agent binary not found'));
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const proc = spawn(invocation.command, [
+      ...invocation.args,
+      args[0],
+      '--daemon-socket', DAEMON_LAUNCH.socketPath,
+      ...args.slice(1),
+    ], { cwd: HOME, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill(); } catch {}
+      reject(new Error(`prime-agent ${args[0]} timed out`));
+    }, timeoutMs);
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    proc.on('exit', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(stderr.trim() || `prime-agent ${args[0]} exited with code ${code}`));
+      try { resolve(stdout.trim() ? JSON.parse(stdout) : {}); }
+      catch { reject(new Error(`prime-agent ${args[0]} returned invalid JSON`)); }
+    });
+  });
+}
+
+async function prepareTargetSession(sessionPath) {
+  return prepareSessionHandoff(sessionPath, {
+    list: async () => (await runAgentCliJson(['list', '--json'])).sessions || [],
+    stop: async (activeSessionId) => { await runAgentCliJson(['stop', activeSessionId, '--json']); },
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    timeoutMs: 5000,
+  });
+}
+
 // ---------- RPC client ----------
 
 function startRpc(cwd) {
@@ -96,7 +151,11 @@ function startRpc(cwd) {
 
   let proc;
   try {
-    proc = spawn(invocation.command, [...invocation.args, '--mode', 'rpc'], {
+    proc = spawn(invocation.command, [
+      ...invocation.args,
+      '--mode', 'rpc',
+      '--daemon-socket', DAEMON_LAUNCH.socketPath,
+    ], {
       cwd: cwd || HOME,
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -167,7 +226,7 @@ function handleRpcMessage(obj) {
   sendToRenderer('rpc-event', obj);
 }
 
-function rpcCommand(cmd) {
+function rpcCommand(cmd, timeoutMs = COMMAND_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     if (!rpc || !rpc.alive) return reject(new Error('Agent process is not running'));
     const id = 'req-' + (++requestSeq);
@@ -177,7 +236,7 @@ function rpcCommand(cmd) {
         rpc.pending.delete(id);
         reject(new Error('Command timed out: ' + (cmd.type || 'unknown')));
       }
-    }, COMMAND_TIMEOUT_MS);
+    }, timeoutMs);
     rpc.pending.set(id, { resolve, reject, timer });
     try {
       rpc.proc.stdin.write(JSON.stringify(cmd) + '\n');
@@ -698,6 +757,12 @@ async function waitForSessionPersisted(filePath, timeoutMs = 20000) {
 
 ipcMain.handle('rpc:command', async (_e, cmd) => {
   try {
+    if (cmd.type === 'switch_session') {
+      const handoff = await prepareTargetSession(cmd.sessionPath);
+      if (!handoff.ok) {
+        return { type: 'response', command: cmd.type, success: false, error: handoff.error };
+      }
+    }
     if (cmd.type === 'switch_session' || cmd.type === 'new_session') {
       try {
         const st = await rpcCommand({ type: 'get_state' });
@@ -707,7 +772,8 @@ ipcMain.handle('rpc:command', async (_e, cmd) => {
         }
       } catch {}
     }
-    return await rpcCommand(cmd);
+    const timeoutMs = cmd.type === 'switch_session' ? SWITCH_SESSION_TIMEOUT_MS : COMMAND_TIMEOUT_MS;
+    return await rpcCommand(cmd, timeoutMs);
   } catch (err) { return { type: 'response', success: false, error: String(err && err.message || err) }; }
 });
 
