@@ -1,6 +1,6 @@
 {
   "name": "prime-desktop",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Desktop app for Prime Agent - Electron shell over prime-agent RPC mode",
   "main": "main.js",
   "scripts": {
