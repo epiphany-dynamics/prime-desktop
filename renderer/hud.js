@@ -6,7 +6,7 @@ async function send() {
   const text = input.value.trim();
   if (!text) return;
   status.className = ''; status.textContent = 'sending…';
-  const r = await prime.hudPrompt(text);
+  const r = await prime.hudPrompt({ key: null, text });
   if (r.ok) {
     status.className = 'ok';
     status.textContent = r.streaming ? 'sent (steering the running agent)' : 'sent to current session';
