@@ -976,8 +976,38 @@ async function closePane(pane) {
 }
 
 async function splitWithSession(sessionPath) {
-  if (G.panes.length >= 2) { G.focused.setBanner('Two panes max for now.'); return; }
-  await createPane(1, sessionPath);
+  if (G.panes.length >= 2) { G.focused.setBanner('Two panes max for now.'); return false; }
+  const pane = await createPane(1, sessionPath);
+  return !!(pane && pane.ready);
+}
+
+function paneAvailableForSessionSwitch(pane) {
+  return !!(pane && !pane.bindingChangePending && !pane.isStreaming && !pane.sending && !pane.draftState.sending && pane.draftState.pending.size === 0);
+}
+
+async function openSessionFromSidebar(sessionPath) {
+  const existing = G.panes.find((pane) => pane.sessionFile === sessionPath);
+  if (existing) { setFocusedPane(existing); return true; }
+
+  if (paneAvailableForSessionSwitch(G.focused)) return G.focused.activate(sessionPath);
+  if (G.panes.length < 2) {
+    if (G.focused && G.focused.isStreaming) return splitWithSession(sessionPath);
+    if (G.focused) G.focused.canChangeBinding('opening another session');
+    return false;
+  }
+
+  const available = G.panes.find((pane) => pane !== G.focused && paneAvailableForSessionSwitch(pane));
+  if (available) {
+    setFocusedPane(available);
+    return available.activate(sessionPath);
+  }
+
+  const allStreaming = G.panes.every((pane) => pane.isStreaming);
+  const message = allStreaming
+    ? 'Both panes are streaming. Stop one response before opening another session.'
+    : 'Both panes are busy. Wait for a pane action or stop one response before opening another session.';
+  (G.focused || G.panes[0]).setBanner(message, true);
+  return false;
 }
 
 // ---------------- extension UI dialogs ----------------
@@ -1069,7 +1099,7 @@ function renderSidebar() {
       <div class="s-name">${(paneHere && paneHere.isStreaming) ? '<span class="live-dot"></span>' : ''}${esc(label)}</div>
       <div class="s-meta">${esc(baseName(s.cwd))} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs</div>
       <div class="s-actions">
-        <button class="s-act s-split" title="Open in second pane">⫿</button>
+        <button class="s-act s-split" title="Open in second pane without stopping the current session" aria-label="Open in second pane">⫿</button>
         <button class="s-act s-pin ${G.pinnedPaths.has(s.path) ? 'pinned' : ''}" title="${G.pinnedPaths.has(s.path) ? 'Unpin' : 'Pin'} session">⌃</button>
         <button class="s-act s-edit" title="Rename session">✎</button>
         <button class="s-act s-delete" title="Delete session">✕</button>
@@ -1077,7 +1107,7 @@ function renderSidebar() {
     item.onclick = (e) => {
       if (e.shiftKey) { togglePin(s.path); return; }
       if (paneHere) { setFocusedPane(paneHere); return; }
-      G.focused.activate(s.path);
+      void openSessionFromSidebar(s.path);
     };
     item.querySelector('.s-name').ondblclick = (e) => { e.stopPropagation(); startRename(item, s); };
     item.querySelector('.s-split').onclick = (e) => { e.stopPropagation(); splitWithSession(s.path); };

@@ -39,9 +39,23 @@ const privateFile = path.join(privateDir, "id_rsa"); fs.writeFileSync(privateFil
 const sessionsDir = path.join(primeDir, "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
 const unsafeSession = path.join(sessionsDir, "unsafe-cwd.jsonl");
 const deletableSession = path.join(sessionsDir, "inactive-delete.jsonl");
+const routingSession = path.join(sessionsDir, "routing-target.jsonl");
+const routingSessionTwo = path.join(sessionsDir, "routing-target-two.jsonl");
 const unsafeCwd = fs.realpathSync("/usr");
 fs.writeFileSync(unsafeSession, JSON.stringify({ type: "session", version: 1, id: "unsafe-cwd", cwd: unsafeCwd }) + "\n");
 fs.writeFileSync(deletableSession, JSON.stringify({ type: "session", version: 1, id: "inactive-delete", cwd: project }) + "\n");
+fs.writeFileSync(routingSession, [
+  JSON.stringify({ type: "session", version: 1, id: "routing-target", cwd: project }),
+  JSON.stringify({ type: "session_info", name: "Routing target" }),
+  "",
+].join("\n"));
+fs.writeFileSync(routingSessionTwo, [
+  JSON.stringify({ type: "session", version: 1, id: "routing-target-two", cwd: project }),
+  JSON.stringify({ type: "session_info", name: "Routing target two" }),
+  "",
+].join("\n"));
+const routingSessionCanonical = fs.realpathSync(routingSession);
+const routingSessionTwoCanonical = fs.realpathSync(routingSessionTwo);
 
 const waitSource = `(predicate, label, timeout = 12000) => new Promise((resolve, reject) => { const started = Date.now(); const tick = () => { let value = false; try { value = predicate(); } catch {} if (value) return resolve(value); if (Date.now() - started > timeout) return reject(new Error('Timed out: ' + label)); setTimeout(tick, 50); }; tick(); })`;
 const evalSource = `(async () => {
@@ -115,32 +129,50 @@ const evalSource = `(async () => {
   await wait(() => inPane('.chat').querySelectorAll('.msg.user').length >= 1 && inPane('.attachment-strip').querySelectorAll('.attachment-chip').length === 0, 'attachment-only send');
   results.attachmentOnly = !!inPane('.chat .message-attachment');
 
+  const first = G.focused;
+  const firstKey = first.key;
+  const firstSession = first.sessionFile;
   inPane('.input').value = '__HOLD__';
   inPane('.input').dispatchEvent(new Event('input', { bubbles: true }));
   inPane('.send-btn').click();
-  await wait(() => G.focused.isStreaming && !inPane('.stop-btn').classList.contains('hidden'), 'streaming response');
-  const streamingKey = G.focused.key;
+  await wait(() => first.isStreaming && !inPane('.stop-btn').classList.contains('hidden'), 'streaming response');
+  const streamingKey = first.key;
   key('o', { metaKey: true });
   await wait(() => !document.querySelector('#project-surface').classList.contains('hidden'), 'streaming project surface');
   document.querySelector('#choose-folder-btn').click();
   await wait(() => document.querySelector('#project-choice-error').textContent.includes('Stop the current response'), 'streaming project rejection');
-  results.streamingBlocked = G.focused.key === streamingKey && !document.querySelector('#choose-folder-btn').disabled;
+  results.streamingBlocked = first.key === streamingKey && !document.querySelector('#choose-folder-btn').disabled;
   key('Escape');
   await wait(() => document.querySelector('#project-surface').classList.contains('hidden'), 'Escape closes project surface');
   results.escape = document.activeElement === inPane('.input') || document.activeElement === inPane('.pane-folder');
-  inPane('.stop-btn').click();
-  await wait(() => !G.focused.isStreaming, 'stop held response');
 
-  const first = G.focused;
-  const firstKey = first.key;
-  const firstSession = first.sessionFile;
-  await splitWithSession(firstSession);
-  await wait(() => G.panes.length === 2 && G.focused.ready, 'second pane');
+  const routeItem = [...document.querySelectorAll('.session-item')].find((item) => item.querySelector('.s-name') && item.querySelector('.s-name').textContent.trim() === 'Routing target');
+  if (!routeItem) throw new Error('Routing target session was not rendered');
+  routeItem.click();
+  await wait(() => G.panes.length === 2 && G.focused !== first && G.focused.ready && G.focused.sessionFile === ${JSON.stringify(routingSessionCanonical)}, 'normal-click streaming session route');
   const second = G.focused;
+  results.streamingSessionRouted = first.isStreaming && first.key === firstKey && second.sessionFile === ${JSON.stringify(routingSessionCanonical)} && !first.bannerEl.textContent.includes('Stop the current response before changing sessions');
+  setFocusedPane(first);
+  const alreadyOpenItem = [...document.querySelectorAll('.session-item')].find((item) => item.querySelector('.s-name') && item.querySelector('.s-name').textContent.trim() === 'Routing target');
+  alreadyOpenItem.click();
+  results.existingSessionFocused = G.focused === second && G.panes.length === 2 && first.isStreaming;
+  setFocusedPane(first);
+  const routeItemTwo = [...document.querySelectorAll('.session-item')].find((item) => item.querySelector('.s-name') && item.querySelector('.s-name').textContent.trim() === 'Routing target two');
+  if (!routeItemTwo) throw new Error('Second routing target session was not rendered');
+  routeItemTwo.click();
+  await wait(() => G.focused === second && second.ready && second.sessionFile === ${JSON.stringify(routingSessionTwoCanonical)}, 'two-pane non-streaming route');
+  results.twoPaneSessionRouted = first.isStreaming && first.key === firstKey && G.panes.length === 2 && second.sessionFile === ${JSON.stringify(routingSessionTwoCanonical)};
+  await first.stop();
+  await wait(() => !first.isStreaming, 'stop routed source response');
+  await second.activate(firstSession);
+  await wait(() => second.ready && second.key === first.key && second.sessionFile === firstSession, 'share first session after routing proof');
   first.inputEl.value = '__HOLD__';
   first.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
   await first.send();
   await wait(() => first.isStreaming && second.isStreaming, 'same-session event fan-out');
+  setFocusedPane(first);
+  const bothStreamingRoute = await openSessionFromSidebar(${JSON.stringify(routingSessionCanonical)});
+  results.bothStreamingRouteBounded = bothStreamingRoute === false && first.isStreaming && second.isStreaming && first.bannerEl.textContent.includes('Both panes are streaming');
   const deleteWhileStreaming = await window.prime.deleteSession(firstSession);
   const restartWhileStreaming = await restartAllAgents();
   results.busyLifecycleRejected = deleteWhileStreaming.ok === false && restartWhileStreaming === false && first.isStreaming && second.isStreaming;
@@ -271,7 +303,7 @@ child.on("exit", (code, signal) => {
     console.log("UI-SMOKE project/worktree + multi-pane: PASS");
     console.log("UI-SMOKE lazy tree + file chip: PASS");
     console.log("UI-SMOKE PNG/GIF/WebP paste + picker/reject/attachment-only: PASS");
-    console.log("UI-SMOKE streaming guard + same-session/HUD fan-out/abort + automation route: PASS");
+    console.log("UI-SMOKE streaming session routing + project guard + same-session/HUD fan-out: PASS");
     console.log("UI-SMOKE shared/busy/inactive session deletion lifecycle: PASS");
     console.log("UI-SMOKE redacted provider edit preserves exact stored key: PASS");
     console.log("UI-SMOKE synthetic pathless drop rejection (real outside-drop policy is unit-tested): PASS");

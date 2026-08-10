@@ -54,3 +54,12 @@ test('async suggestion invalidation, Electron file paths, and bounded safe searc
   assert.match(workspace, /Math\.min\(Number\(request\.limit\) \|\| 40, 100\)/);
   assert.doesNotMatch(workspace, /readdirSync/);
 });
+
+test('normal session selection routes around streaming panes', () => {
+  assert.match(app, /function paneAvailableForSessionSwitch/);
+  assert.match(app, /async function openSessionFromSidebar/);
+  assert.match(app, /G\.focused && G\.focused\.isStreaming\) return splitWithSession\(sessionPath\)/);
+  assert.match(app, /pane !== G\.focused && paneAvailableForSessionSwitch\(pane\)/);
+  assert.match(app, /Both panes are streaming\. Stop one response before opening another session\./);
+  assert.match(app, /void openSessionFromSidebar\(s\.path\)/);
+});

@@ -580,8 +580,8 @@ async function listSessions() {
   catch { return []; }
   const out = [];
   for (const f of files) {
-    const p = path.join(SESSIONS_DIR, f);
     try {
+      const p = await canonicalSessionPath(SESSIONS_DIR, path.join(SESSIONS_DIR, f));
       const stat = fs.statSync(p);
       const content = fs.readFileSync(p, 'utf8');
       const lines = content.split('\n');

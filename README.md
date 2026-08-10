@@ -8,7 +8,7 @@ The current Hermes-minus-voice contract and honest completion states live in [`P
 
 ## v0.6.1 highlights
 
-- **Concurrent sessions** — two independent panes, drag-to-split, pop-outs, pane focus, and live event fanout when panes/windows view the same session.
+- **Concurrent sessions** — two independent panes, streaming-safe session-click routing, drag-to-split, pop-outs, pane focus, and live event fanout when panes/windows view the same session.
 - **Project-aware chats** — per-pane Choose Project, recents, linked Git worktrees/branch identity, Cmd+O, and cwd-pinned process/session activation.
 - **Safe file explorer** — lazy ignored tree, symlink confinement, cached pagination, refresh watching, text preview, Add to chat, copy path, and Finder reveal.
 - **Attachment drafts** — image paste/picker/drop with PNG/JPEG decode, bounded GIF/WebP conversion, resize, and caps; general-file, folder, and session references; atomic pane-scoped mutation; thumbnails/chips/removal; attachment-only turns; retention when a prompt is rejected.
@@ -54,7 +54,7 @@ The renderer does not receive arbitrary shell or filesystem APIs. Project/file o
 
 ## Offline verification
 
-`npm run smoke` and `npm run ui-smoke` use `scripts/fake-agent.js`, an isolated temporary HOME, and local fixtures. They require no network or provider credentials. The UI smoke covers project/worktree selection, shared-session pane and HUD fan-out/abort, busy/shared/inactive deletion safety, draft-preserving same-session restart, dedicated automation routing, PNG/GIF/WebP attachment flows, rejection retention, streaming/activation guards, saved-session workspace degradation, redacted-provider secret preservation, synthetic pathless-drop rejection, sandboxing, and navigation policy.
+`npm run smoke` and `npm run ui-smoke` use `scripts/fake-agent.js`, an isolated temporary HOME, and local fixtures. They require no network or provider credentials. The UI smoke covers project/worktree selection, streaming-safe normal-click session routing, shared-session pane and HUD fan-out/abort, busy/shared/inactive deletion safety, draft-preserving same-session restart, dedicated automation routing, PNG/GIF/WebP attachment flows, rejection retention, streaming/activation guards, saved-session workspace degradation, redacted-provider secret preservation, synthetic pathless-drop rejection, sandboxing, and navigation policy.
 
 ## Current limitations
 
