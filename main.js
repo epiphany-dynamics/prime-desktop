@@ -203,16 +203,21 @@ function createWorkspaceService(client) {
   });
 }
 
-async function disposeClient(client, reason = 'shutdown', remove = true) {
+async function disposeClient(client, reason = 'shutdown', remove = true, options = {}) {
   if (!client) return;
   if (client.disposePromise) return client.disposePromise;
   client.committed = false;
   client.alive = false;
   if (client.workspace) client.workspace.dispose();
   const sessionKey = client.sessionFile || (typeof client.key === 'string' && !client.key.startsWith('new:') ? client.key : null);
+  // App quit / UI detach must not kill live workers. Daemon adapters already
+  // detach-only; process RPC children are left running so they stay persistent.
+  const detachOnly = options.detachOnly === true || reason === 'app-quit' || reason === 'detach' || reason === 'last desktop window released' || reason === 'last desktop pane switched sessions' || reason === 'last desktop pane released' || reason === 'Prime HUD closed' || reason === 'Prime HUD hidden';
+  const stopOptions = detachOnly ? { killProcess: false } : {};
   const stopping = (async () => {
-    try { await client.rpc.stop(reason); }
-    finally {
+    try {
+      if (typeof client.rpc.stop === 'function') await client.rpc.stop(detachOnly ? 'app-quit' : reason, stopOptions);
+    } finally {
       if (remove) for (const [key, value] of clients) if (value === client) clients.delete(key);
     }
   })();
@@ -452,12 +457,15 @@ function assertPaneLocallyIdle(context, action) {
   if (context.sending) throw new Error(`Wait for the current message before ${action}`);
   if (context.pendingActions > 0 || context.attachmentService.pendingMutationCount(context.draft.id) > 0) throw new Error(`Wait for attachments to finish before ${action}`);
 }
-async function requirePaneProjectIdle(context, action) {
+async function requirePaneProjectIdle(context, action, { allowStreaming = false } = {}) {
   if (!context) return null;
   assertPaneLocallyIdle(context, action);
   let state = { isStreaming: false };
   if (context.client.alive && !context.client.disposePromise && clientIsCurrent(context.client)) {
-    state = await requireIdleClient(context.client, action);
+    // Session navigation can leave a live response running in the background
+    // (Hermes model). Project changes / destructive actions still require idle.
+    if (allowStreaming) state = await stateForClient(context.client);
+    else state = await requireIdleClient(context.client, action);
   }
   assertPaneLocallyIdle(context, action);
   return state;
@@ -526,7 +534,10 @@ secureHandle('rpc:activate', async (event, request = {}) => {
       } else if (request.sourceKey != null || request.bindingEpoch != null || request.sourceBindingEpoch != null) {
         throw new Error('The pane binding changed before this action completed');
       }
-      await requirePaneProjectIdle(priorContext, 'changing sessions');
+      // In-place session / New Chat navigation may leave a streaming agent.
+      // Split is explicit-only; never forced by this path.
+      const allowStreamingLeave = request.allowStreamingLeave !== false;
+      await requirePaneProjectIdle(priorContext, 'changing sessions', { allowStreaming: allowStreamingLeave });
       let sessionPath = null;
       let targetCwd = HOME;
       let client = null;
@@ -545,11 +556,14 @@ secureHandle('rpc:activate', async (event, request = {}) => {
         client = await ensureClient({ sessionPath, cwd: targetCwd, ownerWin });
         clientWasExisting = existingBefore.has(client);
         const state = await stateForClient(client);
-        await requirePaneProjectIdle(priorContext, 'changing sessions');
+        await requirePaneProjectIdle(priorContext, 'changing sessions', { allowStreaming: allowStreamingLeave });
         const preserveDraft = !!(priorContext && priorContext.client.sessionFile === client.sessionFile);
         const context = bindPane(event, request.paneId, client, { preserveDraft });
         bound = true;
         if (priorContext && priorContext.client !== client) {
+          // Detach Desktop's view of the prior session; do not stop a live worker.
+          // Process RPC clients keep running until idle eviction; daemon attachments
+          // detach only when no pane/HUD still references them.
           await releaseUnreferencedDaemonClient(priorContext.client, 'last desktop pane switched sessions');
         }
         if (ownerWin) lastFocusedMainWin = ownerWin;
@@ -583,6 +597,8 @@ secureHandle('pane:release', async (event, request) => {
   try {
     return await runPaneTransition(async () => {
       const context = paneContextFor(event, request, { cap: 8 * 1024 });
+      // Closing a split pane is navigation. Streaming may continue in background.
+      // Only local send/attachment locks block release (not agent isStreaming).
       assertPaneLocallyIdle(context, 'closing this pane');
       context.attachmentService.deleteDraft(context.draft.id);
       paneContexts.delete(context.id);
@@ -762,11 +778,10 @@ secureHandle('agent:kill-all', async (_event, request = {}) => {
       const contexts = [...paneContexts.values()];
       const releases = [];
       try {
+        // Restart is deliberate: local send/attachment locks still block, but a
+        // live stream does not — we dispose every client including streaming ones.
         for (const context of contexts) assertPaneLocallyIdle(context, 'restarting agents');
         const unique = [...new Set(clients.values())];
-        for (const client of unique) {
-          if (client.alive && !client.disposePromise && clientIsCurrent(client)) await requireIdleClient(client, 'restarting agents');
-        }
         for (const context of contexts) {
           assertPaneLocallyIdle(context, 'restarting agents');
           releases.push(reservePaneAction(context));
@@ -1535,7 +1550,11 @@ function createWindow(sessionQuery) {
     }
     for (const client of affected) refreshClientViewers(client);
     void (async () => {
-      await Promise.all([...affected].map((client) => releaseUnreferencedDaemonClient(client, 'last desktop window released')));
+      for (const client of affected) {
+        if (clientHasPaneConsumer(client) || hudConsumesClient(client)) continue;
+        // Detach without killing so live work continues after the window is gone.
+        await disposeClient(client, 'last desktop window released', true, { detachOnly: true }).catch(() => {});
+      }
       await evictIdleClients();
     })();
     if (lastFocusedMainWin === win) lastFocusedMainWin = null;
@@ -1762,10 +1781,14 @@ app.on('before-quit', (event) => {
   const unique = [...new Set(clients.values())];
   void (async () => {
     try {
-      await Promise.all(unique.map((client) => disposeClient(client, 'shutdown')));
-      await cleanupAutoCreatedSessions();
+      // Detach Desktop only. Never SIGTERM/SIGKILL agent workers on quit —
+      // sessions must keep running (daemon-resident or orphaned RPC child).
+      await Promise.all(unique.map((client) => disposeClient(client, 'app-quit', true, { detachOnly: true })));
+      // Do NOT cleanup session files on quit — a "empty" auto-created session may
+      // still be the live worker we just detached from.
     } finally {
       clients.clear();
+      paneContexts.clear();
       shutdownComplete = true;
       app.quit();
     }

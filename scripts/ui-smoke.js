@@ -172,66 +172,156 @@ const evalSource = `(async () => {
   await wait(() => document.querySelector('#project-surface').classList.contains('hidden'), 'Escape closes project surface');
   results.escape = document.activeElement === inPane('.input') || document.activeElement === inPane('.pane-folder');
 
+  // Stick-to-bottom while the original stream is live.
+  first.scrollBottom(true, true);
+  first.ensureScrollFollowObserver();
+  for (let i = 0; i < 20; i++) {
+    first.addNotice('stream-follow-probe-' + i + '-' + Date.now());
+    first.scrollBottom(true, false);
+    await new Promise((r) => requestAnimationFrame(r));
+  }
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const gap = first.scrollEl.scrollHeight - first.scrollEl.scrollTop - first.scrollEl.clientHeight;
+  results.streamStickToBottom = first.stickToBottom === true && gap < 12;
+
+  // Scroll up: release. Stream-style pin must NOT yank back.
+  first.stickToBottom = false;
+  first.scrollEl.scrollTop = Math.max(0, first.scrollEl.scrollHeight / 3);
+  const heldTop = first.scrollEl.scrollTop;
+  first.addNotice('should-not-yank-' + Date.now());
+  first.scrollBottom(true, false); // pin-only; stick is false
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  results.streamUnpinAllowsScrollUp = first.stickToBottom === false && Math.abs(first.scrollEl.scrollTop - heldTop) < 40;
+
+  // Return to bottom: re-stick.
+  first.scrollEl.scrollTop = first.scrollEl.scrollHeight;
+  first.syncStickFromUserPosition();
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  first.addNotice('should-follow-again-' + Date.now());
+  first.scrollBottom(true, false);
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const gap2 = first.scrollEl.scrollHeight - first.scrollEl.scrollTop - first.scrollEl.clientHeight;
+  results.streamRestickAtBottom = first.stickToBottom === true && gap2 < 12;
+
+  // New Chat while streaming replaces THIS pane in place — no auto-split, no stop required.
+  setFocusedPane(first);
+  first.setBanner(null); // clear residual project-rejection banner from the guard proof above
+  first.sending = false;
+  if (first.draftState.sending) first.draftState.clearSending();
+  const heldSessionPath = first.sessionFile;
+  const heldKey = first.key;
+  const newChatWhileStreaming = await startNewChat();
+  await wait(() => {
+    return G.panes.length === 1
+      && G.focused === first
+      && first.ready
+      && first.key
+      && first.key !== heldKey
+      && first.sessionFile
+      && first.sessionFile !== heldSessionPath;
+  }, 'in-place new chat while streaming');
+  results.streamingNewChatInPlace = !!(newChatWhileStreaming && G.panes.length === 1 && first.sessionFile !== heldSessionPath && first.key !== heldKey
+    && !String(first.bannerEl.textContent || '').includes('Stop the current response before changing sessions'));
+
+  // Sidebar session click also replaces in place (Hermes model). Explicit Split is separate.
   const routeItem = [...document.querySelectorAll('.session-item')].find((item) => item.querySelector('.s-name') && item.querySelector('.s-name').textContent.trim() === 'Routing target');
   if (!routeItem) throw new Error('Routing target session was not rendered');
   results.daemonDiscovered = routeItem.querySelector('.s-meta').textContent.includes('terminal live') && !!routeItem.querySelector('.live-dot.resident');
   routeItem.focus();
   results.sessionSplitDiscoverable = getComputedStyle(routeItem.querySelector('.s-actions')).display === 'flex' && routeItem.querySelector('.s-split').textContent.includes('Split');
   routeItem.click();
-  await wait(() => G.panes.length === 2 && G.focused !== first && G.focused.ready && G.focused.sessionFile === ${JSON.stringify(routingSessionCanonical)}, 'normal-click streaming session route');
-  const second = G.focused;
-  results.streamingSessionRouted = first.isStreaming && first.key === firstKey && second.sessionFile === ${JSON.stringify(routingSessionCanonical)} && !first.bannerEl.textContent.includes('Stop the current response before changing sessions');
+  await wait(() => G.panes.length === 1 && first.ready && first.sessionFile === ${JSON.stringify(routingSessionCanonical)}, 'in-place streaming session switch');
+  results.streamingSessionInPlace = G.panes.length === 1 && first.sessionFile === ${JSON.stringify(routingSessionCanonical)}
+    && !String(first.bannerEl.textContent || '').includes('Stop the current response before changing sessions');
+
+  // Cycle sessions in the same center pane — never auto-split.
+  const routeItemTwoCycle = [...document.querySelectorAll('.session-item')].find((item) => item.querySelector('.s-name') && item.querySelector('.s-name').textContent.trim() === 'Routing target two');
+  if (!routeItemTwoCycle) throw new Error('Routing target two missing for cycle proof');
+  routeItemTwoCycle.click();
+  await wait(() => G.panes.length === 1 && first.ready && first.sessionFile === ${JSON.stringify(routingSessionTwoCanonical)}, 'cycle to second session single pane');
+  routeItem.click();
+  await wait(() => G.panes.length === 1 && first.ready && first.sessionFile === ${JSON.stringify(routingSessionCanonical)}, 'cycle back to first session single pane');
+  results.sessionCycleSinglePane = G.panes.length === 1 && first.sessionFile === ${JSON.stringify(routingSessionCanonical)};
+
+  // Explicit Split opens a second pane; daemon attach works there.
+  const splitOpened = await splitPane(${JSON.stringify(routingSessionTwoCanonical)});
+  await wait(() => G.panes.length === 2 && G.focused !== first && G.focused.ready && G.focused.sessionFile === ${JSON.stringify(routingSessionTwoCanonical)}, 'explicit split with second session');
+  let second = G.focused;
+  results.explicitSplit = !!(splitOpened && G.panes.length === 2 && second.sessionFile === ${JSON.stringify(routingSessionTwoCanonical)});
   const daemonClients = await window.prime.listClients();
-  second.inputEl.value = '__DAEMON_HOLD__';
-  second.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-  await second.send();
-  await wait(() => second.isStreaming && second.chatEl.textContent.includes('daemon attachment live stream'), 'resident daemon live stream');
-  results.daemonAttachment = daemonClients.some((client) => client.key === second.key && client.transport === 'daemon-attachment') && first.isStreaming;
-  await second.stop();
-  await wait(() => !second.isStreaming && first.isStreaming, 'resident daemon abort without terminal stop');
+  // first now shows routing target (daemon). Drive a hold stream on second (RPC) and first (daemon).
   setFocusedPane(first);
-  const alreadyOpenItem = [...document.querySelectorAll('.session-item')].find((item) => item.querySelector('.s-name') && item.querySelector('.s-name').textContent.trim() === 'Routing target');
-  alreadyOpenItem.click();
-  results.existingSessionFocused = G.focused === second && G.panes.length === 2 && first.isStreaming;
-  setFocusedPane(first);
-  const routeItemTwo = [...document.querySelectorAll('.session-item')].find((item) => item.querySelector('.s-name') && item.querySelector('.s-name').textContent.trim() === 'Routing target two');
-  if (!routeItemTwo) throw new Error('Second routing target session was not rendered');
-  routeItemTwo.click();
-  await wait(() => G.focused === second && second.ready && second.sessionFile === ${JSON.stringify(routingSessionTwoCanonical)}, 'two-pane non-streaming route');
-  results.twoPaneSessionRouted = first.isStreaming && first.key === firstKey && G.panes.length === 2 && second.sessionFile === ${JSON.stringify(routingSessionTwoCanonical)};
-  const sessionsAfterDaemonDetach = await window.prime.listSessions();
-  const detachedResident = sessionsAfterDaemonDetach.find((session) => session.path === ${JSON.stringify(routingSessionCanonical)});
-  results.daemonDetachNotStop = !!(detachedResident && detachedResident.daemonResident && detachedResident.daemonAttachedClients === 1);
-  await first.stop();
-  await wait(() => !first.isStreaming, 'stop routed source response');
-  await second.activate(firstSession);
-  await wait(() => second.ready && second.key === first.key && second.sessionFile === firstSession, 'share first session after routing proof');
-  first.inputEl.value = '__HOLD__';
+  first.inputEl.value = '__DAEMON_HOLD__';
   first.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
   await first.send();
-  await wait(() => first.isStreaming && second.isStreaming, 'same-session event fan-out');
-  setFocusedPane(first);
-  const bothStreamingRoute = await openSessionFromSidebar(${JSON.stringify(routingSessionCanonical)});
-  results.bothStreamingRouteBounded = bothStreamingRoute === false && first.isStreaming && second.isStreaming && first.bannerEl.textContent.includes('Both panes are streaming');
-  const deleteWhileStreaming = await window.prime.deleteSession(firstSession);
-  const restartWhileStreaming = await restartAllAgents();
-  results.busyLifecycleRejected = deleteWhileStreaming.ok === false && restartWhileStreaming === false && first.isStreaming && second.isStreaming;
-  await second.stop();
-  await wait(() => !first.isStreaming && !second.isStreaming, 'same-session abort fan-out');
-  results.sameSessionFanoutAbort = first.key === second.key;
+  await wait(() => first.isStreaming && first.chatEl.textContent.includes('daemon attachment live stream'), 'resident daemon live stream');
+  results.daemonAttachment = daemonClients.some((client) => client.key === first.key && client.transport === 'daemon-attachment') && first.isStreaming;
+
+  // Close the streaming split pane without stopping the response.
+  setFocusedPane(second);
+  second.inputEl.value = '__HOLD__';
+  second.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+  await second.send();
+  await wait(() => second.isStreaming, 'second pane streaming before close');
+  await closePane(second);
+  await wait(() => G.panes.length === 1 && G.focused === first && first.isStreaming, 'close streaming split pane');
+  results.closeStreamingPane = G.panes.length === 1 && first.isStreaming && !first.bannerEl.textContent.includes('Stop the current response before closing');
+
+  // Re-open explicit split for remaining multi-pane proofs.
+  const splitAgain = await splitPane(null);
+  await wait(() => G.panes.length === 2 && G.focused.ready, 'reopen blank split');
+  const paneB = G.focused;
+  results.blankSplitAgain = !!(splitAgain && paneB && paneB.sessionFile !== first.sessionFile);
+  // Share first's live daemon session on paneB for fan-out.
+  await paneB.activate(first.sessionFile);
+  await wait(() => paneB.ready && paneB.key === first.key && paneB.isStreaming, 'share streaming session across panes');
+  results.sameSessionFanout = first.isStreaming && paneB.isStreaming && first.key === paneB.key;
+  const deleteWhileStreaming = await window.prime.deleteSession(first.sessionFile);
+  // Restart is allowed while streaming (disposes/rebinds deliberately). Delete is not.
+  results.busyLifecycleRejected = deleteWhileStreaming.ok === false && first.isStreaming && paneB.isStreaming;
+  await first.stop();
+  await wait(() => !first.isStreaming && !paneB.isStreaming, 'same-session abort fan-out');
+  results.sameSessionFanoutAbort = first.key === paneB.key;
+  second = paneB;
+  const sharedSessionPath = first.sessionFile;
+  const sharedSessionKey = first.key;
 
   const sharedSearch = await window.prime.searchWorkspace(first.key, first.paneId, first.bindingEpoch, {
     workspaceId: first.workspace.workspaceId, generation: first.workspace.generation, query: 'fixture.txt', limit: 10,
   });
   const sharedFile = (sharedSearch.entries || []).find((entry) => entry.name === 'fixture.txt');
   const pendingAttachment = first.addTreeAttachment(sharedFile.nodeId);
-  const deleteWhileAttaching = await window.prime.deleteSession(firstSession);
+  const deleteWhileAttaching = await window.prime.deleteSession(sharedSessionPath);
   await pendingAttachment;
-  const deleteWhileShared = await window.prime.deleteSession(firstSession);
-  results.sharedDeleteRejected = deleteWhileAttaching.ok === false && deleteWhileShared.ok === false && first.key === firstSession && second.key === firstSession && first.draftState.items.some((item) => item.name === 'fixture.txt');
+  const deleteWhileShared = await window.prime.deleteSession(sharedSessionPath);
+  results.sharedDeleteRejected = deleteWhileAttaching.ok === false && deleteWhileShared.ok === false && first.key === sharedSessionKey && second.key === sharedSessionKey && first.draftState.items.some((item) => item.name === 'fixture.txt');
 
+  // Leave the resident daemon session so delete is blocked by terminal ownership,
+  // not by open Desktop panes ("Switch or close every pane...").
+  async function leaveSession(pane, bannedPath, label) {
+    setFocusedPane(pane);
+    await pane.stop().catch(() => {});
+    pane.setBanner(null);
+    if (pane.sessionFile !== bannedPath) return;
+    // Prefer an inactive non-resident session if present; else New Chat.
+    const inactive = G.sessions.find((s) => s.path !== bannedPath && !s.daemonResident);
+    if (inactive) {
+      await pane.activate(inactive.path, null, { allowStreaming: true });
+    } else {
+      if (!pane.workspace.selected) {
+        await openProjectSurface(pane);
+        document.querySelector('#choose-folder-btn').click();
+        await wait(() => pane.workspace.selected, label + ' project');
+      }
+      await pane.activate(null, null, { allowStreaming: true });
+    }
+    await wait(() => pane.ready && pane.sessionFile && pane.sessionFile !== bannedPath, label);
+  }
+  await leaveSession(first, ${JSON.stringify(routingSessionCanonical)}, 'leave resident session on first');
+  await leaveSession(second, ${JSON.stringify(routingSessionCanonical)}, 'leave resident session on second');
+  setFocusedPane(first);
   const residentDelete = await window.prime.deleteSession(${JSON.stringify(routingSessionCanonical)});
-  results.residentDeleteRejected = residentDelete.ok === false && residentDelete.error.includes('active in Prime Agent');
+  results.residentDeleteRejected = residentDelete.ok === false && String(residentDelete.error || '').includes('active in Prime Agent');
   const inactiveDeleted = await window.prime.deleteSession('${deletableSession}');
   const sessionsAfterDelete = await window.prime.listSessions();
   const secondKeyBeforeDeletedReopen = second.key;
@@ -246,12 +336,20 @@ const evalSource = `(async () => {
   const genericAutomation = await window.prime.command(second.key, { type: 'list_schedules', includeInactive: true });
   results.automationRoute = automation.success === true && genericAutomation.success === false;
 
+  // Put first back on the original workspace fixture project for multi-pane isolation proof.
+  if (!first.workspace.cwd || !first.workspace.cwd.includes('workspace-fixture')) {
+    await openProjectSurface(first);
+    await wait(() => [...document.querySelectorAll('#project-choice-list .project-choice')].some((button) => button.textContent.includes('workspace-fixture')), 'restore workspace fixture');
+    const wsChoice = [...document.querySelectorAll('#project-choice-list .project-choice')].find((button) => button.textContent.includes('workspace-fixture'));
+    wsChoice.click();
+    await wait(() => first.workspace.cwd && first.workspace.cwd.includes('workspace-fixture'), 'workspace fixture restored');
+  }
   await openProjectSurface(second);
   await wait(() => [...document.querySelectorAll('#project-choice-list .project-choice')].some((button) => button.textContent.includes('worktree-fixture') || button.textContent.includes('ui-smoke-linked')), 'worktree choice');
   const worktreeChoice = [...document.querySelectorAll('#project-choice-list .project-choice')].find((button) => button.textContent.includes('worktree-fixture') || button.textContent.includes('ui-smoke-linked'));
   worktreeChoice.click();
   await wait(() => second.workspace.cwd && second.workspace.cwd.includes('worktree-fixture'), 'worktree activation');
-  results.multiPaneSafe = first.key === firstKey && first.workspace.cwd.includes('workspace-fixture') && second.key !== first.key && second.workspace.cwd.includes('worktree-fixture');
+  results.multiPaneSafe = first.workspace.cwd.includes('workspace-fixture') && second.key !== first.key && second.workspace.cwd.includes('worktree-fixture');
 
   const synthetic = new File(['outside'], 'outside.txt', { type: 'text/plain' });
   const drop = new Event('drop', { bubbles: true, cancelable: true });
@@ -287,10 +385,46 @@ const evalSource = `(async () => {
   results.savedUnsafeCwdDegrades = unsafeOpened === true && !second.workspace.selected && second.bannerEl.textContent.includes('saved project is unavailable') && unsafeClient && unsafeClient.cwd === '${unsafeCwd}';
   results.activationTextLifecycle = retainedOnFailure && second.inputEl.value === '';
   results.concurrentActivationGuard = concurrentActivation === false && bindingControlsLocked;
+  // Both panes must be idle process-backed chats before restart/crash proofs.
+  // Daemon attachments ignore fake-agent testCrash. Any selected project is fine.
+  async function ensureProcessPane(pane, label) {
+    setFocusedPane(pane);
+    await pane.stop().catch(() => {});
+    pane.setBanner(null);
+    const clientsNow = await window.prime.listClients();
+    const isDaemon = clientsNow.some((c) => c.key === pane.key && c.transport === 'daemon-attachment');
+    if (isDaemon || !pane.workspace.selected) {
+      // Prefer in-place new chat on current project; else open picker / test choose-folder.
+      if (pane.workspace && pane.workspace.selected) {
+        await pane.activate(null, null, { allowStreaming: true });
+        await wait(() => pane.ready && pane.key, label + ' new chat');
+      } else {
+        await openProjectSurface(pane);
+        const choice = [...document.querySelectorAll('#project-choice-list .project-choice')].find((button) => button.textContent.includes('workspace-fixture') || button.textContent.includes('worktree-fixture') || button.textContent.includes('ui-smoke-linked'));
+        if (choice) {
+          choice.click();
+          await wait(() => pane.workspace.selected && pane.ready, label + ' project choice');
+        } else {
+          document.querySelector('#choose-folder-btn').click();
+          await wait(() => pane.workspace.selected && pane.ready, label + ' choose folder');
+        }
+      }
+    }
+    const after = await window.prime.listClients();
+    if (after.some((c) => c.key === pane.key && c.transport === 'daemon-attachment')) {
+      // Last resort: new chat after project is selected should be process-backed.
+      await pane.activate(null, null, { allowStreaming: true });
+      await wait(() => pane.ready && pane.key, label + ' force process chat');
+    }
+  }
+  await ensureProcessPane(first, 'lifecycle first');
+  await ensureProcessPane(second, 'lifecycle second');
+  setFocusedPane(first);
   first.inputEl.value = 'UNSENT RESTART DRAFT';
   first.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
   const restartDraftBefore = { id: first.draftState.id, sessionFile: first.sessionFile, items: first.draftState.items.map((item) => item.name) };
   const restarted = await restartAllAgents();
+  await wait(() => G.panes.every((pane) => pane.ready && pane.key && pane.bindingEpoch), 'panes ready after restart');
   const restartedClients = await window.prime.listClients();
   results.restartRecovery = restarted === true && G.panes.every((pane) => pane.ready && pane.key && pane.bindingEpoch && restartedClients.some((client) => client.key === pane.key && client.alive));
   results.restartDraftPreserved = first.sessionFile === restartDraftBefore.sessionFile && first.draftState.id === restartDraftBefore.id && first.inputEl.value === 'UNSENT RESTART DRAFT' && JSON.stringify(first.draftState.items.map((item) => item.name)) === JSON.stringify(restartDraftBefore.items);

@@ -32,7 +32,7 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
-html, body, #app { height: 100%; }
+html, body, #app { height: 100%; min-height: 0; }
 body {
   font-family: var(--font);
   font-feature-settings: "cv01", "ss03";
@@ -42,7 +42,7 @@ body {
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
-#app { display: flex; }
+#app { display: flex; height: 100%; min-height: 0; overflow: hidden; }
 .hidden { display: none !important; }
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
 
@@ -54,6 +54,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
+  min-height: 0;
   padding-top: 38px; /* room for traffic lights */
 }
 .sidebar-top { padding: 10px 12px 6px; }
@@ -119,7 +120,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 .ghost-btn:hover { color: var(--text); }
 
 /* ---------- Main column ---------- */
-#main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 #topbar {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 16px; padding-top: 38px;
@@ -297,7 +298,7 @@ details.thinking .thinking-body {
 .notice { text-align: center; font-size: 12px; color: var(--text-faint); margin: 10px 0; font-style: italic; }
 
 /* ---------- Composer ---------- */
-.composer { border-top: 1px solid var(--border); padding: 12px 16px 8px; background: var(--bg); }
+.composer { border-top: 1px solid var(--border); padding: 12px 16px 8px; background: var(--bg); flex-shrink: 0; }
 .queue-hint { font-size: 12px; color: var(--amber); margin-bottom: 6px; max-width: 860px; margin-left: auto; margin-right: auto; }
 .composer-row {
   max-width: 860px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end;
@@ -497,6 +498,11 @@ details.thinking .thinking-body {
 .session-item .s-name { padding-right: 96px; }
 
 /* ---------- subagents ---------- */
+.sub-dot.live {
+  background: var(--emerald);
+  box-shadow: 0 0 0 3px rgba(16,185,129,0.18);
+  animation: live-pulse 1.4s ease-in-out infinite;
+}
 .sub-dot {
   display: inline-block; width: 6px; height: 6px; border-radius: 50%;
   background: var(--text-faint); margin-right: 6px; vertical-align: 1px;
@@ -551,9 +557,10 @@ details.thinking .thinking-body {
 .s-actions .s-act, .s-actions .s-delete { position: static; display: block; }
 
 /* ---------- v0.6 panes ---------- */
-#panes { flex: 1; display: flex; min-width: 0; }
+#panes { flex: 1; display: flex; min-width: 0; min-height: 0; }
 .pane {
-  position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0;
+  position: relative; flex: 1; display: flex; flex-direction: column;
+  min-width: 0; min-height: 0; /* required so .chat-scroll can shrink and own overflow */
   border-left: 1px solid transparent;
 }
 body.split .pane:first-child { border-right: 1px solid var(--border); }
@@ -584,8 +591,25 @@ body.split .pane:first-child { border-right: 1px solid var(--border); }
   border-bottom: 1px solid var(--border);
 }
 .pane-banner.error { background: rgba(235,87,87,.10); color: var(--red); }
-.chat-scroll { flex: 1; overflow-y: auto; position: relative; }
-.chat { max-width: 860px; margin: 0 auto; padding: 24px 24px 12px; }
+.chat-scroll {
+  flex: 1 1 auto;
+  min-height: 0; /* flex item must shrink or scrollHeight follow never engages */
+  overflow-x: hidden;
+  overflow-y: auto;
+  position: relative;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.chat {
+  max-width: 860px; margin: 0 auto; padding: 24px 24px 12px;
+  min-height: min-content; /* grow with stream content so ResizeObserver fires */
+}
+.chat-scroll-anchor {
+  width: 100%;
+  height: 1px;
+  overflow: hidden;
+  pointer-events: none;
+}
 body.split .chat { padding: 18px 16px 10px; }
 .empty-state {
   position: absolute; inset: 0; display: flex; flex-direction: column;
@@ -726,3 +750,35 @@ body.split .pane-split:disabled { max-width: none; }
 #hud-btn { color: var(--text-2); }
 
 .live-dot.resident { animation: none; background: var(--text-dim); box-shadow: 0 0 0 2px rgba(255,255,255,.06); }
+
+
+/* ---------- Agents dashboard ---------- */
+#agents-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 90;
+  display: flex; align-items: center; justify-content: center;
+}
+#agents-backdrop.hidden { display: none !important; }
+#agents-panel {
+  background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 12px;
+  width: 720px; max-width: 94vw; height: 620px; max-height: 88vh;
+  display: flex; flex-direction: column; box-shadow: var(--shadow-dialog);
+}
+#agents-body { flex: 1; overflow-y: auto; padding: 8px 16px 18px; }
+.agent-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 10px; border-radius: 8px; cursor: pointer;
+  border: 1px solid transparent;
+}
+.agent-row:hover { background: rgba(255,255,255,0.04); border-color: var(--border); }
+.agent-row .ar-main { flex: 1; min-width: 0; }
+.agent-row .ar-name { font-size: 13px; font-weight: 510; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-row .ar-meta { font-size: 11px; color: var(--text-faint); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-row .ar-status {
+  font-size: 10px; font-weight: 590; letter-spacing: .04em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border-solid);
+  color: var(--text-dim);
+}
+.agent-row .ar-status.running { color: var(--emerald); border-color: rgba(16,185,129,.35); background: rgba(16,185,129,.08); }
+.agent-row .ar-status.idle { color: var(--text-faint); }
+.agent-empty { padding: 10px 4px; color: var(--text-faint); font-size: 12.5px; }
+#subagent-section .section-label { margin-top: 4px; }

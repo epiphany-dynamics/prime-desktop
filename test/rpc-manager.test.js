@@ -171,3 +171,23 @@ test("late and unmatched response records are ignored instead of emitted as even
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(events, [{ type: "agent_end" }]);
 });
+
+
+test("spawn detaches agent workers so Desktop quit cannot reap them", async (t) => {
+  const f = fixture(); await cleanup(t, f);
+  await f.manager.start({ cwd: f.root });
+  assert.equal(f.spawns[0].options.detached, true);
+});
+
+test("app-quit detach does not kill the agent process or close stdin", async (t) => {
+  const f = fixture(); await cleanup(t, f);
+  await f.manager.start({ cwd: f.root });
+  const proc = f.processes[0];
+  const ends = [];
+  proc.stdin.end = () => { ends.push("end"); return true; };
+  proc.stdin.destroy = () => { ends.push("destroy"); };
+  proc.unref = () => { ends.push("unref"); };
+  await f.manager.stop("app-quit", { killProcess: false });
+  assert.deepEqual(proc.signals, [], "detach must not SIGTERM/SIGKILL");
+  assert.ok(!ends.includes("end") && !ends.includes("destroy"), "detach must not close stdin");
+});

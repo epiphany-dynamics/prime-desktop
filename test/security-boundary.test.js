@@ -111,3 +111,14 @@ test('resident daemon sessions attach non-owningly and never pass through destru
   assert.match(main, /const stillResident = moduleEntry && await discoverResidentSession/);
   assert.match(main, /This session is active in Prime Agent\. Stop it there before deleting it\./);
 });
+
+
+test("app quit detaches clients without killing agent workers", () => {
+  const main = require("fs").readFileSync(require("path").join(__dirname, "..", "main.js"), "utf8");
+  const rpc = require("fs").readFileSync(require("path").join(__dirname, "..", "lib", "rpc-manager.js"), "utf8");
+  assert.match(main, /disposeClient\(client, 'app-quit'/);
+  assert.match(main, /detachOnly/);
+  assert.doesNotMatch(main, /disposeClient\(client, 'shutdown'\)/);
+  assert.match(rpc, /killProcess/);
+  assert.match(rpc, /reason !== "app-quit"/);
+});

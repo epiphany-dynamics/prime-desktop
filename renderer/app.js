@@ -86,7 +86,15 @@ const G = {
   extUiOwner: null, // pane that issued the current extension dialog
   hudShortcutWarning: null,
   hudShortcutWarningShown: false,
+  // Unsent composer text keyed by sessionFile (or "new:<paneId>" for blank chats).
+  composerDrafts: new Map(),
+  liveAgents: [],
 };
+
+function composerDraftKey(sessionFile, paneId) {
+  if (typeof sessionFile === 'string' && sessionFile) return sessionFile;
+  return 'new:' + (paneId || 'pane');
+}
 
 function showHudShortcutWarning(pane) {
   if (!pane || !pane.ready || !G.hudShortcutWarning || G.hudShortcutWarningShown) return;
@@ -119,6 +127,13 @@ class Pane {
     this.commandCache = null;
     this.suggestionRequest = 0;
     this.sending = false;
+    this.stickToBottom = true;
+    this._scrollFollowRaf = 0;
+    this._scrollGesturesBound = false;
+    this._scrollAnchor = null;
+    this._chatResizeObserver = null;
+    this._chatMutationObserver = null;
+    this._mutationScrollQueued = false;
 
     const tpl = $('#pane-template').content.cloneNode(true);
     this.el = tpl.querySelector('.pane');
@@ -155,7 +170,14 @@ class Pane {
     this.el.addEventListener('dragover', (e) => this.handlePaneDragOver(e));
     this.el.addEventListener('dragleave', (e) => { if (!this.el.contains(e.relatedTarget)) this.el.classList.remove('drag-target'); });
     this.el.addEventListener('drop', (e) => this.handlePaneDrop(e));
-    this.inputEl.addEventListener('input', () => { this.composerRevision += 1; this.autoSize(); this.updateComposer(); this.updateSuggestions(); });
+    this.ensureScrollFollowObserver();
+    this.inputEl.addEventListener('input', () => {
+      this.composerRevision += 1;
+      this.autoSize();
+      this.updateComposer();
+      this.updateSuggestions();
+      this.saveComposerDraft();
+    });
     this.inputEl.addEventListener('paste', (e) => this.handlePaste(e));
     this.inputEl.addEventListener('dragover', (e) => { if (e.dataTransfer && e.dataTransfer.files.length) e.preventDefault(); });
     this.inputEl.addEventListener('drop', (e) => this.handleFileDrop(e));
@@ -298,10 +320,17 @@ class Pane {
     const sessionPath = e.dataTransfer && e.dataTransfer.getData('application/x-prime-session');
     if (!sessionPath) return;
     e.preventDefault(); e.stopPropagation();
+    // Drop onto a pane opens that session IN THIS pane (or explicit split target).
+    // Never invent a second pane from a sidebar drag — Split button is the only
+    // way to create split view.
     const existing = G.panes.find((p) => p.sessionFile === sessionPath);
-    if (existing) { setFocusedPane(existing); return; }
-    if (G.panes.length < 2) await splitWithSession(sessionPath);
-    else await this.activate(sessionPath);
+    if (existing && existing !== this && G.panes.length > 1) {
+      // In split mode, dropping on a pane loads into that pane.
+      await this.activate(sessionPath, null, { allowStreaming: true });
+      return;
+    }
+    // Single-pane (or drop on the only pane): replace center view in place.
+    await openSessionFromSidebar(sessionPath);
   }
 
   currentComposerToken() {
@@ -406,12 +435,14 @@ class Pane {
   }
 
   // ---------- activation ----------
-  canChangeBinding(action = 'changing sessions') {
+  canChangeBinding(action = 'changing sessions', { allowStreaming = false } = {}) {
     if (this.bindingChangePending) {
       this.setBanner(`Wait for the current project or session change before ${action}.`, true);
       return false;
     }
-    if (this.isStreaming) {
+    // Session navigation is allowed while streaming (in-place switch). Project
+    // changes and pane close still require a quiet response.
+    if (this.isStreaming && !allowStreaming) {
       this.setBanner(`Stop the current response before ${action}.`, true);
       return false;
     }
@@ -441,39 +472,73 @@ class Pane {
     this.bannerEl.style.cursor = '';
     this.bannerEl.onclick = null;
     // A process-only same-session recovery keeps unsent text and the main-owned
-    // draft. Genuine new/session/project bindings clear before async history work.
+    // draft. Otherwise restore any unsent composer text saved for this session.
     if (!preserveDraft) {
-      this.inputEl.value = '';
+      const key = composerDraftKey(this.sessionFile, this.paneId);
+      const saved = G.composerDrafts.get(key);
+      this.inputEl.value = typeof saved === 'string' ? saved : '';
       this.composerRevision += 1;
       this.autoSize();
     }
     this.hideSuggestions();
+    // Prefer activation payload state first (covers daemon attach race before get_state).
+    if (response.state) {
+      this.isStreaming = !!response.state.isStreaming;
+      this.model = response.state.model || this.model;
+      this.thinkingLevel = response.state.thinkingLevel || this.thinkingLevel;
+      if (response.state.sessionFile) this.sessionFile = response.state.sessionFile;
+    }
     await this.syncState();
     if (requestId !== this.activationRequest || this.bindingEpoch !== response.bindingEpoch) return false;
     const messages = await prime.command(this.key, { type: 'get_messages' });
     if (requestId !== this.activationRequest || this.bindingEpoch !== response.bindingEpoch) return false;
     if (messages.success) {
-      const streamingMessage = messages.data && messages.data.streamingMessage;
-      this.renderHistory(messages.data.messages, { dropInFlight: this.isStreaming && !streamingMessage });
-      if (this.isStreaming && streamingMessage && streamingMessage.role === 'assistant') {
-        this.beginStream();
-        this.syncStreamFromMessage(streamingMessage);
-        this.scheduleStreamRender();
+      const streamingMessage = (messages.data && messages.data.streamingMessage)
+        || (response.state && response.state.streamingMessage)
+        || null;
+      this.renderHistory(messages.data.messages || [], { dropInFlight: this.isStreaming && !streamingMessage });
+      if (this.isStreaming) {
+        this.setAgentState('working…');
+        if (streamingMessage && streamingMessage.role === 'assistant') {
+          this.beginStream();
+          this.syncStreamFromMessage(streamingMessage);
+          this.scheduleStreamRender();
+        }
       }
+    } else if (this.isStreaming) {
+      this.setAgentState('working…');
     }
     this.ready = true;
+    this.updateTopbar();
+    this.updateComposer();
     renderSidebar();
+    void refreshLiveAgents(this);
     if (treeVisible && G.focused === this) await renderTreeRoot();
     if (response.warning) this.setBanner(response.warning, false);
     else showHudShortcutWarning(this);
     return true;
   }
 
-  async activate(sessionPath, sourcePane = null) {
-    if (!this.canChangeBinding('changing sessions')) return false;
+  async activate(sessionPath, sourcePane = null, { allowStreaming = true } = {}) {
+    // Default allowStreaming: navigation and New Chat replace this pane in place.
+    // Split View is explicit (button / sidebar Split / drag-drop only).
+    // Drop transient send/stream locks first so navigation is never sealed by a
+    // held stream or a draft send that already returned from main.
+    this.sending = false;
+    if (this.draftState && this.draftState.sending) this.draftState.clearSending();
+    if (!this.canChangeBinding(sessionPath ? 'changing sessions' : 'starting a new chat', { allowStreaming })) return false;
+    // Persist unsent composer text for the session we are leaving.
+    this.saveComposerDraft();
     this.bindingChangePending = true;
     this.updateComposer();
     const requestId = ++this.activationRequest;
+    // Leaving a streaming session: clear local stream chrome before the new binding loads.
+    if (this.isStreaming || this.stream) {
+      this.isStreaming = false;
+      this.endStream();
+      this.setAgentState('');
+      this.toolCards.clear();
+    }
     try {
       this.setBanner(null);
       this.commandCache = null;
@@ -484,6 +549,7 @@ class Pane {
         sourceKey: this.key || (sourcePane && sourcePane.key) || undefined,
         sourcePaneId: !this.paneId && sourcePane ? sourcePane.paneId : undefined,
         sourceBindingEpoch: !this.paneId && sourcePane ? sourcePane.bindingEpoch : undefined,
+        allowStreamingLeave: allowStreaming,
       });
       if (requestId !== this.activationRequest) return false;
       if (!response.ok) { this.setBanner('Could not start session: ' + (response.error || 'unknown'), true); return false; }
@@ -495,8 +561,8 @@ class Pane {
   }
 
   async newChat() {
-    if (!this.workspace.selected) { await openProjectSurface(this); return false; }
-    return this.activate(null);
+    if (this !== G.focused) setFocusedPane(this);
+    return startNewChat();
   }
 
   async syncState() {
@@ -568,14 +634,169 @@ class Pane {
   }
   setAgentState(text) { this.agentState.textContent = text || ''; }
 
+  saveComposerDraft() {
+    const key = composerDraftKey(this.sessionFile, this.paneId);
+    const text = this.inputEl ? this.inputEl.value : '';
+    if (text && text.length) G.composerDrafts.set(key, text);
+    else G.composerDrafts.delete(key);
+  }
+
+  clearComposerDraft(sessionFile = this.sessionFile) {
+    G.composerDrafts.delete(composerDraftKey(sessionFile, this.paneId));
+  }
+
   autoSize() {
     this.inputEl.style.height = 'auto';
     this.inputEl.style.height = Math.min(this.inputEl.scrollHeight, 200) + 'px';
   }
-  nearBottom() { return this.scrollEl.scrollHeight - this.scrollEl.scrollTop - this.scrollEl.clientHeight < 120; }
-  scrollBottom(force) { if (force || this.nearBottom()) this.scrollEl.scrollTop = this.scrollEl.scrollHeight; }
+  nearBottom(threshold = 72) {
+    const el = this.scrollEl;
+    if (!el) return true;
+    return (el.scrollHeight - el.scrollTop - el.clientHeight) <= threshold;
+  }
+
+  /**
+   * ChatGPT-style stick-to-bottom:
+   * - Follow latest output only while stickToBottom is true
+   * - User scroll-away immediately releases and STAYS released
+   * - Returning to the real bottom re-enables stick
+   * - Stream/mutation updates must NEVER re-arm stick (that caused snap-back)
+   */
+  syncStickFromUserPosition() {
+    if (this._programmaticScroll) return;
+    if (this.nearBottom(72)) {
+      this.stickToBottom = true;
+    } else {
+      this.stickToBottom = false;
+      this._stopFollowLoop();
+    }
+  }
+
+  releaseStickFromUserGesture() {
+    // Immediate release on intentional wheel/touch away from bottom.
+    this.stickToBottom = false;
+    this._stopFollowLoop();
+    // After the browser applies the gesture, re-evaluate (allows re-stick at bottom).
+    requestAnimationFrame(() => this.syncStickFromUserPosition());
+  }
+
+  _pinScrollToEnd() {
+    const el = this.scrollEl;
+    if (!el || !this.stickToBottom) return;
+    this._programmaticScroll = true;
+    // Only scrollTop — never scrollIntoView (it can target the wrong box and snap mid-thread).
+    el.scrollTop = el.scrollHeight;
+    requestAnimationFrame(() => {
+      if (this.stickToBottom && this.scrollEl) this.scrollEl.scrollTop = this.scrollEl.scrollHeight;
+      // Clear flag after layout settles so user scroll is heard again.
+      requestAnimationFrame(() => { this._programmaticScroll = false; });
+    });
+  }
+
+  _stopFollowLoop() {
+    if (this._scrollFollowRaf) {
+      cancelAnimationFrame(this._scrollFollowRaf);
+      this._scrollFollowRaf = 0;
+    }
+  }
+
+  _ensureFollowLoop() {
+    // No continuous RAF hammer. Pin once per content change only.
+    this._stopFollowLoop();
+  }
+
+  /**
+   * @param {boolean} forcePin when true, pin if currently sticking (does NOT re-arm stick)
+   * @param {boolean} engageStick when true, intentionally turn stick on (user send / jump-to-latest only)
+   */
+  scrollBottom(forcePin = false, engageStick = false) {
+    if (engageStick) this.stickToBottom = true;
+    if (!this.stickToBottom) return;
+    if (!forcePin && !this.stickToBottom) return;
+    this._pinScrollToEnd();
+  }
+
+  ensureScrollFollowObserver() {
+    if (this.scrollEl && !this._scrollGesturesBound) {
+      this._scrollGesturesBound = true;
+      this.scrollEl.addEventListener('scroll', () => this.syncStickFromUserPosition(), { passive: true });
+      // Wheel/touch: release immediately if user scrolls up; sync after for re-stick at bottom.
+      this.scrollEl.addEventListener('wheel', (e) => {
+        if (e.deltaY < 0) {
+          this.stickToBottom = false;
+          this._stopFollowLoop();
+        } else {
+          requestAnimationFrame(() => this.syncStickFromUserPosition());
+        }
+      }, { passive: true });
+      this.scrollEl.addEventListener('touchstart', () => { this._touchY = null; }, { passive: true });
+      this.scrollEl.addEventListener('touchmove', (e) => {
+        const y = e.touches && e.touches[0] ? e.touches[0].clientY : null;
+        if (y != null && this._touchY != null && y > this._touchY + 2) {
+          // Finger dragging down content = scrolling up historically → release
+          this.stickToBottom = false;
+          this._stopFollowLoop();
+        }
+        this._touchY = y;
+      }, { passive: true });
+      this.scrollEl.addEventListener('touchend', () => requestAnimationFrame(() => this.syncStickFromUserPosition()), { passive: true });
+      this.scrollEl.addEventListener('keydown', (e) => {
+        if (['PageUp', 'Home', 'ArrowUp'].includes(e.key)) {
+          this.stickToBottom = false;
+          this._stopFollowLoop();
+        } else if (['PageDown', 'End', 'ArrowDown', ' '].includes(e.key)) {
+          requestAnimationFrame(() => this.syncStickFromUserPosition());
+        }
+      });
+    }
+
+    if (!this._scrollAnchor && this.chatEl) {
+      const anchor = document.createElement('div');
+      anchor.className = 'chat-scroll-anchor';
+      anchor.setAttribute('aria-hidden', 'true');
+      this.chatEl.appendChild(anchor);
+      this._scrollAnchor = anchor;
+    }
+
+    if (!this._chatResizeObserver && typeof ResizeObserver !== 'undefined') {
+      this._chatResizeObserver = new ResizeObserver(() => {
+        // Content grew: follow only if user is stuck to bottom. Never re-arm.
+        if (this.stickToBottom) this.scrollBottom(true, false);
+      });
+      if (this.chatEl) this._chatResizeObserver.observe(this.chatEl);
+      if (this.scrollEl) this._chatResizeObserver.observe(this.scrollEl);
+    }
+
+    if (!this._chatMutationObserver && typeof MutationObserver !== 'undefined' && this.chatEl) {
+      this._chatMutationObserver = new MutationObserver(() => {
+        if (!this.stickToBottom || this._mutationScrollQueued) return;
+        this._mutationScrollQueued = true;
+        requestAnimationFrame(() => {
+          this._mutationScrollQueued = false;
+          if (this.stickToBottom) this.scrollBottom(true, false);
+        });
+      });
+      this._chatMutationObserver.observe(this.chatEl, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+    }
+  }
   hideEmpty() { this.emptyEl.classList.add('hidden'); }
-  showEmptyIfEmpty() { this.emptyEl.classList.toggle('hidden', this.chatEl.children.length > 0); }
+  showEmptyIfEmpty() {
+    const hasContent = [...this.chatEl.children].some((el) => el !== this._scrollAnchor && !el.classList.contains('empty-state'));
+    this.emptyEl.classList.toggle('hidden', hasContent);
+  }
+  _keepScrollAnchorLast() {
+    if (!this.chatEl) return;
+    if (this._scrollAnchor && this._scrollAnchor.parentNode === this.chatEl) {
+      // Only move when needed — re-append always fires MutationObserver and can thrash.
+      if (this.chatEl.lastElementChild !== this._scrollAnchor) this.chatEl.appendChild(this._scrollAnchor);
+      return;
+    }
+    this.ensureScrollFollowObserver();
+  }
 
   // ---------- sending ----------
   async send() {
@@ -594,18 +815,18 @@ class Pane {
     try {
       const behavior = this.isStreaming ? 'steer' : 'prompt';
       const response = await prime.sendChat(sendBinding.key, sendBinding.paneId, sendBinding.bindingEpoch, receipt.draftId, text, behavior).catch(() => ({ ...sendBinding, ok: false, error: 'The message could not be sent' }));
-      const currentBinding = PrimeDraftState.sameBinding(sendBinding, { key: this.key, paneId: this.paneId, bindingEpoch: this.bindingEpoch })
-        && PrimeDraftState.sameBinding(sendBinding, response);
-      if (!currentBinding) return;
-      if (!response.ok || !response.accepted) {
-        if (this.draftState.rejected(receipt, response.error || 'Prompt rejected')) {
+      const stillThisPane = PrimeDraftState.sameBinding(sendBinding, { key: this.key, paneId: this.paneId, bindingEpoch: this.bindingEpoch });
+      if (!stillThisPane) return;
+      if (!response.ok || !response.accepted || !PrimeDraftState.sameBinding(sendBinding, response)) {
+        if (!this.draftState.rejected(receipt, response.error || 'Prompt rejected')) this.draftState.clearSending();
+        else {
           this.setBanner('Prompt rejected: ' + (response.error || 'unknown'), true);
           this.renderAttachments();
         }
         return;
       }
       const rendered = response.rendered || { text, attachments: fallbackAttachments };
-      if (!this.draftState.accepted(receipt, response.draft)) return;
+      if (!this.draftState.accepted(receipt, response.draft)) this.draftState.clearSending();
       this.addUserBubble(rendered.text, rendered.attachments || []);
       if (this.composerRevision === inputRevisionAtSend && this.inputEl.value === inputAtSend) {
         this.inputEl.value = '';
@@ -614,8 +835,15 @@ class Pane {
       }
       this.renderAttachments();
       this.setBanner(null);
+      // Sent text should not come back when revisiting the session.
+      this.clearComposerDraft(sendBinding.key);
+      this.clearComposerDraft(this.sessionFile);
     } finally {
       this.sending = false;
+      // Never leave the composer permanently sealed after a send attempt.
+      if (this.draftState.sending) this.draftState.clearSending();
+      // Keep any typed-but-not-yet-cleared residual out of the map if empty.
+      if (this.inputEl && !this.inputEl.value) this.clearComposerDraft(this.sessionFile);
       this.updateComposer();
     }
   }
@@ -648,7 +876,8 @@ class Pane {
     const tray = attachments.length ? `<div class="message-attachment-list">${attachments.map((item) => this.attachmentMarkup(item)).join('')}</div>` : '';
     div.innerHTML = `<div class="msg-role">You</div>${body}${tray}`;
     this.chatEl.appendChild(div);
-    this.scrollBottom(true);
+    this._keepScrollAnchorLast();
+    this.scrollBottom(true, true);
   }
 
   addNotice(text) {
@@ -656,7 +885,8 @@ class Pane {
     div.className = 'notice';
     div.textContent = text;
     this.chatEl.appendChild(div);
-    this.scrollBottom();
+    this._keepScrollAnchorLast();
+    this.scrollBottom(true, false);
   }
 
   beginStream() {
@@ -665,8 +895,10 @@ class Pane {
     msg.className = 'msg assistant';
     msg.innerHTML = `<div class="msg-role">Prime Agent</div><div class="msg-body"></div>`;
     this.chatEl.appendChild(msg);
+    this._keepScrollAnchorLast();
     this.stream = { root: msg.querySelector('.msg-body'), blocks: new Map(), rafPending: false };
-    this.scrollBottom();
+    // New assistant turn re-engages follow (user just sent / new reply started).
+    this.scrollBottom(true, true);
   }
   streamBlock(idx, kind) {
     const st = this.stream;
@@ -706,15 +938,20 @@ class Pane {
     st.rafPending = true;
     requestAnimationFrame(() => {
       st.rafPending = false;
-      for (const b of st.blocks.values()) this.renderStreamBlock(b);
-      this.scrollBottom();
+      if (!this.stream) return;
+      for (const b of this.stream.blocks.values()) this.renderStreamBlock(b);
+      this._keepScrollAnchorLast();
+      // Pin only if user is following — never re-arm stick mid-stream.
+      this.scrollBottom(true, false);
     });
   }
   endStream() {
     if (!this.stream) return;
     for (const b of this.stream.blocks.values()) this.renderStreamBlock(b);
     this.stream = null;
-    this.scrollBottom();
+    this._keepScrollAnchorLast();
+    this.scrollBottom(true, false);
+    this._stopFollowLoop();
   }
 
   ensureToolCard(toolCallId, toolName, args) {
@@ -738,9 +975,10 @@ class Pane {
     el.querySelector('.tool-head').onclick = () => el.classList.toggle('open');
     el.querySelector('.t-args pre').textContent = args ? JSON.stringify(args, null, 2) : '';
     host.appendChild(el);
+    this._keepScrollAnchorLast();
     card = { el, dot: el.querySelector('.tool-dot'), out: el.querySelector('.t-out'), outPre: el.querySelector('.t-out pre') };
     this.toolCards.set(toolCallId, card);
-    this.scrollBottom();
+    this.scrollBottom(true, false);
     return card;
   }
   toolResult(card, result, isError) {
@@ -750,13 +988,16 @@ class Pane {
       card.out.classList.remove('hidden');
       card.outPre.textContent = text.length > 20000 ? text.slice(0, 20000) + '\n… [truncated]' : text;
     }
-    this.scrollBottom();
+    this._keepScrollAnchorLast();
+    this.scrollBottom(true, false);
   }
 
   renderHistory(messages, opts) {
     this.chatEl.innerHTML = '';
+    this._scrollAnchor = null;
     this.toolCards.clear();
     this.endStream();
+    this.ensureScrollFollowObserver();
     let list = messages || [];
     if (opts && opts.dropInFlight) {
       const copy = [...list];
@@ -813,7 +1054,8 @@ class Pane {
       }
     }
     this.showEmptyIfEmpty();
-    this.scrollBottom(true);
+    this._keepScrollAnchorLast();
+    this.scrollBottom(true, true);
   }
 
   // ---------- pickers ----------
@@ -884,9 +1126,13 @@ class Pane {
           this.beginStream();
           this.syncStreamFromMessage(ev.streamingMessage);
           this.scheduleStreamRender();
+        } else if (this.isStreaming) {
+          this.setAgentState('working…');
         }
         this.updateTopbar();
         this.updateComposer();
+        renderSidebar();
+        if (G.focused === this) void refreshLiveAgents(this);
         break;
       }
       case 'agent_start':
@@ -894,6 +1140,7 @@ class Pane {
         this.setAgentState('working…');
         this.updateComposer();
         renderSidebar();
+        if (G.focused === this) void refreshLiveAgents(this);
         break;
       case 'message_start':
         if (ev.message && ev.message.role === 'assistant' && !this.stream) this.beginStream();
@@ -922,7 +1169,7 @@ class Pane {
           if (text) {
             card.out.classList.remove('hidden');
             card.outPre.textContent = text.length > 20000 ? text.slice(0, 20000) + '\n… [truncated]' : text;
-            this.scrollBottom();
+            this.scrollBottom(true, false);
           }
         }
         break;
@@ -936,9 +1183,11 @@ class Pane {
         this.isStreaming = false;
         this.setAgentState('');
         this.endStream();
+        this._stopFollowLoop();
         this.updateComposer();
         this.syncState();
         refreshSessions();
+        if (G.focused === this) void refreshLiveAgents(this);
         break;
       case 'compaction_start': this.setAgentState('compacting context…'); break;
       case 'compaction_end':
@@ -979,6 +1228,7 @@ function setFocusedPane(pane) {
   if (pane) pane.updateTopbar();
   updateSplitControls();
   if (treeVisible) void renderTreeRoot();
+  void refreshLiveAgents(pane);
 }
 
 function updateSplitControls() {
@@ -1017,11 +1267,23 @@ async function createPane(index, sessionPath, sourcePane = null) {
 }
 
 async function closePane(pane) {
-  if (G.panes.length <= 1 || !pane.canChangeBinding('closing this pane')) return;
+  // Closing a split pane is navigation, not stop. Live work continues in the
+  // background (Hermes model). Only local draft/send locks block close.
+  if (G.panes.length <= 1) return;
+  if (!pane.canChangeBinding('closing this pane', { allowStreaming: true })) return;
   if (pane.key && pane.paneId) {
-    const released = await prime.releasePane(pane.key, pane.paneId, pane.bindingEpoch);
+    const released = await prime.releasePane(pane.key, pane.paneId, pane.bindingEpoch, { allowStreaming: true });
     if (!released.ok) { pane.setBanner(released.error || 'This pane could not be closed', true); return; }
   }
+  if (pane._chatResizeObserver) {
+    try { pane._chatResizeObserver.disconnect(); } catch {}
+    pane._chatResizeObserver = null;
+  }
+  if (pane._chatMutationObserver) {
+    try { pane._chatMutationObserver.disconnect(); } catch {}
+    pane._chatMutationObserver = null;
+  }
+  if (pane._stopFollowLoop) pane._stopFollowLoop();
   G.panes = G.panes.filter((p) => p !== pane);
   pane.activationRequest += 1;
   pane.el.remove();
@@ -1032,47 +1294,86 @@ async function closePane(pane) {
   // after their final Desktop pane/HUD consumer releases them.
 }
 
-async function splitPane(sessionPath = null) {
+async function splitPane(sessionPath = null, sourcePane = null) {
   if (G.panes.length >= 2) {
     (G.focused || G.panes[0]).setBanner('Two panes maximum. Close a pane before opening another.', true);
     updateSplitControls();
     return false;
   }
-  const sourcePane = G.focused;
-  const pane = await createPane(1, sessionPath, sessionPath ? null : sourcePane);
+  const source = sourcePane || G.focused;
+  // Blank chats inherit project/cwd from source; named sessions activate by path alone.
+  const pane = await createPane(1, sessionPath, sessionPath ? null : source);
   return !!(pane && pane.ready);
 }
 
 // Compatibility name retained for saved-session drag/drop call sites.
 const splitWithSession = splitPane;
 
-function paneAvailableForSessionSwitch(pane) {
-  return !!(pane && !pane.bindingChangePending && !pane.isStreaming && !pane.sending && !pane.draftState.sending && pane.draftState.pending.size === 0);
+/**
+ * Hermes-style navigation:
+ * - Sidebar session click always opens that session in the SINGLE center pane.
+ * - Never auto-splits. If a split is open, collapse it first, then show the session.
+ * - New Chat replaces the focused/center pane in place (also collapses split so
+ *   center is unambiguous).
+ * - Split View is explicit only: pane Split button, sidebar "▥ Split", or
+ *   drag-drop a session onto the chat surface.
+ */
+async function collapseToPrimaryPane() {
+  // Close secondary panes until only the primary center pane remains.
+  while (G.panes.length > 1) {
+    const extra = G.panes[G.panes.length - 1];
+    const before = G.panes.length;
+    await closePane(extra);
+    if (G.panes.length >= before) {
+      // closePane refused (local lock); force-remove UI so navigation is never stuck.
+      if (extra.key && extra.paneId) {
+        try { await prime.releasePane(extra.key, extra.paneId, extra.bindingEpoch); } catch {}
+      }
+      G.panes = G.panes.filter((p) => p !== extra);
+      if (extra._chatResizeObserver) {
+        try { extra._chatResizeObserver.disconnect(); } catch {}
+        extra._chatResizeObserver = null;
+      }
+      extra.activationRequest += 1;
+      extra.el.remove();
+      if (!G.panes.some((p) => p.index > 0)) document.body.classList.remove('split');
+      setFocusedPane(G.panes[0] || null);
+      updateSplitControls();
+    }
+  }
+  if (G.panes[0]) setFocusedPane(G.panes[0]);
+  return G.panes[0] || null;
+}
+
+async function startNewChat() {
+  const pane = await collapseToPrimaryPane();
+  if (!pane) return false;
+  if (!pane.workspace.selected) {
+    await openProjectSurface(pane);
+    return false;
+  }
+  return pane.activate(null, null, { allowStreaming: true });
 }
 
 async function openSessionFromSidebar(sessionPath) {
-  const existing = G.panes.find((pane) => pane.sessionFile === sessionPath);
-  if (existing) { setFocusedPane(existing); return true; }
-
-  if (paneAvailableForSessionSwitch(G.focused)) return G.focused.activate(sessionPath);
-  if (G.panes.length < 2) {
-    if (G.focused && G.focused.isStreaming) return splitWithSession(sessionPath);
-    if (G.focused) G.focused.canChangeBinding('opening another session');
-    return false;
+  if (!sessionPath) return false;
+  // HARD RULE: sidebar session click NEVER opens split view. Ever.
+  // Collapse any existing split, then replace the single center pane in place.
+  if (G.panes.length > 1 || document.body.classList.contains('split')) {
+    await collapseToPrimaryPane();
   }
-
-  const available = G.panes.find((pane) => pane !== G.focused && paneAvailableForSessionSwitch(pane));
-  if (available) {
-    setFocusedPane(available);
-    return available.activate(sessionPath);
+  let pane = G.panes[0] || G.focused;
+  if (!pane) pane = await collapseToPrimaryPane();
+  if (!pane) return false;
+  setFocusedPane(pane);
+  if (pane.sessionFile === sessionPath && pane.ready) {
+    // Re-activate live sessions so daemon/stream hydration runs again after reopen.
+    if (pane.isStreaming) return true;
+    // Still re-bind when the session is marked live in the sidebar but this pane is quiet.
+    const meta = G.sessions.find((s) => s.path === sessionPath);
+    if (!(meta && (meta.daemonStreaming || meta.daemonResident))) return true;
   }
-
-  const allStreaming = G.panes.every((pane) => pane.isStreaming);
-  const message = allStreaming
-    ? 'Both panes are streaming. Stop one response before opening another session.'
-    : 'Both panes are busy. Wait for a pane action or stop one response before opening another session.';
-  (G.focused || G.panes[0]).setBanner(message, true);
-  return false;
+  return pane.activate(sessionPath, null, { allowStreaming: true });
 }
 
 // ---------------- extension UI dialogs ----------------
@@ -1141,19 +1442,21 @@ function renderSidebar() {
   const filter = $('#session-filter').value.trim().toLowerCase();
   const host = $('#session-list');
   host.innerHTML = '';
-  const activeFiles = new Set(G.panes.map((p) => p.sessionFile).filter(Boolean));
   const matches = (s) => {
     const label = s.name || s.preview || 'Untitled session';
     return !filter || label.toLowerCase().includes(filter) || (s.cwd || '').toLowerCase().includes(filter);
   };
   const pinned = G.sessions.filter((s) => G.pinnedPaths.has(s.path) && matches(s));
   const rest = G.sessions.filter((s) => !G.pinnedPaths.has(s.path) && matches(s));
+  // Active = the center/focused session only (not "any pane in a split").
+  const activeSessionPath = (G.focused && G.focused.sessionFile) || (G.panes[0] && G.panes[0].sessionFile) || null;
 
   const makeItem = (s) => {
     const label = s.name || s.preview || 'Untitled session';
     const paneHere = G.panes.find((p) => p.sessionFile === s.path);
+    const isActive = !!(activeSessionPath && s.path === activeSessionPath);
     const item = document.createElement('div');
-    item.className = 'session-item' + (paneHere ? ' active' : '');
+    item.className = 'session-item' + (isActive ? ' active' : '');
     item.tabIndex = 0;
     item.draggable = true;
     item.addEventListener('dragstart', (e) => {
@@ -1161,14 +1464,16 @@ function renderSidebar() {
       e.dataTransfer.setData('application/x-prime-session', s.path);
       e.dataTransfer.setData('text/plain', s.path);
     });
-    const liveMarker = (paneHere && paneHere.isStreaming)
+    const liveStreaming = !!(paneHere && paneHere.isStreaming) || !!s.daemonStreaming;
+    const liveMarker = liveStreaming
       ? '<span class="live-dot" title="Streaming now"></span>'
       : s.daemonResident
         ? '<span class="live-dot resident" title="Running in Prime Agent terminal"></span>'
         : '';
+    const liveMeta = liveStreaming ? ' · live' : (s.daemonResident ? ' · terminal live' : '');
     item.innerHTML = `
       <div class="s-name">${liveMarker}${esc(label)}</div>
-      <div class="s-meta">${esc(baseName(s.cwd))} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs${s.daemonResident ? ' · terminal live' : ''}</div>
+      <div class="s-meta">${esc(baseName(s.cwd))} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs${liveMeta}</div>
       <div class="s-actions">
         <button class="s-act s-split" title="Open in Split View" aria-label="Open in Split View">▥ Split</button>
         <button class="s-act s-pin ${G.pinnedPaths.has(s.path) ? 'pinned' : ''}" title="${G.pinnedPaths.has(s.path) ? 'Unpin' : 'Pin'} session">⌃</button>
@@ -1176,15 +1481,16 @@ function renderSidebar() {
         <button class="s-act s-delete" title="Delete session">✕</button>
       </div>`;
     item.onclick = (e) => {
+      // Never treat session row clicks as "focus the other split pane".
+      // Split is explicit via the row's Split button only.
       if (e.shiftKey) { togglePin(s.path); return; }
-      if (paneHere) { setFocusedPane(paneHere); return; }
+      if (e.target.closest('.s-actions')) return;
       void openSessionFromSidebar(s.path);
     };
     item.onkeydown = (e) => {
       if (e.target !== item || (e.key !== 'Enter' && e.key !== ' ')) return;
       e.preventDefault();
-      if (paneHere) setFocusedPane(paneHere);
-      else void openSessionFromSidebar(s.path);
+      void openSessionFromSidebar(s.path);
     };
     item.querySelector('.s-name').ondblclick = (e) => { e.stopPropagation(); startRename(item, s); };
     item.querySelector('.s-split').onclick = (e) => { e.stopPropagation(); splitWithSession(s.path); };
@@ -1259,40 +1565,145 @@ async function startRename(item, session) {
   inp.onclick = (e) => e.stopPropagation();
 }
 
-// ---------------- subagents (near-live) ----------------
+// ---------------- subagents / child agents (near-live) ----------------
+G.liveAgents = [];
+let liveAgentPoll = null;
+
 function renderSubagents() {
-  const activeFiles = new Set(G.panes.map((p) => p.sessionFile).filter(Boolean));
-  const subs = G.sessions.filter((s) => s.parentSession && activeFiles.has(s.parentSession)).slice(0, 20);
+  const focusedPath = (G.focused && G.focused.sessionFile) || null;
+  // 1) Child sessions linked by parentSession to the focused center session
+  const childSessions = focusedPath
+    ? G.sessions.filter((s) => s.parentSession === focusedPath).slice(0, 30)
+    : [];
+  // 2) Live nested workers from RPC list_agents / get_active_subagents
+  const live = Array.isArray(G.liveAgents) ? G.liveAgents.slice(0, 30) : [];
   const sec = $('#subagent-section');
-  if (!subs.length) { sec.classList.add('hidden'); return; }
+  if (!childSessions.length && !live.length) { sec.classList.add('hidden'); return; }
   sec.classList.remove('hidden');
   const host = $('#subagent-list');
   host.innerHTML = '';
-  for (const s of subs) {
-    const item = document.createElement('div');
-    item.className = 'session-item subagent-item';
-    const label = s.name || s.preview || ('subagent depth ' + s.rlmDepth);
-    item.innerHTML = `
-      <div class="s-name"><span class="sub-dot"></span>${esc(label)}</div>
-      <div class="s-meta">depth ${s.rlmDepth} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs</div>`;
-    item.onclick = () => openSubagentViewer(s);
-    host.appendChild(item);
+
+  if (live.length) {
+    const liveLabel = document.createElement('div');
+    liveLabel.className = 'section-label';
+    liveLabel.textContent = 'LIVE WORKERS';
+    host.appendChild(liveLabel);
+    for (const agent of live) {
+      const item = document.createElement('div');
+      item.className = 'session-item subagent-item';
+      const name = agent.name || agent.id || agent.role || 'worker';
+      const status = agent.status || agent.state || (agent.isStreaming || agent.busy ? 'running' : 'idle');
+      const detail = agent.model || agent.detail || agent.sessionFile || '';
+      item.innerHTML = `
+        <div class="s-name"><span class="sub-dot ${status === 'running' || status === 'streaming' ? 'live' : ''}"></span>${esc(name)}</div>
+        <div class="s-meta">${esc(status)}${detail ? ' · ' + esc(String(detail).slice(0, 80)) : ''}</div>`;
+      if (agent.sessionFile || agent.path) {
+        const path = agent.sessionFile || agent.path;
+        item.onclick = () => void openSessionFromSidebar(path);
+        item.title = 'Open worker session';
+      }
+      host.appendChild(item);
+    }
   }
+
+  if (childSessions.length) {
+    const childLabel = document.createElement('div');
+    childLabel.className = 'section-label';
+    childLabel.textContent = 'CHILD SESSIONS';
+    host.appendChild(childLabel);
+    for (const s of childSessions) {
+      const item = document.createElement('div');
+      item.className = 'session-item subagent-item';
+      const label = s.name || s.preview || ('subagent depth ' + s.rlmDepth);
+      const live = s.daemonStreaming || s.daemonResident;
+      item.innerHTML = `
+        <div class="s-name"><span class="sub-dot ${live ? 'live' : ''}"></span>${esc(label)}</div>
+        <div class="s-meta">depth ${s.rlmDepth || 0} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs${live ? ' · live' : ''}</div>`;
+      item.onclick = () => openSubagentViewer(s);
+      host.appendChild(item);
+    }
+  }
+}
+
+async function refreshLiveAgents(pane = G.focused) {
+  if (!pane || !pane.key || !pane.ready) {
+    G.liveAgents = [];
+    renderSubagents();
+    return;
+  }
+  try {
+    const [agents, active] = await Promise.all([
+      prime.command(pane.key, { type: 'list_agents' }).catch(() => ({ success: false })),
+      prime.command(pane.key, { type: 'get_active_subagents' }).catch(() => ({ success: false })),
+    ]);
+    const list = [];
+    const pushAll = (value) => {
+      if (!value) return;
+      if (Array.isArray(value)) list.push(...value);
+      else if (Array.isArray(value.agents)) list.push(...value.agents);
+      else if (Array.isArray(value.subagents)) list.push(...value.subagents);
+      else if (Array.isArray(value.children)) list.push(...value.children);
+    };
+    if (agents && agents.success) pushAll(agents.data);
+    if (active && active.success) pushAll(active.data);
+    // Dedupe by id/name/sessionFile
+    const seen = new Set();
+    G.liveAgents = list.filter((agent) => {
+      if (!agent || typeof agent !== 'object') return false;
+      const key = String(agent.id || agent.sessionFile || agent.path || agent.name || JSON.stringify(agent)).slice(0, 300);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  } catch {
+    G.liveAgents = [];
+  }
+  renderSubagents();
+  renderAgentsDashboard();
+}
+
+function ensureLiveAgentPolling() {
+  if (liveAgentPoll) return;
+  liveAgentPoll = setInterval(() => {
+    if (G.focused && G.focused.ready) void refreshLiveAgents(G.focused);
+  }, 2500);
 }
 
 let subagentPoll = null;
 let currentViewerFile = null;
-async function openSubagentViewer(session) {
+function agentSessionPath(agentOrSession) {
+  if (!agentOrSession) return null;
+  if (typeof agentOrSession === 'string') return agentOrSession;
+  return agentOrSession.path || agentOrSession.sessionFile || agentOrSession.session_path || null;
+}
+
+async function openSubagentViewer(sessionOrAgent) {
   currentViewerFile = null;
+  const path = agentSessionPath(sessionOrAgent);
+  const label = (sessionOrAgent && (sessionOrAgent.name || sessionOrAgent.id || sessionOrAgent.role)) || (path ? path.split('/').pop() : 'worker');
   $('#viewer-add-chat').classList.add('hidden');
-  $('#viewer-title').textContent = 'Subagent — ' + (session.name || session.id.slice(0, 8)) + ' (live)';
+  $('#viewer-title').textContent = (path ? 'Agent — ' : 'Worker — ') + label + ' (live)';
   $('#viewer-backdrop').classList.remove('hidden');
   const body = $('#viewer-body');
   const render = async () => {
-    const r = await prime.sessionTail(session.path, 60);
-    if (!r.ok) return;
     body.innerHTML = '';
-    if (!r.messages.length) body.innerHTML = '<p class="s-help">No messages yet.</p>';
+    if (!path) {
+      // No session file — show structured snapshot of the worker descriptor.
+      const pre = document.createElement('pre');
+      pre.className = 'viewer-pre';
+      pre.textContent = JSON.stringify(sessionOrAgent, null, 2);
+      body.appendChild(pre);
+      return;
+    }
+    const r = await prime.sessionTail(path, 80);
+    if (!r.ok) {
+      body.innerHTML = `<p class="s-help">${esc(r.error || 'Could not load agent transcript')}</p>`;
+      return;
+    }
+    if (!r.messages || !r.messages.length) {
+      body.innerHTML = '<p class="s-help">No messages yet — worker may still be starting.</p>';
+      return;
+    }
     for (const msg of r.messages) {
       const div = document.createElement('div');
       div.className = 'viewer-msg';
@@ -1306,7 +1717,96 @@ async function openSubagentViewer(session) {
   subagentPoll = setInterval(() => {
     if ($('#viewer-backdrop').classList.contains('hidden')) { clearInterval(subagentPoll); return; }
     render();
-  }, 2000);
+  }, 1500);
+}
+
+function collectChildSessions(parentPath) {
+  if (!parentPath) return [];
+  return G.sessions.filter((s) => s.parentSession === parentPath).slice(0, 50);
+}
+
+function collectRelatedSessions(parentPath) {
+  // Children + any daemon-resident sessions under same cwd as focused, for dashboard breadth.
+  const focused = G.focused;
+  const cwd = focused && focused.cwd;
+  const kids = new Set(collectChildSessions(parentPath).map((s) => s.path));
+  const related = [];
+  for (const s of G.sessions) {
+    if (kids.has(s.path) || s.path === parentPath) continue;
+    if (s.daemonResident || s.daemonStreaming || (cwd && s.cwd === cwd && s.rlmDepth > 0)) related.push(s);
+  }
+  return related.slice(0, 40);
+}
+
+function renderAgentRows(host, rows, emptyText) {
+  host.innerHTML = '';
+  if (!rows.length) {
+    host.innerHTML = `<div class="agent-empty">${esc(emptyText)}</div>`;
+    return;
+  }
+  for (const row of rows) {
+    const el = document.createElement('div');
+    el.className = 'agent-row';
+    const running = !!(row.running || row.daemonStreaming || row.isStreaming || row.busy || row.status === 'running' || row.status === 'streaming');
+    const status = running ? 'running' : (row.status || row.state || (row.daemonResident ? 'resident' : 'idle'));
+    el.innerHTML = `
+      <span class="sub-dot ${running ? 'live' : ''}"></span>
+      <span class="ar-main">
+        <div class="ar-name">${esc(row.name)}</div>
+        <div class="ar-meta">${esc(row.meta || '')}</div>
+      </span>
+      <span class="ar-status ${running ? 'running' : 'idle'}">${esc(status)}</span>`;
+    el.onclick = () => {
+      if (row.open === 'session' && row.path) void openSessionFromSidebar(row.path);
+      else void openSubagentViewer(row.source || row);
+    };
+    host.appendChild(el);
+  }
+}
+
+async function openAgentsDashboard() {
+  $('#agents-backdrop').classList.remove('hidden');
+  await refreshLiveAgents(G.focused);
+  renderAgentsDashboard();
+}
+
+function closeAgentsDashboard() {
+  $('#agents-backdrop').classList.add('hidden');
+}
+
+function renderAgentsDashboard() {
+  if ($('#agents-backdrop').classList.contains('hidden')) return;
+  const focusedPath = (G.focused && G.focused.sessionFile) || null;
+  const live = (G.liveAgents || []).map((agent) => ({
+    name: agent.name || agent.id || agent.role || 'worker',
+    meta: [agent.model, agent.detail, agent.sessionFile || agent.path].filter(Boolean).map(String).join(' · ').slice(0, 120),
+    status: agent.status || agent.state || (agent.isStreaming || agent.busy ? 'running' : 'idle'),
+    running: !!(agent.isStreaming || agent.busy || agent.status === 'running'),
+    path: agent.sessionFile || agent.path || null,
+    source: agent,
+    open: (agent.sessionFile || agent.path) ? 'viewer' : 'viewer',
+  }));
+  const children = collectChildSessions(focusedPath).map((s) => ({
+    name: s.name || s.preview || s.id || 'child session',
+    meta: `${baseName(s.cwd)} · depth ${s.rlmDepth || 0} · ${s.messageCount} msgs`,
+    status: s.daemonStreaming ? 'running' : (s.daemonResident ? 'resident' : 'idle'),
+    running: !!s.daemonStreaming,
+    path: s.path,
+    source: s,
+    open: 'viewer',
+  }));
+  const related = collectRelatedSessions(focusedPath).map((s) => ({
+    name: s.name || s.preview || s.id || 'session',
+    meta: `${baseName(s.cwd)} · ${s.messageCount} msgs${s.daemonResident ? ' · terminal' : ''}`,
+    status: s.daemonStreaming ? 'running' : (s.daemonResident ? 'resident' : 'idle'),
+    running: !!s.daemonStreaming,
+    path: s.path,
+    source: s,
+    open: 'session',
+  }));
+  renderAgentRows($('#agents-live-list'), live, 'No live nested workers on the focused session.');
+  renderAgentRows($('#agents-child-list'), children, 'No child sessions linked to this chat yet.');
+  renderAgentRows($('#agents-related-list'), related, 'No other resident/related agent sessions.');
 }
 
 // ---------------- projects / worktrees ----------------
@@ -1512,7 +2012,17 @@ async function openWorkspaceFileViewer(pane, nodeId, name) {
 
 // ---------------- restart helpers ----------------
 async function restartAllAgents() {
-  for (const pane of G.panes) if (!pane.canChangeBinding('restarting agents')) return false;
+  // Restart is a deliberate lifecycle action: clear local stream/send locks first.
+  for (const pane of G.panes) {
+    pane.sending = false;
+    if (pane.draftState && pane.draftState.sending) pane.draftState.clearSending();
+    if (pane.isStreaming) {
+      try { await pane.stop(); } catch {}
+      pane.isStreaming = false;
+      pane.endStream();
+    }
+  }
+  for (const pane of G.panes) if (!pane.canChangeBinding('restarting agents', { allowStreaming: true })) return false;
   const snapshot = G.panes.map((pane) => ({ pane, sessionFile: pane.sessionFile }));
   for (const { pane } of snapshot) { pane.bindingChangePending = true; pane.updateComposer(); }
   try {
@@ -1525,7 +2035,7 @@ async function restartAllAgents() {
     for (const { pane, sessionFile } of snapshot) {
       pane.bindingChangePending = false;
       pane.ready = false; pane.isStreaming = false;
-      try { if (!await pane.activate(sessionFile || null)) restored = false; }
+      try { if (!await pane.activate(sessionFile || null, null, { allowStreaming: true })) restored = false; }
       catch { restored = false; }
     }
     renderSidebar();
@@ -1974,7 +2484,7 @@ async function renderHeartbeatsList() {
 }
 
 // ---------------- menu actions / wiring ----------------
-$('#new-chat-btn').onclick = () => G.focused && G.focused.newChat();
+$('#new-chat-btn').onclick = () => { void startNewChat(); };
 $('#new-folder-chat-btn').onclick = () => openProjectSurface(G.focused);
 $('#session-filter').addEventListener('input', renderSidebar);
 $('#hud-btn').onclick = () => prime.toggleHud();
@@ -2007,6 +2517,12 @@ $('#save-defaults-btn').onclick = async () => {
   alert(r.ok ? 'Defaults saved.' : 'Save failed: ' + r.error);
 };
 
+if ($('#agents-btn')) {
+  $('#agents-btn').onclick = () => void openAgentsDashboard();
+  $('#agents-close').onclick = closeAgentsDashboard;
+  $('#agents-refresh').onclick = async () => { await refreshLiveAgents(G.focused); renderAgentsDashboard(); };
+  $('#agents-backdrop').onclick = (e) => { if (e.target === $('#agents-backdrop')) closeAgentsDashboard(); };
+}
 $('#capabilities-btn').onclick = openCapabilities;
 $('#capabilities-close').onclick = () => $('#capabilities-backdrop').classList.add('hidden');
 $('#capabilities-backdrop').onclick = (e) => { if (e.target === $('#capabilities-backdrop')) $('#capabilities-backdrop').classList.add('hidden'); };
@@ -2061,6 +2577,7 @@ $('#viewer-close').onclick = () => { clearInterval(subagentPoll); $('#viewer-bac
 $('#viewer-backdrop').onclick = (e) => { if (e.target === $('#viewer-backdrop')) { clearInterval(subagentPoll); $('#viewer-backdrop').classList.add('hidden'); } };
 
 function closeTopSurface() {
+  if ($('#agents-backdrop') && !$('#agents-backdrop').classList.contains('hidden')) { closeAgentsDashboard(); return true; }
   const surfaces = [
     ['#modal-backdrop', () => $('#modal-backdrop').classList.add('hidden')],
     ['#viewer-backdrop', () => { clearInterval(subagentPoll); $('#viewer-backdrop').classList.add('hidden'); }],
@@ -2090,7 +2607,7 @@ document.addEventListener('keydown', (event) => {
   }
   if (command && !event.shiftKey && event.key.toLowerCase() === 'n') {
     event.preventDefault();
-    if (G.focused) void G.focused.newChat();
+    void startNewChat();
     return;
   }
   if (event.key === 'Escape' && closeTopSurface()) event.preventDefault();
@@ -2170,7 +2687,7 @@ prime.onHudShortcutStatus(({ registered, message }) => {
   showHudShortcutWarning(G.focused);
 });
 prime.onMenuAction(({ id }) => {
-  if (id === 'new-chat') G.focused && G.focused.newChat();
+  if (id === 'new-chat') void startNewChat();
   else if (id === 'split-view') void splitPane(G.focused && G.focused.sessionFile || null);
   else if (id === 'new-chat-split') void splitPane(null);
   else if (id === 'toggle-hud') void prime.toggleHud();
@@ -2204,6 +2721,8 @@ async function runAgentInstall(titleText) {
   const popSession = params.get('session');
   const pane = await createPane(0, popSession || null);
   setFocusedPane(pane);
+  ensureLiveAgentPolling();
+  void refreshLiveAgents(pane);
   const input = pane.inputEl;
   input.focus();
 })();

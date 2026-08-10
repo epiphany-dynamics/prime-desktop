@@ -85,9 +85,19 @@
     }
 
     accepted(receipt, replacement) {
-      if (!receipt || receipt.draftId !== this.id || receipt.workspaceGeneration !== this.workspaceGeneration) return false;
-      this.reset(replacement);
+      if (!receipt || receipt.draftId !== this.id || receipt.workspaceGeneration !== this.workspaceGeneration) {
+        // Never leave the composer permanently sealed after a send attempt.
+        this.sending = false;
+        return false;
+      }
+      this.reset(replacement || null);
       return true;
+    }
+
+    /** Clear local send lock without dropping attachments (nav / recovery). */
+    clearSending() {
+      this.sending = false;
+      return this.snapshot();
     }
 
     snapshot() {

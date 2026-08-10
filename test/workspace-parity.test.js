@@ -23,13 +23,15 @@ test('composer exposes pane-scoped attachments and inline slash/@ references', (
   assert.match(preload, /pickAttachments/);
 });
 
-test('workspace supports folder selection and drag-to-split sessions', () => {
+test('workspace supports folder selection and session drag without auto-split', () => {
   assert.match(html, /id="new-folder-chat-btn"/);
   assert.match(html, /class="picker-btn pane-folder"/);
   assert.match(main, /Open Project….*CmdOrCtrl\+O/);
   assert.match(app, /application\/x-prime-session/);
   assert.match(app, /handlePaneDrop/);
-  assert.match(app, /splitWithSession\(sessionPath\)/);
+  // Drop opens in place via sidebar open — never invents a second pane.
+  assert.match(app, /openSessionFromSidebar\(sessionPath\)/);
+  assert.match(app, /Split button is the only/);
 });
 
 test('multi-view session events fan out to every matching pane', () => {
@@ -55,18 +57,55 @@ test('async suggestion invalidation, Electron file paths, and bounded safe searc
   assert.doesNotMatch(workspace, /readdirSync/);
 });
 
-test('normal session selection routes around streaming panes', () => {
-  assert.match(app, /function paneAvailableForSessionSwitch/);
+test('session and new-chat navigation always uses a single center pane', () => {
+  // Hermes model: sidebar click / New Chat never auto-splits and never requires stop.
   assert.match(app, /async function openSessionFromSidebar/);
-  assert.match(app, /G\.focused && G\.focused\.isStreaming\) return splitWithSession\(sessionPath\)/);
-  assert.match(app, /pane !== G\.focused && paneAvailableForSessionSwitch\(pane\)/);
-  assert.match(app, /Both panes are streaming\. Stop one response before opening another session\./);
+  assert.match(app, /HARD RULE: sidebar session click NEVER opens split view/);
+  assert.match(app, /sidebar session click NEVER opens split view/);
+  assert.match(app, /async function startNewChat/);
+  assert.match(app, /async function collapseToPrimaryPane/);
+  assert.match(app, /allowStreaming:\s*true/);
+  assert.match(app, /allowStreamingLeave/);
+  assert.doesNotMatch(app, /routeBindingAroundBusyPanes/);
+  assert.doesNotMatch(app, /Both panes are streaming/);
+  // Sidebar click always goes through openSessionFromSidebar — never setFocusedPane(paneHere).
   assert.match(app, /void openSessionFromSidebar\(s\.path\)/);
+  assert.doesNotMatch(app, /if \(paneHere\) \{ setFocusedPane\(paneHere\)/);
+  assert.match(app, /collapseToPrimaryPane\(\)/);
+  assert.match(app, /id === 'new-chat'\) void startNewChat/);
+  assert.match(app, /\$\('#new-chat-btn'\)\.onclick = \(\) => \{ void startNewChat\(\); \}/);
+  // Split is explicit only.
+  assert.match(app, /splitWithSession\(s\.path\)/);
+  assert.match(app, /handlePaneDrop/);
+  // Close split pane while streaming is allowed.
+  assert.match(app, /closing this pane', \{ allowStreaming: true \}/);
+  assert.match(main, /Closing a split pane is navigation/);
+  assert.match(main, /allowStreamingLeave/);
+});
+
+test('chat stream sticks to latest output with standard release/re-stick', () => {
+  assert.match(app, /this\.stickToBottom = true/);
+  assert.match(app, /syncStickFromUserPosition\(/);
+  assert.match(app, /_programmaticScroll/);
+  assert.match(app, /scrollBottom\(forcePin = false, engageStick = false\)/);
+  assert.match(app, /ensureScrollFollowObserver/);
+  assert.match(app, /_keepScrollAnchorLast/);
+  assert.match(app, /MutationObserver/);
+  // Stream updates pin without re-arming stick (prevents snap-back while reading).
+  assert.match(app, /scrollBottom\(true, false\)/);
+  assert.match(app, /never re-arm stick mid-stream/i);
+  assert.match(app, /scrollEl\.addEventListener\('scroll'/);
+  assert.match(app, /addEventListener\('wheel'/);
+  assert.match(app, /_pinScrollToEnd/);
+  assert.doesNotMatch(app, /scrollIntoView\(/); // no scrollIntoView() calls; comment may mention the name
+  assert.match(read('renderer/styles.css'), /\.chat-scroll \{[\s\S]*min-height: 0/);
+  assert.match(read('renderer/styles.css'), /\.pane \{[\s\S]*min-height: 0/);
+  assert.match(read('renderer/styles.css'), /\.chat-scroll-anchor/);
 });
 
 test('Split View is persistent, keyboard discoverable, blank-capable, and honest at two panes', () => {
   assert.match(html, /class="picker-btn pane-split"[^>]*aria-label="Split View"[^>]*>[^<]*Split View/);
-  assert.match(app, /async function splitPane\(sessionPath = null\)/);
+  assert.match(app, /async function splitPane\(sessionPath = null, sourcePane = null\)/);
   assert.match(app, /sourcePaneId: !this\.paneId && sourcePane/);
   assert.match(main, /sourceContext = paneContextFor/);
   assert.match(app, /id === 'new-chat-split'.*splitPane\(null\)/);

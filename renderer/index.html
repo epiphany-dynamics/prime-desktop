@@ -20,6 +20,7 @@
         </div>
       </div>
       <div class="sidebar-nav">
+        <button id="agents-btn" class="nav-item" title="Live agents, sub-agents and child sessions">◈ Agents</button>
         <button id="capabilities-btn" class="nav-item" title="Skills, commands and capabilities">⚡ Capabilities</button>
         <button id="schedules-btn" class="nav-item" title="Scheduled jobs and heartbeats">⏱ Schedules</button>
       </div>
@@ -212,6 +213,28 @@
         </div>
         <div class="section-label" style="margin-top:16px">HEARTBEATS</div>
         <div id="heartbeats-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Agents dashboard -->
+  <div id="agents-backdrop" class="hidden">
+    <div id="agents-panel">
+      <div class="panel-head">
+        <span>Agents dashboard</span>
+        <span class="panel-head-actions">
+          <button id="agents-refresh" title="Refresh">↻</button>
+          <button id="agents-close" title="Close">✕</button>
+        </span>
+      </div>
+      <div class="panel-body" id="agents-body">
+        <p class="s-help">Live workers and child sessions for the focused chat. Click a row to open a live view.</p>
+        <div class="section-label">LIVE WORKERS</div>
+        <div id="agents-live-list"></div>
+        <div class="section-label" style="margin-top:14px">CHILD SESSIONS</div>
+        <div id="agents-child-list"></div>
+        <div class="section-label" style="margin-top:14px">ALL RESIDENT / RELATED</div>
+        <div id="agents-related-list"></div>
       </div>
     </div>
   </div>
