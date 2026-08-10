@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="Prime Desktop by Epiphany Dynamics">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0f14"/>
+      <stop offset="55%" stop-color="#121a24"/>
+      <stop offset="100%" stop-color="#0d1520"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#5b9dff"/>
+      <stop offset="50%" stop-color="#7c5cff"/>
+      <stop offset="100%" stop-color="#3dd6c6"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="70%" cy="30%" r="50%">
+      <stop offset="0%" stop-color="#7c5cff" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#7c5cff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#glow)"/>
+  <circle cx="980" cy="180" r="180" fill="#5b9dff" opacity="0.06"/>
+  <circle cx="1080" cy="420" r="220" fill="#3dd6c6" opacity="0.05"/>
+  <!-- window chrome -->
+  <rect x="140" y="150" width="1000" height="360" rx="18" fill="#151c27" stroke="#2a3545" stroke-width="2"/>
+  <rect x="140" y="150" width="1000" height="44" rx="18" fill="#1a2330"/>
+  <rect x="140" y="176" width="1000" height="18" fill="#1a2330"/>
+  <circle cx="172" cy="172" r="6" fill="#ff5f57"/>
+  <circle cx="194" cy="172" r="6" fill="#febc2e"/>
+  <circle cx="216" cy="172" r="6" fill="#28c840"/>
+  <!-- sidebar -->
+  <rect x="140" y="194" width="220" height="316" fill="#101722"/>
+  <rect x="160" y="220" width="140" height="12" rx="6" fill="#2a3545"/>
+  <rect x="160" y="250" width="180" height="10" rx="5" fill="#243041"/>
+  <rect x="160" y="274" width="160" height="10" rx="5" fill="#243041"/>
+  <rect x="160" y="298" width="170" height="10" rx="5" fill="#5b9dff" opacity="0.45"/>
+  <rect x="160" y="322" width="150" height="10" rx="5" fill="#243041"/>
+  <!-- chat -->
+  <rect x="400" y="230" width="420" height="56" rx="12" fill="#1c2635"/>
+  <rect x="520" y="310" width="480" height="72" rx="12" fill="#182231" stroke="#2d3b50"/>
+  <rect x="400" y="410" width="360" height="48" rx="12" fill="#1c2635"/>
+  <!-- right rail accent -->
+  <rect x="1040" y="210" width="80" height="280" rx="12" fill="#182231" stroke="#2d3b50"/>
+  <text x="170" y="100" fill="#8b9bb0" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="22" letter-spacing="4">EPIPHANY DYNAMICS</text>
+  <text x="170" y="130" fill="#f4f7fb" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="48" font-weight="700">Prime Desktop</text>
+  <rect x="170" y="545" width="220" height="6" rx="3" fill="url(#accent)"/>
+  <text x="170" y="580" fill="#a8b6c8" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="22">macOS client for Prime Agent · agents keep running when you quit</text>
+</svg>

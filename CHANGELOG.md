@@ -14,6 +14,16 @@
 - Local install helper: `scripts/install-prime-desktop.sh` (build, clean quit, install into Applications, reopen).
 - Open-source pack: MIT license, security notes, contributing guide, package metadata.
 
+
+### Docs & first-run (flagship)
+
+- Full install guide, troubleshooting, roadmap under `docs/`
+- `npm run doctor` environment check
+- Stronger README with hero, stranger install path, demo checklist
+- First-run empty state with setup steps
+- Code of conduct + support docs
+- GitHub secret scanning enabled on the public repo
+
 ### Verification
 
 - `npm test` — pass

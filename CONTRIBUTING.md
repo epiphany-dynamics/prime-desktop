@@ -12,10 +12,14 @@ Built by [Epiphany Dynamics](https://epiphanydynamics.ai).
 
 ## Setup
 
+Stranger install path: [`docs/INSTALL.md`](docs/INSTALL.md).
+
+
 ```bash
 git clone https://github.com/epiphany-dynamics/prime-desktop.git
 cd prime-desktop
 npm install
+npm run doctor
 ```
 
 ## Checks you should run

@@ -9,7 +9,9 @@
     "pack": "electron-builder --dir",
     "dist": "electron-builder --mac",
     "test": "node --test test/*.test.js",
-    "ui-smoke": "node scripts/ui-smoke.js && node scripts/window-smoke.js"
+    "ui-smoke": "node scripts/ui-smoke.js && node scripts/window-smoke.js",
+    "doctor": "node scripts/doctor.js",
+    "postinstall": "node -e \"console.log('\\nPrime Desktop: run npm run doctor   then npm start\\nDocs: docs/INSTALL.md\\n')\""
   },
   "dependencies": {
     "dompurify": "^3.2.4",

@@ -1,89 +1,140 @@
-# Prime Desktop
+<p align="center">
+  <img src="docs/assets/hero-banner.svg" alt="Prime Desktop by Epiphany Dynamics" width="100%">
+</p>
 
-**A native macOS app for [Prime Agent](https://primeintellect.ai).**  
-Multi-pane chats, project folders, file tree, image paste, live daemon attach, and a floating HUD — without taking over the agent process.
+<p align="center">
+  <strong>Native macOS desktop client for <a href="https://primeintellect.ai">Prime Agent</a></strong><br>
+  Multi-pane chats · live daemon attach · projects · locked-down Electron shell<br>
+  Built by <a href="https://epiphanydynamics.ai">Epiphany Dynamics</a>
+</p>
 
-Built by **[Epiphany Dynamics](https://epiphanydynamics.ai)**.
+<p align="center">
+  <a href="https://github.com/epiphany-dynamics/prime-desktop/releases"><img src="https://img.shields.io/github/v/release/epiphany-dynamics/prime-desktop?style=flat-square&color=6e56cf" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow?style=flat-square" alt="MIT"></a>
+  <a href="docs/INSTALL.md"><img src="https://img.shields.io/badge/platform-macOS-lightgrey?style=flat-square" alt="macOS"></a>
+  <a href="https://www.electronjs.org/"><img src="https://img.shields.io/badge/electron-35-blue?style=flat-square" alt="Electron 35"></a>
+  <a href="https://epiphanydynamics.ai"><img src="https://img.shields.io/badge/built%20by-Epiphany%20Dynamics-0b0f14?style=flat-square" alt="Epiphany Dynamics"></a>
+</p>
 
-[![Electron](https://img.shields.io/badge/electron-35-blue)](#run-from-source)
-[![Version](https://img.shields.io/badge/version-v0.6.2-green)](CHANGELOG.md)
-[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)](#run-from-source)
-
-> Closing the app does **not** kill your agents. They keep running. Open Desktop again and reattach.
-
-No voice features. That is on purpose.
-
----
-
-## Why this exists
-
-Prime Agent is strong in the terminal. Prime Desktop gives it a real Mac UI:
-
-- two chats side by side
-- attach to agents that are already running
-- pick a project folder per chat
-- paste images and drop files
-- watch live workers and child sessions
-
-Epiphany Dynamics built this client so teams can run serious agent work from a desktop shell that stays out of the agent’s way.
+<p align="center">
+  <a href="docs/INSTALL.md"><strong>Install guide</strong></a> ·
+  <a href="docs/TROUBLESHOOTING.md"><strong>Troubleshooting</strong></a> ·
+  <a href="CHANGELOG.md"><strong>Changelog</strong></a> ·
+  <a href="PARITY.md"><strong>Feature status</strong></a> ·
+  <a href="https://github.com/epiphany-dynamics/prime-desktop/issues"><strong>Issues</strong></a>
+</p>
 
 ---
 
-## Highlights (v0.6.2)
+## Why Prime Desktop
 
-- **Split View** — one window, two panes. Sidebar clicks stay single-pane; split only when you ask.
-- **Daemon attach** — find a live Prime Agent 0.7 session, join it, watch output, steer it, leave without stopping it.
-- **Workers survive quit** — Desktop detaches on quit. Agents keep going.
-- **Project-aware chats** — Choose Folder, recents, git branch/worktree identity, Cmd+O.
-- **Safe file explorer** — lazy tree, ignores, symlink safety, preview, add-to-chat, reveal in Finder.
-- **Attachments** — image paste/picker/drop (PNG/JPEG plus bounded GIF/WebP), file/folder/session chips.
-- **Agents dashboard** — live workers, child sessions, related resident sessions.
-- **Prime controls** — model and thinking pickers, stop/steer, context and cost, schedules, capabilities, settings, floating HUD.
-- **Hard shell** — sandboxed UI, tight IPC, write-only API keys, blocked sensitive paths.
+Prime Agent is excellent in the terminal. **Prime Desktop** gives it a real Mac UI without taking ownership of the agent process.
 
-Deep status vs Hermes-style desktop goals: [`PARITY.md`](PARITY.md).  
-How daemon attach works: [`DAEMON-ATTACHMENT.md`](DAEMON-ATTACHMENT.md).  
-What changed lately: [`CHANGELOG.md`](CHANGELOG.md).
+| You get | Why it matters |
+|---|---|
+| Two chats side by side | Compare, babysit, or steer two lines of work |
+| Attach to live agents | Join a session already running in the terminal/daemon |
+| **Quit without killing agents** | Close the window; workers keep going; reopen and reattach |
+| Project folders + file tree | Point a chat at a repo; browse and attach files safely |
+| Image paste + file chips | Drop context in without fighting the terminal |
+| Agents dashboard | See live workers and child sessions |
+| Floating HUD | Lightweight always-on-top view |
+
+No voice features. That is a product rule, not a missing checkbox.
 
 ---
 
-## Run from source
+## Install in 2 minutes
+
+### 1. Install Prime Agent (the brain)
+
+```bash
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+prime-agent --version
+```
+
+### 2. Run Prime Desktop (this app)
 
 ```bash
 git clone https://github.com/epiphany-dynamics/prime-desktop.git
 cd prime-desktop
 npm install
-npm test
-npm run smoke
-npm run ui-smoke   # macOS + Electron window checks
+npm run doctor
 npm start
 ```
 
-Build a local `.app` (unsigned):
+### 3. First session
 
-```bash
-npm run pack
-# output: dist/mac-arm64/Prime Agent.app
-```
+1. **Prime → Install or Repair Agent…** if doctor said the agent is missing  
+2. **Cmd+O** → choose a project folder  
+3. Type a message → Enter  
+4. Optional: complete provider login in **Settings** (or run `prime-agent` once and `/login`)
 
-Install that build into Applications (clean quit first; never force-kills agents):
+<details>
+<summary><strong>Put a local .app in Applications</strong> (unsigned early build)</summary>
 
 ```bash
 ./scripts/install-prime-desktop.sh
 ```
 
-The app finds `prime-agent` on common install paths or `PATH`. Finder launches do not need your shell `PATH`.
+macOS may Gatekeeper-block unsigned apps → right-click → **Open**.  
+Full notes: [docs/INSTALL.md](docs/INSTALL.md)
 
-### Requirements
-
-- macOS
-- Node.js 20+
-- Optional for real use: [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) 0.7+
+</details>
 
 ---
 
-## Architecture (short)
+## Demo checklist (stranger-safe)
+
+After `npm start`:
+
+- [ ] Empty state shows three setup steps  
+- [ ] Settings opens; API keys are write-only (never shown back in full)  
+- [ ] Choose Project sets the folder under the composer  
+- [ ] Sending a message streams a reply when the agent + provider are configured  
+- [ ] Sidebar session click stays **one** pane (Split only from the Split control)  
+- [ ] Quit app → `prime-agent agents` still lists live work → reopen Desktop and reattach  
+
+---
+
+## Verify without API keys
+
+```bash
+npm test          # unit tests
+npm run smoke     # protocol + fake agent
+npm run ui-smoke  # real Electron windows (macOS)
+npm run doctor    # environment check
+```
+
+This org does **not** use GitHub Actions on this repo. **Your machine is the CI.** Run the commands above before PRs.
+
+---
+
+## Feature snapshot
+
+See the full matrix in [`PARITY.md`](PARITY.md).
+
+**Solid today**
+
+- Split View (2 panes), pop-outs, shared live sessions  
+- Daemon attach for Prime Agent 0.7 resident workers  
+- Detach-on-quit for process and daemon clients  
+- Projects, git branch/worktree identity, safe file explorer  
+- Attachments (images + local file/folder/session refs)  
+- HUD, schedules/heartbeats entry points, capabilities panel  
+- Agents dashboard (live / children / related)  
+- Sandboxed renderer + tight IPC  
+
+**Not yet / on purpose**
+
+- Apple-signed DMG download  
+- Windows / Linux  
+- Session export, full git mutation UI, in-app editor  
+- Voice (excluded)
+
+---
+
+## Architecture
 
 ```text
 sandboxed UI  --tight IPC-->  Electron main  --attach-->  live daemon worker
@@ -93,55 +144,49 @@ sandboxed UI  --tight IPC-->  Electron main  --attach-->  live daemon worker
 | Path | Role |
 |---|---|
 | `main.js` | Windows, panes, IPC, settings, HUD |
-| `lib/rpc-manager.js` | Process RPC; detach-on-quit; kill only when asked |
-| `lib/daemon-rpc-adapter.js` | Non-owning attach to resident Prime 0.7 sessions |
+| `lib/rpc-manager.js` | Process RPC; detach-on-quit |
+| `lib/daemon-rpc-adapter.js` | Non-owning Prime 0.7 attach |
 | `lib/workspace-service.js` | Projects, tree, search, watch |
 | `lib/attachment-service.js` | Drafts, images, file refs |
 | `preload.js` | Small bridge into the UI |
 | `renderer/` | Multi-pane UI |
-| `scripts/` | Fake agent + offline smoke tests |
+| `scripts/` | Doctor, fake agent, smoke tests |
+| `docs/` | Install, troubleshooting, roadmap |
 
-The UI never gets raw shell or free disk power. File work uses opaque IDs from main.
-
----
-
-## Offline checks
-
-These need **no network and no API keys**:
-
-```bash
-npm test        # unit tests
-npm run smoke   # protocol / fake agent
-npm run ui-smoke
-```
-
-This org does not run GitHub Actions on this repo. Run the checks on your machine before you open a PR.
-
----
-
-## Current limits
-
-- macOS only; build is local and unsigned (Apple signing later)
-- two panes max
-- general files are local refs, not remote uploads
-- one project folder per live agent client
-- no session export, no full git branch manager, no in-app code editor yet
-- voice will not be added
+Contract for daemon attach: [`DAEMON-ATTACHMENT.md`](DAEMON-ATTACHMENT.md).
 
 ---
 
 ## Security
 
-See [`SECURITY.md`](SECURITY.md).  
-To report a security issue, email **security@epiphanydynamics.ai** — do not paste secrets into public issues.
+- No API keys or machine paths are stored in this git repo  
+- GitHub **secret scanning + push protection** are on for this repository  
+- Keys in the app are write-only after save  
+- Sensitive paths cannot be attached as files  
+
+Report issues privately: [`SECURITY.md`](SECURITY.md) · **security@epiphanydynamics.ai**
 
 ---
 
-## Contributing
+## Contributing & support
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- [CONTRIBUTING.md](CONTRIBUTING.md) — setup, rules, PR bar  
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)  
+- [SUPPORT.md](SUPPORT.md)  
+- [docs/ROADMAP.md](docs/ROADMAP.md)  
+- [CHANGELOG.md](CHANGELOG.md)
 
-Small tested changes beat huge untested ones. Update `PARITY.md` when user-visible behavior changes.
+---
+
+## About Epiphany Dynamics
+
+We build production AI systems and sharp open tools.
+
+- Web: [epiphanydynamics.ai](https://epiphanydynamics.ai)  
+- GitHub: [github.com/epiphany-dynamics](https://github.com/epiphany-dynamics)  
+- This repo: [github.com/epiphany-dynamics/prime-desktop](https://github.com/epiphany-dynamics/prime-desktop)
+
+If Prime Desktop helps you, a star helps others find it — and helps Epiphany Dynamics keep shipping.
 
 ---
 
@@ -149,12 +194,4 @@ Small tested changes beat huge untested ones. Update `PARITY.md` when user-visib
 
 [MIT](LICENSE) © [Epiphany Dynamics](https://epiphanydynamics.ai)
 
-Prime Desktop is an independent client. “Prime Agent” / “Prime Intellect” names belong to their owners. See [`NOTICE`](NOTICE).
-
----
-
-## Links
-
-- Epiphany Dynamics: [epiphanydynamics.ai](https://epiphanydynamics.ai)
-- This repo: [github.com/epiphany-dynamics/prime-desktop](https://github.com/epiphany-dynamics/prime-desktop)
-- Prime Agent: [primeintellect.ai](https://primeintellect.ai)
+Prime Desktop is an independent client. “Prime Agent” and “Prime Intellect” names belong to their owners. See [`NOTICE`](NOTICE).

@@ -782,3 +782,23 @@ body.split .pane-split:disabled { max-width: none; }
 .agent-row .ar-status.idle { color: var(--text-faint); }
 .agent-empty { padding: 10px 4px; color: var(--text-faint); font-size: 12.5px; }
 #subagent-section .section-label { margin-top: 4px; }
+
+
+/* First-run empty state */
+.empty-steps {
+  margin: 16px auto 0;
+  padding: 0 0 0 1.15rem;
+  max-width: 340px;
+  text-align: left;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.empty-steps li { margin: 0.35rem 0; }
+.empty-steps strong { color: var(--text); font-weight: 560; }
+.empty-note {
+  margin-top: 14px;
+  font-size: 12px;
+  color: var(--text-faint);
+  opacity: 0.9;
+}
