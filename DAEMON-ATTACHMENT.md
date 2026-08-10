@@ -78,3 +78,19 @@ arbitrary filesystem authority are never exposed through preload.
   final-pane detach returns the fake worker to its terminal-only client count.
 - `scripts/window-smoke.js`: queued HUD startup, shortcut-failure menu fallback,
   distinct always-on-top HUD visibility, and Dock reactivation with a hidden HUD.
+
+## Detached process RPC and app quit
+
+When no resident daemon session matches, Desktop may start `prime-agent --mode rpc`
+as a **detached** child. That child is a worker Desktop can drive over JSONL.
+
+On app quit, last-window close, or leaving the final pane/HUD consumer for that
+client, Desktop **detaches**:
+
+- daemon attachments call `dispose()` with non-owning options (worker keeps running)
+- process RPC clients are unref'd and left alive — Desktop does **not** SIGTERM them on quit
+
+Deliberate **Restart agents** still stops Desktop-managed workers. The local
+installer script also refuses to force-kill the UI so in-flight workers are not
+taken down by a botched update.
+

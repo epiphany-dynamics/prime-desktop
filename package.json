@@ -1,7 +1,7 @@
 {
   "name": "prime-desktop",
-  "version": "0.6.1",
-  "description": "Desktop app for Prime Agent - Electron shell over prime-agent RPC mode",
+  "version": "0.6.2",
+  "description": "Native macOS desktop client for Prime Agent \u2014 multi-pane chats, daemon attach, projects, and a locked-down Electron shell. Built by Epiphany Dynamics.",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -41,5 +41,31 @@
         "dir"
       ]
     }
+  },
+  "license": "MIT",
+  "author": {
+    "name": "Epiphany Dynamics",
+    "email": "hello@epiphanydynamics.ai",
+    "url": "https://epiphanydynamics.ai"
+  },
+  "homepage": "https://github.com/epiphany-dynamics/prime-desktop",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/epiphany-dynamics/prime-desktop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/epiphany-dynamics/prime-desktop/issues"
+  },
+  "keywords": [
+    "prime-agent",
+    "electron",
+    "macos",
+    "desktop",
+    "ai-agent",
+    "epiphany-dynamics",
+    "prime-intellect"
+  ],
+  "engines": {
+    "node": ">=20"
   }
 }
