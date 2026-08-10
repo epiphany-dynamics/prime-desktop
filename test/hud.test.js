@@ -55,3 +55,30 @@ test('RPC events fan out to every window viewing a client', () => {
   assert.match(main, /refreshClientViewers\(client\)/);
   assert.match(main, /viewers\.add\(context\.ownerWin\)/);
 });
+
+test('HUD is discoverable when global shortcut registration fails and waits for renderer readiness', () => {
+  const appHtml = fs.readFileSync(path.join(root, 'renderer/index.html'), 'utf8');
+  const appJs = fs.readFileSync(path.join(root, 'renderer/app.js'), 'utf8');
+  assert.match(appHtml, /id="hud-btn"[^>]*>[^<]*Prime HUD/);
+  assert.match(appJs, /\$\('#hud-btn'\)\.onclick = \(\) => prime\.toggleHud\(\)/);
+  assert.match(main, /id: 'toggle-prime-hud'.*label: 'Show Prime HUD'/s);
+  assert.match(main, /globalShortcut\.register/);
+  assert.match(main, /globalShortcut\.isRegistered/);
+  assert.match(main, /PRIME_HUD_SHORTCUT_UNAVAILABLE/);
+  assert.match(main, /hudOpenPending = true/);
+  const createHud = main.slice(main.indexOf('function createHud()'), main.indexOf('function selectHudClient'));
+  assert.match(createHud, /frame: false/);
+  assert.match(createHud, /alwaysOnTop: true/);
+  assert.match(createHud, /show: false/);
+  assert.match(main, /webContents\.once\('did-finish-load'/);
+  assert.match(main, /candidate\.once\('ready-to-show'/);
+  assert.match(preload, /toggleHud: \(\) => ipcRenderer\.invoke\('hud:toggle'\)/);
+});
+
+test('Dock activation counts main windows instead of the persistent hidden HUD', () => {
+  const activation = main.match(/function activateMainWindow\(\) \{([\s\S]*?)\n\}/);
+  assert.ok(activation);
+  assert.match(activation[1], /\[\.\.\.wins\]/);
+  assert.doesNotMatch(activation[1], /BrowserWindow\.getAllWindows/);
+  assert.match(main, /app\.on\('activate', activateMainWindow\)/);
+});

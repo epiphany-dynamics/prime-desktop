@@ -81,6 +81,9 @@ contextBridge.exposeInMainWorld('prime', {
   hudAbort: () => ipcRenderer.invoke('hud:abort'),
   hudOpenSession: () => ipcRenderer.invoke('hud:open-session'),
   hudHide: () => ipcRenderer.invoke('hud:hide'),
+  toggleHud: () => ipcRenderer.invoke('hud:toggle'),
+  setSplitAvailable: (available) => ipcRenderer.invoke('window:set-split-available', { available: available === true }),
+  testWindowState: () => ipcRenderer.invoke('test:window-state'),
 
   onRpcEvent: (callback) => on('rpc-event', callback),
   onSessionsChanged: (callback) => on('sessions-changed', callback),
@@ -90,6 +93,7 @@ contextBridge.exposeInMainWorld('prime', {
   onInstallProgress: (callback) => on('agent-install-progress', callback),
   onXaiDeviceCode: (callback) => on('xai-device-code', callback),
   onHudOpened: (callback) => on('hud-opened', callback),
+  onHudShortcutStatus: (callback) => on('hud-shortcut-status', callback),
   onHudEvent: (callback) => on('hud-event', callback),
   onWorkspaceInvalidated: (callback) => on('workspace-invalidated', callback),
   onWorkspaceChanged: (callback) => on('workspace-changed', callback),

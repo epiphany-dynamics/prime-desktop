@@ -63,3 +63,18 @@ test('normal session selection routes around streaming panes', () => {
   assert.match(app, /Both panes are streaming\. Stop one response before opening another session\./);
   assert.match(app, /void openSessionFromSidebar\(s\.path\)/);
 });
+
+test('Split View is persistent, keyboard discoverable, blank-capable, and honest at two panes', () => {
+  assert.match(html, /class="picker-btn pane-split"[^>]*aria-label="Split View"[^>]*>[^<]*Split View/);
+  assert.match(app, /async function splitPane\(sessionPath = null\)/);
+  assert.match(app, /sourcePaneId: !this\.paneId && sourcePane/);
+  assert.match(main, /sourceContext = paneContextFor/);
+  assert.match(app, /id === 'new-chat-split'.*splitPane\(null\)/);
+  assert.match(main, /id: 'split-view'.*label: 'Split View'/s);
+  assert.match(main, /id: 'new-chat-split'.*label: 'New Chat in Split'/s);
+  assert.match(app, /Two panes maximum\. Close a pane before opening another\./);
+  assert.match(app, /button\.disabled = atLimit/);
+  assert.match(app, /item\.tabIndex = 0/);
+  assert.match(read('renderer/styles.css'), /session-item:focus-within \.s-actions/);
+  assert.match(read('renderer/styles.css'), /session-item\.active \.s-actions/);
+});

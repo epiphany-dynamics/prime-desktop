@@ -9,7 +9,7 @@
     "pack": "electron-builder --dir",
     "dist": "electron-builder --mac",
     "test": "node --test test/*.test.js",
-    "ui-smoke": "node scripts/ui-smoke.js"
+    "ui-smoke": "node scripts/ui-smoke.js && node scripts/window-smoke.js"
   },
   "dependencies": {
     "dompurify": "^3.2.4",
@@ -28,7 +28,6 @@
     "files": [
       "main.js",
       "daemon-launch.js",
-      "session-handoff.js",
       "lib/**/*",
       "preload.js",
       "renderer/**/*",

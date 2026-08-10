@@ -71,6 +71,25 @@ const evalSource = `(async () => {
   const paneEl = () => G.focused.el;
   const inPane = (selector) => paneEl().querySelector(selector);
 
+  const initialPane = G.focused;
+  results.persistentSplitControl = getComputedStyle(initialPane.splitBtn).display !== 'none' && initialPane.splitBtn.textContent.includes('Split View');
+  const blankSplitOpened = await splitPane(null);
+  await wait(() => G.panes.length === 2 && G.focused.ready, 'blank chat split');
+  const blankPane = G.focused;
+  const paneBounds = G.panes.map((pane) => pane.el.getBoundingClientRect());
+  const initialWindowState = await window.prime.testWindowState();
+  results.blankSplit = blankSplitOpened && blankPane.sessionFile !== initialPane.sessionFile;
+  results.trueSingleWindowSplit = initialWindowState.mainWindowCount === 1 && initialWindowState.visibleMainWindowCount === 1 && paneBounds[0].width > 100 && paneBounds[1].width > 100 && paneBounds[0].right <= paneBounds[1].left + 1;
+  results.twoPaneLimitVisible = G.panes.every((pane) => pane.splitBtn.disabled && pane.splitBtn.title.includes('Two panes maximum'));
+  await closePane(blankPane);
+  await wait(() => G.panes.length === 1 && G.focused === initialPane, 'close blank split');
+
+  document.querySelector('#hud-btn').click();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const hudWindowState = await window.prime.testWindowState();
+  results.hudFallback = hudWindowState.hudVisible && hudWindowState.hudExists && hudWindowState.hudAlwaysOnTop && hudWindowState.menuHasHud && hudWindowState.menuHasSplit && hudWindowState.shortcutRegistered === false;
+  await window.prime.toggleHud();
+
   key('o', { metaKey: true });
   await wait(() => !document.querySelector('#project-surface').classList.contains('hidden'), 'Cmd+O project surface');
   results.cmdO = true;
@@ -78,6 +97,13 @@ const evalSource = `(async () => {
   await wait(() => G.focused.workspace.selected && G.focused.workspace.name === 'workspace-fixture', 'project activation');
   results.project = inPane('.git-pill').textContent.includes('ui-smoke');
   results.projectPathVisible = inPane('.cwd-label').textContent.includes('workspace-fixture');
+  const projectSourcePane = G.focused;
+  const projectSplit = await splitPane(null);
+  await wait(() => G.panes.length === 2 && G.focused.ready, 'project-inheriting blank split');
+  const projectBlankPane = G.focused;
+  results.blankSplitInheritsProject = projectSplit && projectBlankPane.workspace.selected && projectBlankPane.workspace.cwd === projectSourcePane.workspace.cwd;
+  await closePane(projectBlankPane);
+  await wait(() => G.panes.length === 1 && G.focused === projectSourcePane, 'close project blank split');
 
   document.querySelector('#tree-toggle').click();
   await wait(() => [...document.querySelectorAll('#tree-body .tree-row.file')].some((row) => row.textContent.includes('fixture.txt')), 'lazy file tree');
@@ -148,10 +174,21 @@ const evalSource = `(async () => {
 
   const routeItem = [...document.querySelectorAll('.session-item')].find((item) => item.querySelector('.s-name') && item.querySelector('.s-name').textContent.trim() === 'Routing target');
   if (!routeItem) throw new Error('Routing target session was not rendered');
+  results.daemonDiscovered = routeItem.querySelector('.s-meta').textContent.includes('terminal live') && !!routeItem.querySelector('.live-dot.resident');
+  routeItem.focus();
+  results.sessionSplitDiscoverable = getComputedStyle(routeItem.querySelector('.s-actions')).display === 'flex' && routeItem.querySelector('.s-split').textContent.includes('Split');
   routeItem.click();
   await wait(() => G.panes.length === 2 && G.focused !== first && G.focused.ready && G.focused.sessionFile === ${JSON.stringify(routingSessionCanonical)}, 'normal-click streaming session route');
   const second = G.focused;
   results.streamingSessionRouted = first.isStreaming && first.key === firstKey && second.sessionFile === ${JSON.stringify(routingSessionCanonical)} && !first.bannerEl.textContent.includes('Stop the current response before changing sessions');
+  const daemonClients = await window.prime.listClients();
+  second.inputEl.value = '__DAEMON_HOLD__';
+  second.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+  await second.send();
+  await wait(() => second.isStreaming && second.chatEl.textContent.includes('daemon attachment live stream'), 'resident daemon live stream');
+  results.daemonAttachment = daemonClients.some((client) => client.key === second.key && client.transport === 'daemon-attachment') && first.isStreaming;
+  await second.stop();
+  await wait(() => !second.isStreaming && first.isStreaming, 'resident daemon abort without terminal stop');
   setFocusedPane(first);
   const alreadyOpenItem = [...document.querySelectorAll('.session-item')].find((item) => item.querySelector('.s-name') && item.querySelector('.s-name').textContent.trim() === 'Routing target');
   alreadyOpenItem.click();
@@ -162,6 +199,9 @@ const evalSource = `(async () => {
   routeItemTwo.click();
   await wait(() => G.focused === second && second.ready && second.sessionFile === ${JSON.stringify(routingSessionTwoCanonical)}, 'two-pane non-streaming route');
   results.twoPaneSessionRouted = first.isStreaming && first.key === firstKey && G.panes.length === 2 && second.sessionFile === ${JSON.stringify(routingSessionTwoCanonical)};
+  const sessionsAfterDaemonDetach = await window.prime.listSessions();
+  const detachedResident = sessionsAfterDaemonDetach.find((session) => session.path === ${JSON.stringify(routingSessionCanonical)});
+  results.daemonDetachNotStop = !!(detachedResident && detachedResident.daemonResident && detachedResident.daemonAttachedClients === 1);
   await first.stop();
   await wait(() => !first.isStreaming, 'stop routed source response');
   await second.activate(firstSession);
@@ -190,6 +230,8 @@ const evalSource = `(async () => {
   const deleteWhileShared = await window.prime.deleteSession(firstSession);
   results.sharedDeleteRejected = deleteWhileAttaching.ok === false && deleteWhileShared.ok === false && first.key === firstSession && second.key === firstSession && first.draftState.items.some((item) => item.name === 'fixture.txt');
 
+  const residentDelete = await window.prime.deleteSession(${JSON.stringify(routingSessionCanonical)});
+  results.residentDeleteRejected = residentDelete.ok === false && residentDelete.error.includes('active in Prime Agent');
   const inactiveDeleted = await window.prime.deleteSession('${deletableSession}');
   const sessionsAfterDelete = await window.prime.listSessions();
   const secondKeyBeforeDeletedReopen = second.key;
@@ -279,9 +321,13 @@ const safeEnv = {
   PRIME_DESKTOP_TEST_PROJECT: project,
   PRIME_DESKTOP_TEST_ATTACH_PATHS: JSON.stringify([path.join(project, "fixture.txt"), pickedImage, privateFile]),
   PRIME_DESKTOP_AGENT_SCRIPT: path.join(__dirname, "fake-agent.js"),
+  PRIME_DESKTOP_AGENT_MODULE: path.join(__dirname, "fake-daemon-module.mjs"),
+  PRIME_DESKTOP_FAKE_DAEMON_SESSIONS: JSON.stringify([routingSession, routingSessionTwo]),
   PRIME_DESKTOP_EVAL: evalSource,
   PRIME_DESKTOP_EVAL_DELAY: "600",
   PRIME_DESKTOP_QUIT_AFTER_EVAL: "1",
+  PRIME_DESKTOP_TEST_SHORTCUT_FAILURE: "1",
+  PRIME_DESKTOP_TEST_SHOW_WINDOWS: "1",
   ELECTRON_DISABLE_SECURITY_WARNINGS: "true",
 };
 if (process.env.PRIME_DESKTOP_UI_SMOKE_CAPTURE) safeEnv.PRIME_DESKTOP_CAPTURE = path.resolve(process.env.PRIME_DESKTOP_UI_SMOKE_CAPTURE);

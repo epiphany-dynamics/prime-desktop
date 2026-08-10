@@ -92,3 +92,22 @@ test("draft-preserving restarts lock pane authority and reuse same-session draft
   assert.match(renderer, /response\.preservedDraft/);
   assert.match(renderer, /prime\.killAllAgents\(\{ preserveDrafts: true \}\)/);
 });
+
+test('resident daemon sessions attach non-owningly and never pass through destructive handoff', () => {
+  const adapter = fs.readFileSync(path.join(root, 'lib/daemon-rpc-adapter.js'), 'utf8');
+  assert.match(main, /new DaemonRpcAdapter\(\{ socketPath: DAEMON_LAUNCH\.socketPath, sessionPath, moduleEntry \}\)/);
+  assert.match(main, /error instanceof NoResidentSessionError/);
+  assert.match(main, /client\.transport = 'rpc-process'/);
+  assert.doesNotMatch(main, /prepareSessionHandoff|prepareTargetSession/);
+  assert.match(adapter, /includeClientOwned: true/);
+  assert.match(adapter, /sendClientEnv: false/);
+  assert.match(adapter, /ownedSession: false/);
+  assert.match(adapter, /await connection\.dispose\(\)/);
+  assert.match(main, /releaseUnreferencedDaemonClient/);
+  assert.match(main, /clientHasPaneConsumer/);
+  assert.match(main, /last desktop pane released/);
+  assert.match(main, /client && client\.transport === 'daemon-attachment'/);
+  assert.match(main, /resident\.attachedClients <= 1/);
+  assert.match(main, /const stillResident = moduleEntry && await discoverResidentSession/);
+  assert.match(main, /This session is active in Prime Agent\. Stop it there before deleting it\./);
+});

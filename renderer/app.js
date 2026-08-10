@@ -84,7 +84,15 @@ const G = {
   panes: [],
   focused: null,
   extUiOwner: null, // pane that issued the current extension dialog
+  hudShortcutWarning: null,
+  hudShortcutWarningShown: false,
 };
+
+function showHudShortcutWarning(pane) {
+  if (!pane || !pane.ready || !G.hudShortcutWarning || G.hudShortcutWarningShown) return;
+  G.hudShortcutWarningShown = true;
+  pane.setBanner(G.hudShortcutWarning, false);
+}
 
 // ---------------- Pane ----------------
 class Pane {
@@ -141,6 +149,7 @@ class Pane {
     this.thinkingMenu = $('.thinking-menu', this.el);
     this.closeBtn = $('.pane-close', this.el);
     this.folderBtn = $('.pane-folder', this.el);
+    this.splitBtn = $('.pane-split', this.el);
 
     this.el.addEventListener('mousedown', () => setFocusedPane(this));
     this.el.addEventListener('dragover', (e) => this.handlePaneDragOver(e));
@@ -166,6 +175,7 @@ class Pane {
     };
     this.modelFilter.addEventListener('input', () => this.renderModelMenu());
     this.thinkingBtn.onclick = () => { this.renderThinkingMenu(); toggleMenu(this.thinkingMenu); };
+    this.splitBtn.onclick = () => splitPane(this.sessionFile || null);
     $('.pane-popout', this.el).onclick = () => prime.popOut(this.sessionFile || undefined);
     this.closeBtn.onclick = () => closePane(this);
   }
@@ -442,15 +452,24 @@ class Pane {
     if (requestId !== this.activationRequest || this.bindingEpoch !== response.bindingEpoch) return false;
     const messages = await prime.command(this.key, { type: 'get_messages' });
     if (requestId !== this.activationRequest || this.bindingEpoch !== response.bindingEpoch) return false;
-    if (messages.success) this.renderHistory(messages.data.messages, { dropInFlight: this.isStreaming });
+    if (messages.success) {
+      const streamingMessage = messages.data && messages.data.streamingMessage;
+      this.renderHistory(messages.data.messages, { dropInFlight: this.isStreaming && !streamingMessage });
+      if (this.isStreaming && streamingMessage && streamingMessage.role === 'assistant') {
+        this.beginStream();
+        this.syncStreamFromMessage(streamingMessage);
+        this.scheduleStreamRender();
+      }
+    }
     this.ready = true;
     renderSidebar();
     if (treeVisible && G.focused === this) await renderTreeRoot();
     if (response.warning) this.setBanner(response.warning, false);
+    else showHudShortcutWarning(this);
     return true;
   }
 
-  async activate(sessionPath) {
+  async activate(sessionPath, sourcePane = null) {
     if (!this.canChangeBinding('changing sessions')) return false;
     this.bindingChangePending = true;
     this.updateComposer();
@@ -462,7 +481,9 @@ class Pane {
         sessionPath: sessionPath || undefined,
         paneId: this.paneId || undefined,
         bindingEpoch: this.bindingEpoch || undefined,
-        sourceKey: this.key || undefined,
+        sourceKey: this.key || (sourcePane && sourcePane.key) || undefined,
+        sourcePaneId: !this.paneId && sourcePane ? sourcePane.paneId : undefined,
+        sourceBindingEpoch: !this.paneId && sourcePane ? sourcePane.bindingEpoch : undefined,
       });
       if (requestId !== this.activationRequest) return false;
       if (!response.ok) { this.setBanner('Could not start session: ' + (response.error || 'unknown'), true); return false; }
@@ -853,6 +874,21 @@ class Pane {
   // ---------- event handling ----------
   handleEvent(ev) {
     switch (ev.type) {
+      case 'session_resynced': {
+        const state = ev.state || {};
+        this.isStreaming = !!state.isStreaming;
+        this.model = state.model || this.model;
+        this.thinkingLevel = state.thinkingLevel || this.thinkingLevel;
+        this.renderHistory(ev.messages || [], { dropInFlight: false });
+        if (this.isStreaming && ev.streamingMessage && ev.streamingMessage.role === 'assistant') {
+          this.beginStream();
+          this.syncStreamFromMessage(ev.streamingMessage);
+          this.scheduleStreamRender();
+        }
+        this.updateTopbar();
+        this.updateComposer();
+        break;
+      }
       case 'agent_start':
         this.isStreaming = true;
         this.setAgentState('working…');
@@ -941,7 +977,25 @@ function setFocusedPane(pane) {
   for (const p of G.panes) p.el.classList.toggle('focused', p === pane);
   if (pane && pane.key) prime.touchClient(pane.key);
   if (pane) pane.updateTopbar();
+  updateSplitControls();
   if (treeVisible) void renderTreeRoot();
+}
+
+function updateSplitControls() {
+  const atLimit = G.panes.length >= 2;
+  const title = atLimit
+    ? 'Two panes maximum. Close a pane before opening another.'
+    : 'Open this session side by side in the same window';
+  for (const pane of G.panes) {
+    pane.splitBtn.disabled = atLimit;
+    pane.splitBtn.title = title;
+    pane.splitBtn.setAttribute('aria-label', atLimit ? 'Split View unavailable: two panes maximum' : 'Split View');
+  }
+  for (const button of $$('.s-split')) {
+    button.disabled = atLimit;
+    button.title = atLimit ? 'Two panes maximum. Close a pane before opening another.' : 'Open in Split View';
+  }
+  if (prime.setSplitAvailable) void prime.setSplitAvailable(!atLimit);
 }
 
 function toggleMenu(menu, show) {
@@ -949,7 +1003,7 @@ function toggleMenu(menu, show) {
   menu.classList.toggle('hidden', show === undefined ? undefined : !show);
 }
 
-async function createPane(index, sessionPath) {
+async function createPane(index, sessionPath, sourcePane = null) {
   const pane = new Pane(index);
   G.panes.push(pane);
   if (index > 0) {
@@ -957,7 +1011,8 @@ async function createPane(index, sessionPath) {
     document.body.classList.add('split');
   }
   setFocusedPane(pane);
-  await pane.activate(sessionPath || null);
+  await pane.activate(sessionPath || null, sourcePane);
+  updateSplitControls();
   return pane;
 }
 
@@ -972,14 +1027,24 @@ async function closePane(pane) {
   pane.el.remove();
   if (!G.panes.some((p) => p.index > 0)) document.body.classList.remove('split');
   setFocusedPane(G.panes[G.panes.length - 1]);
-  // pane's agent process keeps running in the background by design
+  updateSplitControls();
+  // Process-owned sessions may keep running; resident daemon sessions detach
+  // after their final Desktop pane/HUD consumer releases them.
 }
 
-async function splitWithSession(sessionPath) {
-  if (G.panes.length >= 2) { G.focused.setBanner('Two panes max for now.'); return false; }
-  const pane = await createPane(1, sessionPath);
+async function splitPane(sessionPath = null) {
+  if (G.panes.length >= 2) {
+    (G.focused || G.panes[0]).setBanner('Two panes maximum. Close a pane before opening another.', true);
+    updateSplitControls();
+    return false;
+  }
+  const sourcePane = G.focused;
+  const pane = await createPane(1, sessionPath, sessionPath ? null : sourcePane);
   return !!(pane && pane.ready);
 }
+
+// Compatibility name retained for saved-session drag/drop call sites.
+const splitWithSession = splitPane;
 
 function paneAvailableForSessionSwitch(pane) {
   return !!(pane && !pane.bindingChangePending && !pane.isStreaming && !pane.sending && !pane.draftState.sending && pane.draftState.pending.size === 0);
@@ -1089,17 +1154,23 @@ function renderSidebar() {
     const paneHere = G.panes.find((p) => p.sessionFile === s.path);
     const item = document.createElement('div');
     item.className = 'session-item' + (paneHere ? ' active' : '');
+    item.tabIndex = 0;
     item.draggable = true;
     item.addEventListener('dragstart', (e) => {
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('application/x-prime-session', s.path);
       e.dataTransfer.setData('text/plain', s.path);
     });
+    const liveMarker = (paneHere && paneHere.isStreaming)
+      ? '<span class="live-dot" title="Streaming now"></span>'
+      : s.daemonResident
+        ? '<span class="live-dot resident" title="Running in Prime Agent terminal"></span>'
+        : '';
     item.innerHTML = `
-      <div class="s-name">${(paneHere && paneHere.isStreaming) ? '<span class="live-dot"></span>' : ''}${esc(label)}</div>
-      <div class="s-meta">${esc(baseName(s.cwd))} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs</div>
+      <div class="s-name">${liveMarker}${esc(label)}</div>
+      <div class="s-meta">${esc(baseName(s.cwd))} · ${relTime(s.updatedAt)} · ${s.messageCount} msgs${s.daemonResident ? ' · terminal live' : ''}</div>
       <div class="s-actions">
-        <button class="s-act s-split" title="Open in second pane without stopping the current session" aria-label="Open in second pane">⫿</button>
+        <button class="s-act s-split" title="Open in Split View" aria-label="Open in Split View">▥ Split</button>
         <button class="s-act s-pin ${G.pinnedPaths.has(s.path) ? 'pinned' : ''}" title="${G.pinnedPaths.has(s.path) ? 'Unpin' : 'Pin'} session">⌃</button>
         <button class="s-act s-edit" title="Rename session">✎</button>
         <button class="s-act s-delete" title="Delete session">✕</button>
@@ -1108,6 +1179,12 @@ function renderSidebar() {
       if (e.shiftKey) { togglePin(s.path); return; }
       if (paneHere) { setFocusedPane(paneHere); return; }
       void openSessionFromSidebar(s.path);
+    };
+    item.onkeydown = (e) => {
+      if (e.target !== item || (e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      if (paneHere) setFocusedPane(paneHere);
+      else void openSessionFromSidebar(s.path);
     };
     item.querySelector('.s-name').ondblclick = (e) => { e.stopPropagation(); startRename(item, s); };
     item.querySelector('.s-split').onclick = (e) => { e.stopPropagation(); splitWithSession(s.path); };
@@ -1136,6 +1213,7 @@ function renderSidebar() {
   }
   rest.forEach((s) => host.appendChild(makeItem(s)));
   renderSubagents();
+  updateSplitControls();
 }
 
 async function loadPins() {
@@ -1899,6 +1977,7 @@ async function renderHeartbeatsList() {
 $('#new-chat-btn').onclick = () => G.focused && G.focused.newChat();
 $('#new-folder-chat-btn').onclick = () => openProjectSurface(G.focused);
 $('#session-filter').addEventListener('input', renderSidebar);
+$('#hud-btn').onclick = () => prime.toggleHud();
 $('#settings-btn').onclick = openSettings;
 $('#settings-close').onclick = closeSettings;
 $('#settings-backdrop').onclick = (e) => { if (e.target === $('#settings-backdrop')) closeSettings(); };
@@ -2076,7 +2155,7 @@ prime.onRpcExit(({ key, code, error }) => {
     pane.isStreaming = false;
     pane.endStream();
     pane.updateComposer();
-    pane.setBanner(`${error || 'Agent process exited'} (code ${code}). Click to restart.`, true);
+    pane.setBanner(`${error || 'Agent connection closed'} (code ${code}). Click to restart.`, true);
     pane.bannerEl.style.cursor = 'pointer';
     pane.bannerEl.onclick = recover;
   }
@@ -2085,8 +2164,16 @@ prime.onRpcError(({ key, message }) => {
   const pane = (key && G.panes.find((p) => p.key === key)) || G.focused;
   if (pane) pane.setBanner(message || 'Agent process error.', true);
 });
+prime.onHudShortcutStatus(({ registered, message }) => {
+  if (registered) return;
+  G.hudShortcutWarning = message || 'The global HUD shortcut is unavailable. Use Prime HUD here or Window → Show Prime HUD.';
+  showHudShortcutWarning(G.focused);
+});
 prime.onMenuAction(({ id }) => {
   if (id === 'new-chat') G.focused && G.focused.newChat();
+  else if (id === 'split-view') void splitPane(G.focused && G.focused.sessionFile || null);
+  else if (id === 'new-chat-split') void splitPane(null);
+  else if (id === 'toggle-hud') void prime.toggleHud();
   else if (id === 'open-project') openProjectSurface(G.focused);
   else if (id === 'attach-files') G.focused && G.focused.pickAttachments();
   else if (id === 'open-settings') openSettings();

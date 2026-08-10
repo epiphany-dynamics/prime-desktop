@@ -10,8 +10,8 @@ const fsp = fs.promises;
 const os = require('os');
 
 const { primeDaemonLaunchConfig } = require('./daemon-launch');
-const { prepareSessionHandoff } = require('./session-handoff');
 const { RpcManager, canonicalDirectory } = require('./lib/rpc-manager');
+const { DaemonRpcAdapter, NoResidentSessionError, findPrimeAgentModuleEntry, listResidentDaemonSessions, discoverResidentSession } = require('./lib/daemon-rpc-adapter');
 const { WorkspaceService, activateWorkspaceForClient, isWithin } = require('./lib/workspace-service');
 const { AttachmentService, AttachmentError, sniffImageMime, parseFileTransport } = require('./lib/attachment-service');
 const { canonicalSessionPath, validateSessionHeader, safeDeleteSession, cleanupTrackedEmptySessions, countSessionMessages } = require('./lib/session-utils');
@@ -101,8 +101,9 @@ function resolveAgentInvocation(childEnv) {
   return { command: found, args: [], display: found };
 }
 
-// ---------- Multi-client RPC manager ----------
-// One hardened RpcManager per live session, routed by opaque pane contexts.
+// ---------- Multi-client agent connections ----------
+// One process-backed RPC manager or non-owning daemon adapter per canonical
+// session, shared by panes and routed through opaque main-issued contexts.
 
 const clients = new Map();
 const sessionLifecycle = new SessionLifecycleRegistry();
@@ -153,7 +154,7 @@ function clientIsCurrent(client) {
   return !!client && client.committed && clients.get(client.key) === client;
 }
 function clientCommand(client, command, timeoutMs) {
-  if (!client || !client.alive) return Promise.reject(new Error('Agent process is not running'));
+  if (!client || !client.alive) return Promise.reject(new Error('Agent connection is not running'));
   return client.rpc.command(command, timeoutMs ? { timeoutMs } : {});
 }
 function getClient(key) { return typeof key === 'string' ? clients.get(key) : null; }
@@ -164,12 +165,24 @@ function refreshClientViewers(client) {
   for (const context of paneContexts.values()) if (context.client === client && context.ownerWin && !context.ownerWin.isDestroyed()) viewers.add(context.ownerWin);
   client.viewers = viewers;
 }
+function clientHasPaneConsumer(client) {
+  return [...paneContexts.values()].some((context) => context.client === client);
+}
+function hudConsumesClient(client) {
+  return hudClient === client && hudWin && !hudWin.isDestroyed() && (hudWin.isVisible() || hudOpenPending);
+}
+async function releaseUnreferencedDaemonClient(client, reason) {
+  if (!client || client.transport !== 'daemon-attachment' || clientHasPaneConsumer(client) || hudConsumesClient(client)) return;
+  try { await disposeClient(client, reason); }
+  catch (error) { console.warn('PRIME_DAEMON_DETACH_FAILED', boundedText(error && error.message, 300)); }
+}
 function trackCreatedSession(sessionPath) {
   if (typeof sessionPath === 'string') createdSessionFiles.add(sessionPath);
 }
 function handleClientMessage(client, obj) {
   if (!clientIsCurrent(client)) return;
   if (obj.type === 'agent_start') client.streaming = true;
+  if (obj.type === 'session_resynced' && obj.state) client.streaming = !!obj.state.isStreaming;
   if (obj.type === 'agent_end') {
     client.streaming = false;
     if (client.workspace) client.workspace.refresh('agent');
@@ -218,18 +231,55 @@ async function evictIdleClients() {
   }
 }
 
-async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspace = null }) {
-  const targetCwd = canonicalDirectory(cwd || HOME);
-  const temporaryKey = `new:${++tempSeq}`;
-  const rpc = new RpcManager({
+function createRpcManager(targetCwd) {
+  return new RpcManager({
     defaultCwd: targetCwd,
     resolveInvocation: resolveAgentInvocation,
     buildEnv: buildChildEnv,
     extraArgs: ['--daemon-socket', DAEMON_LAUNCH.socketPath],
   });
+}
+
+function resolvePrimeAgentModuleEntry() {
+  const childEnv = buildChildEnv();
+  return findPrimeAgentModuleEntry({
+    homeDir: HOME,
+    invocation: resolveAgentInvocation(childEnv),
+    override: process.env.PRIME_DESKTOP_AGENT_MODULE,
+  });
+}
+
+function createDaemonAdapter(sessionPath) {
+  if (!sessionPath) return null;
+  const moduleEntry = resolvePrimeAgentModuleEntry();
+  if (!moduleEntry) return null;
+  return new DaemonRpcAdapter({ socketPath: DAEMON_LAUNCH.socketPath, sessionPath, moduleEntry });
+}
+
+function wireClientRpc(client, rpc) {
+  client.rpc = rpc;
+  rpc.on('event', (event) => handleClientMessage(client, event));
+  // Never mirror provider stderr into the renderer; it can contain paths or credentials.
+  rpc.on('stderr', () => {});
+  rpc.on('error-event', (payload) => {
+    if (clientIsCurrent(client)) sendToClientWindows(client, 'rpc-error', { key: client.key, message: boundedText(payload.message, 500) });
+  });
+  rpc.on('exit', (payload) => {
+    if (!clientIsCurrent(client)) return;
+    client.alive = false;
+    sendToClientWindows(client, 'rpc-exit', { key: client.key, code: payload.code, error: payload.error });
+    sendHudEvent(client, { type: 'error', error: payload.error || `Agent connection closed (${payload.code})` });
+  });
+}
+
+async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspace = null }) {
+  const targetCwd = canonicalDirectory(cwd || HOME);
+  const temporaryKey = `new:${++tempSeq}`;
+  let rpc = createDaemonAdapter(sessionPath) || createRpcManager(targetCwd);
   const client = {
     key: temporaryKey,
     rpc,
+    transport: rpc instanceof DaemonRpcAdapter ? 'daemon-attachment' : 'rpc-process',
     sessionFile: sessionPath,
     cwd: targetCwd,
     viewers: new Set(ownerWin ? [ownerWin] : []),
@@ -241,22 +291,26 @@ async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspa
     workspace: null,
     workspaceWarning: null,
   };
-  rpc.on('event', (event) => handleClientMessage(client, event));
-  // Never mirror provider stderr into the renderer; it can contain paths or credentials.
-  rpc.on('stderr', () => {});
-  rpc.on('error-event', (payload) => {
-    if (clientIsCurrent(client)) sendToClientWindows(client, 'rpc-error', { key: client.key, message: boundedText(payload.message, 500) });
-  });
-  rpc.on('exit', (payload) => {
-    if (!clientIsCurrent(client)) return;
-    client.alive = false;
-    sendToClientWindows(client, 'rpc-exit', { key: client.key, code: payload.code, error: payload.error });
-    sendHudEvent(client, { type: 'error', error: payload.error || `Agent process exited (${payload.code})` });
-  });
+  wireClientRpc(client, rpc);
 
   try {
-    await rpc.start({ cwd: targetCwd, sessionPath, reason: 'client activation' });
-    const ready = await rpc.waitUntilReady();
+    let ready;
+    try {
+      await rpc.start({ cwd: targetCwd, sessionPath, reason: 'client activation' });
+      ready = await rpc.waitUntilReady();
+    } catch (error) {
+      if (!(rpc instanceof DaemonRpcAdapter) || !(error instanceof NoResidentSessionError)) throw error;
+      // Discovery completed without a matching active worker (or no daemon is
+      // running), so this saved session is genuinely inactive and may resume
+      // through the existing RPC process path.
+      await rpc.stop('inactive daemon fallback').catch(() => {});
+      rpc.removeAllListeners();
+      rpc = createRpcManager(targetCwd);
+      client.transport = 'rpc-process';
+      wireClientRpc(client, rpc);
+      await rpc.start({ cwd: targetCwd, sessionPath, reason: 'inactive session activation' });
+      ready = await rpc.waitUntilReady();
+    }
     const reported = ready.data && ready.data.sessionFile;
     if (typeof reported !== 'string') throw new Error('Agent did not report a session file');
     const canonicalSession = await canonicalSessionPath(SESSIONS_DIR, reported);
@@ -306,42 +360,6 @@ async function ensureClient({ sessionPath = null, cwd, ownerWin, inspectedWorksp
     return spawnClient({ sessionPath, cwd, ownerWin, inspectedWorkspace });
   };
   return sessionPath ? sessionLifecycle.run(sessionPath, activate) : activate();
-}
-
-function runAgentCliJson(args, timeoutMs = 8_000) {
-  return new Promise((resolve, reject) => {
-    const childEnv = buildChildEnv();
-    const invocation = resolveAgentInvocation(childEnv);
-    if (!invocation) return reject(new Error('prime-agent binary not found'));
-    let stdout = '', stderr = '', settled = false;
-    const proc = spawn(invocation.command, [...invocation.args, args[0], '--daemon-socket', DAEMON_LAUNCH.socketPath, ...args.slice(1)], {
-      cwd: HOME, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try { proc.kill('SIGKILL'); } catch {}
-      reject(new Error(`prime-agent ${args[0]} timed out`));
-    }, timeoutMs);
-    proc.stdout.on('data', (data) => { stdout += data.toString(); });
-    proc.stderr.on('data', (data) => { stderr += data.toString(); });
-    proc.on('error', (error) => { if (!settled) { settled = true; clearTimeout(timer); reject(error); } });
-    proc.on('exit', (code) => {
-      if (settled) return;
-      settled = true; clearTimeout(timer);
-      if (code !== 0) return reject(new Error(stderr.trim() || `prime-agent ${args[0]} exited with code ${code}`));
-      try { resolve(stdout.trim() ? JSON.parse(stdout) : {}); }
-      catch { reject(new Error(`prime-agent ${args[0]} returned invalid JSON`)); }
-    });
-  });
-}
-async function prepareTargetSession(sessionPath) {
-  return prepareSessionHandoff(sessionPath, {
-    list: async () => (await runAgentCliJson(['list', '--json'])).sessions || [],
-    stop: async (activeSessionId) => { await runAgentCliJson(['stop', activeSessionId, '--json']); },
-    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    timeoutMs: 5_000,
-  });
 }
 
 function ownerForEvent(event) { return BrowserWindow.fromWebContents(event.sender); }
@@ -494,9 +512,18 @@ secureHandle('rpc:activate', async (event, request = {}) => {
       const ownerWin = ownerForEvent(event);
       const currentContext = request.paneId && paneContexts.get(request.paneId);
       let priorContext = null;
+      let sourceContext = null;
       if (currentContext) {
+        if (request.sourcePaneId != null || request.sourceBindingEpoch != null) throw new Error('Invalid split source');
         priorContext = paneContextFor(event, { paneId: request.paneId, key: request.sourceKey, bindingEpoch: request.bindingEpoch }, { cap: 8 * 1024 });
-      } else if (request.sourceKey != null || request.bindingEpoch != null) {
+      } else if (request.sourcePaneId != null) {
+        if (request.bindingEpoch != null) throw new Error('Invalid split source');
+        sourceContext = paneContextFor(event, {
+          paneId: request.sourcePaneId,
+          key: request.sourceKey,
+          bindingEpoch: request.sourceBindingEpoch,
+        }, { cap: 8 * 1024 });
+      } else if (request.sourceKey != null || request.bindingEpoch != null || request.sourceBindingEpoch != null) {
         throw new Error('The pane binding changed before this action completed');
       }
       await requirePaneProjectIdle(priorContext, 'changing sessions');
@@ -510,12 +537,8 @@ secureHandle('rpc:activate', async (event, request = {}) => {
           const verified = await validateSessionHeader(SESSIONS_DIR, request.sessionPath);
           sessionPath = verified.sessionPath;
           targetCwd = verified.header.cwd;
-          if (!clients.has(sessionPath) && !TEST_MODE) {
-            const prepared = await prepareTargetSession(sessionPath);
-            if (!prepared.ok) throw new Error(prepared.error);
-          }
         } else {
-          const sourceClient = priorContext ? priorContext.client : getClient(request.sourceKey);
+          const sourceClient = priorContext ? priorContext.client : sourceContext ? sourceContext.client : null;
           if (sourceClient) targetCwd = sourceClient.cwd;
         }
         const existingBefore = new Set(clients.values());
@@ -526,6 +549,9 @@ secureHandle('rpc:activate', async (event, request = {}) => {
         const preserveDraft = !!(priorContext && priorContext.client.sessionFile === client.sessionFile);
         const context = bindPane(event, request.paneId, client, { preserveDraft });
         bound = true;
+        if (priorContext && priorContext.client !== client) {
+          await releaseUnreferencedDaemonClient(priorContext.client, 'last desktop pane switched sessions');
+        }
         if (ownerWin) lastFocusedMainWin = ownerWin;
         return describeActivation(context, state, { preservedDraft: preserveDraft });
       } catch (error) {
@@ -540,6 +566,7 @@ secureHandle('rpc:activate', async (event, request = {}) => {
 
 secureHandle('rpc:list-clients', async () => [...new Set(clients.values())].map((client) => ({
   key: client.key, sessionFile: client.sessionFile, streaming: client.streaming, alive: client.alive, cwd: client.cwd,
+  transport: client.transport,
 })));
 secureHandle('rpc:touch-client', (event, request) => {
   try {
@@ -560,6 +587,7 @@ secureHandle('pane:release', async (event, request) => {
       context.attachmentService.deleteDraft(context.draft.id);
       paneContexts.delete(context.id);
       refreshClientViewers(context.client);
+      await releaseUnreferencedDaemonClient(context.client, 'last desktop pane released');
       await evictIdleClients();
       return { ok: true };
     });
@@ -622,6 +650,26 @@ async function listSessions() {
       });
     } catch { /* skip */ }
   }
+  const moduleEntry = resolvePrimeAgentModuleEntry();
+  if (moduleEntry) {
+    try {
+      const residents = await listResidentDaemonSessions({ socketPath: DAEMON_LAUNCH.socketPath, moduleEntry });
+      const byPath = new Map(residents.map((resident) => {
+        try { return [fs.realpathSync(resident.sessionFile), resident]; } catch { return [path.resolve(resident.sessionFile), resident]; }
+      }));
+      for (const session of out) {
+        const resident = byPath.get(session.path);
+        const localClient = clients.get(session.path);
+        if (!resident || (localClient && localClient.alive && localClient.transport === 'rpc-process')) continue;
+        session.daemonResident = true;
+        session.daemonStreaming = !!resident.isStreaming;
+        const attachedClients = Number(resident.attachedClients || 0);
+        session.daemonAttachedClients = Number.isSafeInteger(attachedClients) ? Math.max(0, Math.min(attachedClients, 10_000)) : 0;
+      }
+    } catch (error) {
+      console.warn('PRIME_DAEMON_DISCOVERY_FAILED', boundedText(error && error.message, 300));
+    }
+  }
   out.sort((a, b) => b.updatedAt - a.updatedAt);
   return out;
 }
@@ -648,7 +696,16 @@ secureHandle('sessions:delete', async (_event, sessionPath) => {
       if (client && client.alive && !client.disposePromise && clientIsCurrent(client)) await requireIdleClient(client, 'deleting this session');
       for (const context of attached) assertPaneLocallyIdle(context, 'deleting this session');
       if (attached.length) throw new Error('Switch or close every pane using this session before deleting it');
+      const moduleEntry = resolvePrimeAgentModuleEntry();
+      const resident = moduleEntry && await discoverResidentSession({ socketPath: DAEMON_LAUNCH.socketPath, sessionPath: canonical, moduleEntry });
+      const soleLocalRpcOwner = !!(resident && client && client.alive && client.transport === 'rpc-process'
+        && Number.isSafeInteger(resident.attachedClients) && resident.attachedClients <= 1);
+      if ((client && client.transport === 'daemon-attachment') || (resident && !soleLocalRpcOwner)) {
+        throw new Error('This session is active in Prime Agent. Stop it there before deleting it.');
+      }
       if (client) await disposeClient(client, 'session deletion');
+      const stillResident = moduleEntry && await discoverResidentSession({ socketPath: DAEMON_LAUNCH.socketPath, sessionPath: canonical, moduleEntry });
+      if (stillResident) throw new Error('This session is still active in Prime Agent. Retry after it stops.');
       await safeDeleteSession(SESSIONS_DIR, canonical);
       return { ok: true };
     }));
@@ -1283,6 +1340,10 @@ secureHandle('skills:add-from-folder', async (event) => {
 
 let hudWin = null;
 let hudClient = null;
+let hudReady = false;
+let hudOpenPending = false;
+let hudShortcutRegistered = false;
+let hudShortcutRegistrationAttempted = false;
 let lastFocusedMainWin = null;
 const HUD_WIDTH = 620, HUD_HEIGHT = 480;
 function installNavigationPolicy(window, localFile) {
@@ -1307,7 +1368,15 @@ function installNavigationPolicy(window, localFile) {
   window.webContents.on('will-attach-webview', (event) => event.preventDefault());
 }
 
+function updateHudMenuLabel() {
+  const menu = Menu.getApplicationMenu();
+  const item = menu && menu.getMenuItemById('toggle-prime-hud');
+  if (item) item.label = hudWin && !hudWin.isDestroyed() && hudWin.isVisible() ? 'Hide Prime HUD' : 'Show Prime HUD';
+}
+
 function createHud() {
+  hudReady = false;
+  hudOpenPending = false;
   hudWin = new BrowserWindow({
     width: HUD_WIDTH, height: HUD_HEIGHT, frame: false, resizable: false,
     alwaysOnTop: true, skipTaskbar: true, show: false, backgroundColor: '#0f1011',
@@ -1315,9 +1384,33 @@ function createHud() {
   });
   const hudFile = path.join(__dirname, 'renderer', 'hud.html');
   installNavigationPolicy(hudWin, hudFile);
-  hudWin.loadFile(hudFile);
+  const candidate = hudWin;
+  let documentLoaded = false;
+  let readyToShow = false;
+  const markHudReady = () => {
+    if (candidate !== hudWin || candidate.isDestroyed() || !documentLoaded || !readyToShow) return;
+    hudReady = true;
+    if (hudOpenPending) showHud();
+  };
+  candidate.webContents.once('did-finish-load', () => { documentLoaded = true; markHudReady(); });
+  candidate.once('ready-to-show', () => { readyToShow = true; markHudReady(); });
+  hudWin.loadFile(hudFile).catch((error) => {
+    hudOpenPending = false;
+    console.warn('PRIME_HUD_LOAD_FAILED', boundedText(error && error.message, 300));
+  });
   hudWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  hudWin.on('blur', () => { if (hudWin && !hudWin.webContents.isDevToolsOpened()) hudWin.hide(); });
+  hudWin.on('blur', () => {
+    if (hudWin && !hudWin.isDestroyed() && !hudWin.webContents.isDevToolsOpened()) hideHud();
+  });
+  hudWin.on('closed', () => {
+    const previousClient = hudClient;
+    hudClient = null;
+    hudWin = null;
+    hudReady = false;
+    hudOpenPending = false;
+    updateHudMenuLabel();
+    void releaseUnreferencedDaemonClient(previousClient, 'Prime HUD closed');
+  });
 }
 function selectHudClient(key) {
   if (key) {
@@ -1336,22 +1429,43 @@ function sendHudEvent(client, event) {
   sendToWindow(hudWin, 'hud-event', { key: client.key, event });
 }
 
-function toggleHud() {
-  if (!hudWin) return;
-  if (hudWin.isVisible()) { hudWin.hide(); return; }
+function showHud() {
+  if (!hudWin || hudWin.isDestroyed()) return { ok: false, error: 'Prime HUD is unavailable' };
+  if (!hudReady) { hudOpenPending = true; return { ok: true, pending: true, visible: false }; }
+  hudOpenPending = false;
   hudClient = selectHudClient(null);
   const cursor = screen.getCursorScreenPoint();
   const display = screen.getDisplayNearestPoint(cursor);
   const { x, y, width, height } = display.workArea;
   hudWin.setPosition(Math.round(x + (width - HUD_WIDTH) / 2), Math.round(y + height - HUD_HEIGHT - 72));
   hudWin.show(); hudWin.focus();
-  hudWin.webContents.send('hud-opened', {
+  sendToWindow(hudWin, 'hud-opened', {
     key: hudClient && hudClient.key,
     sessionFile: hudClient && hudClient.sessionFile,
     streaming: !!(hudClient && hudClient.streaming),
   });
+  updateHudMenuLabel();
+  return { ok: true, visible: true };
 }
-secureHandle('hud:hide', () => { if (hudWin) hudWin.hide(); });
+
+function hideHud() {
+  const previousClient = hudClient;
+  hudClient = null;
+  hudOpenPending = false;
+  if (hudWin && !hudWin.isDestroyed()) hudWin.hide();
+  updateHudMenuLabel();
+  void releaseUnreferencedDaemonClient(previousClient, 'Prime HUD hidden');
+  return { ok: true, visible: false };
+}
+
+function toggleHud() {
+  if (!hudWin || hudWin.isDestroyed()) return { ok: false, error: 'Prime HUD is unavailable' };
+  if (hudWin.isVisible() || hudOpenPending) return hideHud();
+  return showHud();
+}
+secureHandle('hud:toggle', () => toggleHud());
+secureHandle('hud:hide', () => hideHud());
+
 secureHandle('hud:prompt', async (_e, { key, text }) => {
   try {
     const client = key ? selectHudClient(key) : (hudClient && hudClient.alive ? hudClient : selectHudClient(null));
@@ -1388,27 +1502,30 @@ secureHandle('hud:open-session', () => {
   } else {
     createWindow(hudClient.sessionFile || undefined);
   }
-  if (hudWin) hudWin.hide();
+  hideHud();
   return { ok: true, sessionFile: hudClient.sessionFile };
 });
 
 // ---------- Windows / pop-out ----------
 
 const wins = new Set();
+const splitAvailabilityByWindow = new WeakMap();
 function createWindow(sessionQuery) {
   const win = new BrowserWindow({
     width: 1280, height: 840, minWidth: 940, minHeight: 600,
-    title: 'Prime Agent', backgroundColor: '#08090a', show: !TEST_MODE,
+    title: 'Prime Agent', backgroundColor: '#08090a', show: !TEST_MODE || process.env.PRIME_DESKTOP_TEST_SHOW_WINDOWS === '1',
     titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 14, y: 14 },
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   wins.add(win);
+  splitAvailabilityByWindow.set(win, true);
   if (TEST_MODE) win.webContents.on('console-message', (_event, details) => {
     if (details && ['warning', 'error'].includes(details.level)) console.error('RENDERER_CONSOLE', boundedText(details.message, 2_000), boundedText(details.sourceId, 300), Number(details.lineNumber) || 0);
   });
-  win.on('focus', () => { lastFocusedMainWin = win; });
+  win.on('focus', () => { lastFocusedMainWin = win; updateSplitMenuItems(); });
   win.on('closed', () => {
     wins.delete(win);
+    splitAvailabilityByWindow.delete(win);
     const affected = new Set();
     for (const [paneId, context] of paneContexts) {
       if (context.ownerWin !== win) continue;
@@ -1417,11 +1534,22 @@ function createWindow(sessionQuery) {
       affected.add(context.client);
     }
     for (const client of affected) refreshClientViewers(client);
-    void evictIdleClients();
+    void (async () => {
+      await Promise.all([...affected].map((client) => releaseUnreferencedDaemonClient(client, 'last desktop window released')));
+      await evictIdleClients();
+    })();
     if (lastFocusedMainWin === win) lastFocusedMainWin = null;
   });
   const file = path.join(__dirname, 'renderer', 'index.html');
   installNavigationPolicy(win, file);
+  win.webContents.once('did-finish-load', () => {
+    if (hudShortcutRegistrationAttempted && !hudShortcutRegistered) {
+      sendToWindow(win, 'hud-shortcut-status', {
+        registered: false,
+        message: 'The global HUD shortcut could not be registered. Use Prime HUD here or Window → Show Prime HUD.',
+      });
+    }
+  });
   if (sessionQuery) win.loadFile(file, { query: { session: sessionQuery } });
   else win.loadFile(file);
   if (!app.isPackaged && !TEST_MODE && process.env.PRIME_DESKTOP_DEVTOOLS) win.webContents.openDevTools({ mode: 'detach' });
@@ -1458,8 +1586,52 @@ secureHandle('window:pop-out', async (_event, sessionPath) => {
 
 // ---------- Menu ----------
 
+function focusedMainWindow() {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused && wins.has(focused) && !focused.isDestroyed()) return focused;
+  if (lastFocusedMainWin && wins.has(lastFocusedMainWin) && !lastFocusedMainWin.isDestroyed()) return lastFocusedMainWin;
+  return [...wins].find((win) => win && !win.isDestroyed()) || null;
+}
+function sendMenuAction(id) {
+  const target = focusedMainWindow();
+  if (target) sendToWindow(target, 'menu-action', { id });
+}
+function updateSplitMenuItems() {
+  const menu = Menu.getApplicationMenu();
+  const focused = focusedMainWindow();
+  const available = focused ? splitAvailabilityByWindow.get(focused) !== false : true;
+  for (const id of ['split-view', 'new-chat-split']) {
+    const item = menu && menu.getMenuItemById(id);
+    if (item) item.enabled = available;
+  }
+}
+secureHandle('window:set-split-available', (event, request = {}) => {
+  const owner = ownerForEvent(event);
+  if (!owner || !wins.has(owner)) return { ok: false };
+  splitAvailabilityByWindow.set(owner, request.available === true);
+  if (owner === focusedMainWindow()) updateSplitMenuItems();
+  return { ok: true };
+});
+secureHandle('test:window-state', () => {
+  if (!TEST_MODE) return { ok: false };
+  const mainWindows = [...wins].filter((win) => win && !win.isDestroyed());
+  return {
+    ok: true,
+    mainWindowCount: mainWindows.length,
+    visibleMainWindowCount: mainWindows.filter((win) => win.isVisible()).length,
+    hudExists: !!(hudWin && !hudWin.isDestroyed()),
+    hudReady,
+    hudPending: hudOpenPending,
+    hudVisible: !!(hudWin && !hudWin.isDestroyed() && hudWin.isVisible()),
+    hudAlwaysOnTop: !!(hudWin && !hudWin.isDestroyed() && hudWin.isAlwaysOnTop()),
+    shortcutRegistered: hudShortcutRegistered,
+    menuHasHud: !!(Menu.getApplicationMenu() && Menu.getApplicationMenu().getMenuItemById('toggle-prime-hud')),
+    menuHasSplit: !!(Menu.getApplicationMenu() && Menu.getApplicationMenu().getMenuItemById('split-view')),
+  };
+});
+
 function buildMenu() {
-  const send = (id) => () => broadcast('menu-action', { id });
+  const send = (id) => () => sendMenuAction(id);
   const template = [
     { label: app.name, submenu: [
       { role: 'about' }, { type: 'separator' },
@@ -1483,20 +1655,99 @@ function buildMenu() {
       { type: 'separator' },
       { label: 'Restart All Agents', click: send('restart-agent') },
     ] },
-    { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' },
+    { role: 'editMenu' }, { role: 'viewMenu' },
+    { label: 'Window', submenu: [
+      { id: 'split-view', label: 'Split View', accelerator: 'CmdOrCtrl+Alt+S', enabled: true, click: send('split-view') },
+      { id: 'new-chat-split', label: 'New Chat in Split', accelerator: 'CmdOrCtrl+Alt+N', enabled: true, click: send('new-chat-split') },
+      { type: 'separator' },
+      { id: 'toggle-prime-hud', label: 'Show Prime HUD', accelerator: 'CmdOrCtrl+Alt+H', click: () => toggleHud() },
+      { type: 'separator' }, { role: 'minimize' }, { role: 'zoom' }, { type: 'separator' }, { role: 'front' },
+    ] },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+  updateHudMenuLabel();
+  updateSplitMenuItems();
 }
 
 // ---------- Boot ----------
 
+function registerHudShortcut() {
+  const accelerator = 'CommandOrControl+Shift+Space';
+  if (TEST_MODE && process.env.PRIME_DESKTOP_TEST_SHORTCUT_FAILURE !== '1') return false;
+  hudShortcutRegistrationAttempted = true;
+  if (TEST_MODE) hudShortcutRegistered = false;
+  else {
+    try {
+      const accepted = globalShortcut.register(accelerator, toggleHud);
+      hudShortcutRegistered = accepted === true && globalShortcut.isRegistered(accelerator);
+    } catch { hudShortcutRegistered = false; }
+  }
+  if (!hudShortcutRegistered) {
+    rememberSecurityEvent('hud-shortcut-unavailable', accelerator);
+    console.warn('PRIME_HUD_SHORTCUT_UNAVAILABLE', accelerator, 'menu and in-app fallbacks remain available');
+  }
+  return hudShortcutRegistered;
+}
+
+function activateMainWindow() {
+  const available = [...wins].filter((win) => win && !win.isDestroyed());
+  if (!available.length) return createWindow();
+  const target = focusedMainWindow() || available[0];
+  if (target.isMinimized()) target.restore();
+  target.show();
+  target.focus();
+  return target;
+}
+
+async function waitForTestCondition(predicate, timeoutMs = 8_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}
+
+async function runWindowLifecycleSmoke(firstWindow) {
+  // toggleHud was called before the HUD document loaded; the queued request must
+  // become a real, separate, always-on-top window once did-finish-load fires.
+  const opened = await waitForTestCondition(() => hudReady && hudWin && hudWin.isVisible());
+  const before = {
+    opened,
+    mainWindowCount: wins.size,
+    mainVisible: firstWindow && firstWindow.isVisible(),
+    hudSeparate: !!(hudWin && hudWin !== firstWindow),
+    hudAlwaysOnTop: !!(hudWin && hudWin.isAlwaysOnTop()),
+    menuFallback: !!(Menu.getApplicationMenu() && Menu.getApplicationMenu().getMenuItemById('toggle-prime-hud')),
+    shortcutRegistered: hudShortcutRegistered,
+  };
+  hideHud();
+  for (const win of [...wins]) if (!win.isDestroyed()) win.close();
+  const closed = await waitForTestCondition(() => wins.size === 0);
+  const hiddenHudSurvived = !!(hudWin && !hudWin.isDestroyed() && !hudWin.isVisible());
+  app.emit('activate');
+  const reactivated = await waitForTestCondition(() => wins.size === 1);
+  const replacement = [...wins][0];
+  const result = {
+    ...before,
+    closed,
+    hiddenHudSurvived,
+    reactivated,
+    replacementVisible: !!(replacement && replacement.isVisible()),
+  };
+  console.log('WINDOW_SMOKE_RESULT', JSON.stringify(result));
+  setTimeout(() => app.quit(), 50);
+}
+
 app.whenReady().then(async () => {
   buildMenu();
   createHud();
-  if (!TEST_MODE) globalShortcut.register('CommandOrControl+Shift+Space', toggleHud);
-  createWindow();
+  registerHudShortcut();
+  if (TEST_MODE && process.env.PRIME_DESKTOP_WINDOW_LIFECYCLE_SMOKE === '1') toggleHud();
+  const firstWindow = createWindow();
   watchSessions();
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+  app.on('activate', activateMainWindow);
+  if (TEST_MODE && process.env.PRIME_DESKTOP_WINDOW_LIFECYCLE_SMOKE === '1') void runWindowLifecycleSmoke(firstWindow);
 });
 
 app.on('window-all-closed', () => { /* HUD hotkey keeps app alive; Cmd+Q to quit */ });
