@@ -15,6 +15,12 @@ const { DaemonRpcAdapter, NoResidentSessionError, findPrimeAgentModuleEntry, lis
 const { WorkspaceService, activateWorkspaceForClient, isWithin } = require('./lib/workspace-service');
 const { AttachmentService, AttachmentError, sniffImageMime, parseFileTransport } = require('./lib/attachment-service');
 const { canonicalSessionPath, validateSessionHeader, safeDeleteSession, cleanupTrackedEmptySessions, countSessionMessages } = require('./lib/session-utils');
+const {
+  listSubagentsForParent,
+  mergeAgentLists,
+  normalizeLiveChild,
+  canonicalPrimeSessionPath,
+} = require('./lib/subagent-roster');
 const { tryAcquireFlag } = require('./lib/inflight-lock');
 const { classifyNavigation } = require('./lib/navigation-policy');
 const { SessionLifecycleRegistry } = require('./lib/session-lifecycle');
@@ -27,12 +33,15 @@ if (TEST_MODE) fs.mkdirSync(HOME_INPUT, { recursive: true });
 const HOME = fs.realpathSync(HOME_INPUT);
 if (TEST_MODE) app.setPath('userData', path.join(HOME, '.prime-desktop-test-user-data'));
 const SESSIONS_DIR = path.join(HOME, '.prime', 'agent', 'sessions');
+const PRIME_AGENT_DIR = path.join(HOME, '.prime', 'agent');
+const ARTIFACTS_DIR = path.join(PRIME_AGENT_DIR, 'session-artifacts');
 const COMMAND_TIMEOUT_MS = 30000;
 const MAX_CLIENTS = 8;
 const MAX_IPC_JSON_BYTES = 2 * 1024 * 1024;
 const WORKSPACE_STATE_PATH = path.join(app.getPath('userData'), 'workspaces.json');
 const DAEMON_LAUNCH = primeDaemonLaunchConfig();
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
 
 // ---------- Agent binary resolution ----------
 
@@ -545,7 +554,24 @@ secureHandle('rpc:activate', async (event, request = {}) => {
       let bound = false;
       try {
         if (request.sessionPath) {
-          const verified = await validateSessionHeader(SESSIONS_DIR, request.sessionPath);
+          // Top-level sessions and nested RLM sub-agent transcripts under session-artifacts.
+          const allowedPath = await canonicalPrimeSessionPath(PRIME_AGENT_DIR, request.sessionPath);
+          let verified = null;
+          try {
+            // Fast path for normal top-level sessions in ~/.prime/agent/sessions.
+            verified = await validateSessionHeader(SESSIONS_DIR, allowedPath);
+          } catch {
+            const headerLine = (await fsp.readFile(allowedPath, 'utf8')).split('\n').find((line) => line && line[0] === '{');
+            const header = headerLine ? JSON.parse(headerLine) : null;
+            if (!header || header.type !== 'session' || typeof header.id !== 'string') throw new Error('Session header is invalid');
+            if (typeof header.cwd !== 'string' || !path.isAbsolute(header.cwd)) throw new Error('Session project folder is invalid');
+            let cwd = header.cwd;
+            try {
+              cwd = await fsp.realpath(header.cwd);
+              if (!(await fsp.stat(cwd)).isDirectory()) throw new Error('missing');
+            } catch { throw new Error('The project folder for this session is no longer available'); }
+            verified = { sessionPath: allowedPath, header: { ...header, cwd } };
+          }
           sessionPath = verified.sessionPath;
           targetCwd = verified.header.cwd;
         } else {
@@ -700,6 +726,84 @@ function watchSessions() {
   } catch {}
 }
 
+
+async function listAgentsForFocusedSession(request = {}) {
+  const parentSessionPath = request.parentSessionPath || request.sessionPath || null;
+  const parentSessionId = request.parentSessionId || null;
+  let parentPath = null;
+  let parentId = parentSessionId;
+  if (parentSessionPath) {
+    try { parentPath = await canonicalPrimeSessionPath(PRIME_AGENT_DIR, parentSessionPath); }
+    catch {
+      try { parentPath = await canonicalSessionPath(SESSIONS_DIR, parentSessionPath); }
+      catch { parentPath = null; }
+    }
+  }
+  if (!parentId && parentPath) {
+    try {
+      const header = JSON.parse(fs.readFileSync(parentPath, 'utf8').split('\n').find((line) => line && line[0] === '{') || 'null');
+      if (header && header.id) parentId = header.id;
+    } catch {}
+  }
+
+  const fromDisk = listSubagentsForParent(PRIME_AGENT_DIR, {
+    parentSessionPath: parentPath,
+    parentSessionId: parentId,
+  });
+
+  let fromLive = [];
+  if (parentPath) {
+    const client = clients.get(parentPath);
+    if (client && client.alive && client.rpc && typeof client.rpc.command === 'function') {
+      try {
+        const response = await clientCommand(client, { type: 'list_agents' });
+        const data = response && response.success ? response.data : null;
+        const raw = data && (data.agents || data.children || data.subagents || data);
+        const list = Array.isArray(raw) ? raw : [];
+        fromLive = list.map((item) => normalizeLiveChild(item)).filter(Boolean);
+      } catch {}
+    }
+  }
+
+  const agents = mergeAgentLists(fromDisk, fromLive).map((agent) => ({
+    id: agent.id,
+    childId: agent.childId,
+    name: agent.name,
+    label: agent.label,
+    status: agent.status,
+    running: !!agent.running,
+    model: agent.model,
+    recap: agent.recap ? boundedText(agent.recap, 280) : null,
+    prompt: agent.prompt ? boundedText(agent.prompt, 280) : null,
+    sessionFile: agent.sessionFile || agent.path || null,
+    path: agent.sessionFile || agent.path || null,
+    parentSessionFile: agent.parentSessionFile || parentPath,
+    rlmDepth: agent.rlmDepth,
+    tokenCount: agent.tokenCount,
+    toolUseCount: agent.toolUseCount,
+    activity: agent.activity || null,
+    error: agent.error ? boundedText(agent.error, 200) : null,
+    updatedAt: agent.updatedAt,
+    source: agent.source,
+    kind: 'subagent',
+  }));
+
+  return {
+    ok: true,
+    parentSessionPath: parentPath,
+    parentSessionId: parentId,
+    agents,
+    runningCount: agents.filter((agent) => agent.running).length,
+  };
+}
+
+secureHandle('agents:list', async (_event, request = {}) => {
+  try {
+    assertSmallDto(request, 16 * 1024);
+    return await listAgentsForFocusedSession(request || {});
+  } catch (error) { return publicError(error, 'Could not list agents'); }
+});
+
 secureHandle('sessions:list', () => listSessions());
 secureHandle('sessions:delete', async (_event, sessionPath) => {
   try {
@@ -730,7 +834,7 @@ secureHandle('sessions:delete', async (_event, sessionPath) => {
 secureHandle('sessions:tail', async (_event, request) => {
   try {
     assertSmallDto(request, 16 * 1024);
-    const sessionPath = await canonicalSessionPath(SESSIONS_DIR, request && request.path);
+    const sessionPath = await canonicalPrimeSessionPath(PRIME_AGENT_DIR, request && request.path);
     const maximum = Math.max(1, Math.min(Number(request.max) || 50, 100));
     const messages = [];
     for (const line of (await fsp.readFile(sessionPath, 'utf8')).split('\n')) {

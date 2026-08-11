@@ -122,3 +122,10 @@ test("app quit detaches clients without killing agent workers", () => {
   assert.match(rpc, /killProcess/);
   assert.match(rpc, /reason !== "app-quit"/);
 });
+
+test("agents list is a dedicated IPC surface", () => {
+  assert.match(main, /secureHandle\('agents:list'/);
+  assert.match(main, /listSubagentsForParent/);
+  assert.match(main, /canonicalPrimeSessionPath/);
+  assert.match(preload, /listAgents:/);
+});

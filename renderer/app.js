@@ -1116,6 +1116,10 @@ class Pane {
   // ---------- event handling ----------
   handleEvent(ev) {
     switch (ev.type) {
+      case 'rlm_child_update': {
+        if (G.focused === this) void refreshLiveAgents(this);
+        break;
+      }
       case 'session_resynced': {
         const state = ev.state || {};
         this.isStreaming = !!state.isStreaming;
@@ -1626,32 +1630,60 @@ function renderSubagents() {
 }
 
 async function refreshLiveAgents(pane = G.focused) {
-  if (!pane || !pane.key || !pane.ready) {
+  const sessionPath = pane && (pane.sessionFile || (pane.state && pane.state.sessionFile)) || null;
+  if (!pane) {
     G.liveAgents = [];
     renderSubagents();
+    renderAgentsDashboard();
     return;
   }
   try {
-    const [agents, active] = await Promise.all([
-      prime.command(pane.key, { type: 'list_agents' }).catch(() => ({ success: false })),
-      prime.command(pane.key, { type: 'get_active_subagents' }).catch(() => ({ success: false })),
-    ]);
-    const list = [];
-    const pushAll = (value) => {
-      if (!value) return;
-      if (Array.isArray(value)) list.push(...value);
-      else if (Array.isArray(value.agents)) list.push(...value.agents);
-      else if (Array.isArray(value.subagents)) list.push(...value.subagents);
-      else if (Array.isArray(value.children)) list.push(...value.children);
-    };
-    if (agents && agents.success) pushAll(agents.data);
-    if (active && active.success) pushAll(active.data);
-    // Dedupe by id/name/sessionFile
+    // Main process merges: (1) session-artifacts rlm-subagents.jsonl roster
+    // (2) live daemon snapshot / rlm_child_update children for the attached client.
+    const result = await prime.listAgents({ parentSessionPath: sessionPath }).catch(() => null);
+    let list = (result && result.ok && Array.isArray(result.agents)) ? result.agents : [];
+
+    // Also ask the live client directly so mid-run updates still surface if disk lags.
+    if (pane.key && pane.ready) {
+      try {
+        const [agents, active] = await Promise.all([
+          prime.command(pane.key, { type: 'list_agents' }).catch(() => ({ success: false })),
+          prime.command(pane.key, { type: 'get_active_subagents' }).catch(() => ({ success: false })),
+        ]);
+        const extra = [];
+        const pushAll = (value) => {
+          if (!value) return;
+          if (Array.isArray(value)) extra.push(...value);
+          else if (Array.isArray(value.agents)) extra.push(...value.agents);
+          else if (Array.isArray(value.subagents)) extra.push(...value.subagents);
+          else if (Array.isArray(value.children)) extra.push(...value.children);
+        };
+        if (agents && agents.success) pushAll(agents.data);
+        if (active && active.success) pushAll(active.data);
+        for (const agent of extra) {
+          if (!agent || typeof agent !== 'object') continue;
+          list.push({
+            id: agent.id || agent.childId || agent.sessionName || agent.label,
+            childId: agent.id || agent.childId || null,
+            name: agent.sessionName || agent.label || agent.name || agent.id || 'sub-agent',
+            status: agent.status || 'unknown',
+            running: ['running', 'queued', 'streaming', 'starting'].includes(String(agent.status || '').toLowerCase()),
+            model: agent.model || null,
+            recap: agent.recap || agent.answerPreview || null,
+            sessionFile: agent.sessionFile || null,
+            path: agent.sessionFile || null,
+            sessionDir: agent.sessionDir || null,
+            source: 'live-client',
+          });
+        }
+      } catch {}
+    }
+
     const seen = new Set();
     G.liveAgents = list.filter((agent) => {
       if (!agent || typeof agent !== 'object') return false;
-      const key = String(agent.id || agent.sessionFile || agent.path || agent.name || JSON.stringify(agent)).slice(0, 300);
-      if (seen.has(key)) return false;
+      const key = String(agent.childId || agent.id || agent.sessionFile || agent.path || agent.name || '').slice(0, 300);
+      if (!key || seen.has(key)) return false;
       seen.add(key);
       return true;
     });
@@ -1677,31 +1709,76 @@ function agentSessionPath(agentOrSession) {
   return agentOrSession.path || agentOrSession.sessionFile || agentOrSession.session_path || null;
 }
 
-async function openSubagentViewer(sessionOrAgent) {
+async function openSubagentViewer(sessionOrAgent, { preferOpenSession = false } = {}) {
   currentViewerFile = null;
   const path = agentSessionPath(sessionOrAgent);
-  const label = (sessionOrAgent && (sessionOrAgent.name || sessionOrAgent.id || sessionOrAgent.role)) || (path ? path.split('/').pop() : 'worker');
+  const label = (sessionOrAgent && (sessionOrAgent.name || sessionOrAgent.label || sessionOrAgent.id || sessionOrAgent.role)) || (path ? path.split('/').pop() : 'worker');
+  const status = sessionOrAgent && (sessionOrAgent.status || (sessionOrAgent.running ? 'running' : ''));
+
+  // Full navigation into the child run when requested and a session file exists.
+  if (preferOpenSession && path) {
+    closeAgentsDashboard();
+    await openSessionFromSidebar(path);
+    return;
+  }
+
   $('#viewer-add-chat').classList.add('hidden');
-  $('#viewer-title').textContent = (path ? 'Agent — ' : 'Worker — ') + label + ' (live)';
+  $('#viewer-title').textContent = `Agent — ${label}${status ? ' · ' + status : ''}`;
   $('#viewer-backdrop').classList.remove('hidden');
   const body = $('#viewer-body');
   const render = async () => {
     body.innerHTML = '';
+    // Header actions
+    const actions = document.createElement('div');
+    actions.className = 'viewer-actions';
+    actions.style.cssText = 'display:flex;gap:8px;margin:0 0 12px;flex-wrap:wrap;';
+    if (path) {
+      const openBtn = document.createElement('button');
+      openBtn.className = 's-btn';
+      openBtn.textContent = 'Open live session';
+      openBtn.onclick = () => { closeAgentsDashboard(); $('#viewer-backdrop').classList.add('hidden'); void openSessionFromSidebar(path); };
+      actions.appendChild(openBtn);
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 's-btn';
+      copyBtn.textContent = 'Copy path';
+      copyBtn.onclick = async () => { try { await navigator.clipboard.writeText(path); copyBtn.textContent = 'Copied'; } catch {} };
+      actions.appendChild(copyBtn);
+    }
+    body.appendChild(actions);
+
+    if (sessionOrAgent && (sessionOrAgent.recap || sessionOrAgent.prompt || sessionOrAgent.model)) {
+      const meta = document.createElement('div');
+      meta.className = 's-help';
+      meta.style.marginBottom = '10px';
+      meta.innerHTML = [
+        sessionOrAgent.model ? `<div><strong>Model</strong> · ${esc(sessionOrAgent.model)}</div>` : '',
+        sessionOrAgent.recap ? `<div><strong>Recap</strong> · ${esc(sessionOrAgent.recap)}</div>` : '',
+        sessionOrAgent.prompt ? `<div><strong>Task</strong> · ${esc(String(sessionOrAgent.prompt).slice(0, 400))}</div>` : '',
+        sessionOrAgent.activity ? `<div><strong>Activity</strong> · ${esc(JSON.stringify(sessionOrAgent.activity))}</div>` : '',
+      ].join('');
+      body.appendChild(meta);
+    }
+
     if (!path) {
-      // No session file — show structured snapshot of the worker descriptor.
       const pre = document.createElement('pre');
       pre.className = 'viewer-pre';
       pre.textContent = JSON.stringify(sessionOrAgent, null, 2);
       body.appendChild(pre);
       return;
     }
-    const r = await prime.sessionTail(path, 80);
+    const r = await prime.sessionTail(path, 120);
     if (!r.ok) {
-      body.innerHTML = `<p class="s-help">${esc(r.error || 'Could not load agent transcript')}</p>`;
+      const err = document.createElement('p');
+      err.className = 's-help';
+      err.textContent = r.error || 'Could not load agent transcript';
+      body.appendChild(err);
       return;
     }
     if (!r.messages || !r.messages.length) {
-      body.innerHTML = '<p class="s-help">No messages yet — worker may still be starting.</p>';
+      const empty = document.createElement('p');
+      empty.className = 's-help';
+      empty.textContent = 'No messages yet — worker may still be starting.';
+      body.appendChild(empty);
       return;
     }
     for (const msg of r.messages) {
@@ -1756,16 +1833,23 @@ function renderAgentRows(host, rows, emptyText) {
         <div class="ar-meta">${esc(row.meta || '')}</div>
       </span>
       <span class="ar-status ${running ? 'running' : 'idle'}">${esc(status)}</span>`;
-    el.onclick = () => {
+    el.onclick = (event) => {
+      if ((event.metaKey || event.ctrlKey || event.shiftKey) && row.path) {
+        closeAgentsDashboard();
+        void openSessionFromSidebar(row.path);
+        return;
+      }
       if (row.open === 'session' && row.path) void openSessionFromSidebar(row.path);
       else void openSubagentViewer(row.source || row);
     };
+    el.title = row.path ? 'Click to inspect · ⌘/Ctrl-click to open live session' : 'Inspect agent';
     host.appendChild(el);
   }
 }
 
 async function openAgentsDashboard() {
   $('#agents-backdrop').classList.remove('hidden');
+  ensureLiveAgentPolling();
   await refreshLiveAgents(G.focused);
   renderAgentsDashboard();
 }
@@ -1777,15 +1861,27 @@ function closeAgentsDashboard() {
 function renderAgentsDashboard() {
   if ($('#agents-backdrop').classList.contains('hidden')) return;
   const focusedPath = (G.focused && G.focused.sessionFile) || null;
-  const live = (G.liveAgents || []).map((agent) => ({
-    name: agent.name || agent.id || agent.role || 'worker',
-    meta: [agent.model, agent.detail, agent.sessionFile || agent.path].filter(Boolean).map(String).join(' · ').slice(0, 120),
-    status: agent.status || agent.state || (agent.isStreaming || agent.busy ? 'running' : 'idle'),
-    running: !!(agent.isStreaming || agent.busy || agent.status === 'running'),
-    path: agent.sessionFile || agent.path || null,
-    source: agent,
-    open: (agent.sessionFile || agent.path) ? 'viewer' : 'viewer',
-  }));
+  const sessionPath = focusedPath;
+  const live = (G.liveAgents || []).map((agent) => {
+    const running = !!(agent.running || agent.isStreaming || agent.busy || ['running', 'queued', 'streaming', 'starting'].includes(String(agent.status || '').toLowerCase()));
+    const metaParts = [
+      agent.model,
+      agent.recap || agent.detail || agent.prompt,
+      running ? null : agent.status,
+      agent.sessionFile || agent.path ? 'has transcript' : 'no transcript path',
+    ].filter(Boolean).map(String);
+    return {
+      name: agent.name || agent.label || agent.id || agent.role || 'worker',
+      meta: metaParts.join(' · ').slice(0, 160),
+      status: agent.status || agent.state || (running ? 'running' : 'idle'),
+      running,
+      path: agent.sessionFile || agent.path || null,
+      source: agent,
+      open: 'viewer',
+    };
+  });
+  // Sort running first
+  live.sort((a, b) => Number(b.running) - Number(a.running));
   const children = collectChildSessions(focusedPath).map((s) => ({
     name: s.name || s.preview || s.id || 'child session',
     meta: `${baseName(s.cwd)} · depth ${s.rlmDepth || 0} · ${s.messageCount} msgs`,
@@ -1804,7 +1900,7 @@ function renderAgentsDashboard() {
     source: s,
     open: 'session',
   }));
-  renderAgentRows($('#agents-live-list'), live, 'No live nested workers on the focused session.');
+  renderAgentRows($('#agents-live-list'), live, sessionPath ? 'No sub-agents recorded for this chat yet. When the agent spawns children, they appear here.' : 'Focus a chat first — then sub-agents for that run show up here.');
   renderAgentRows($('#agents-child-list'), children, 'No child sessions linked to this chat yet.');
   renderAgentRows($('#agents-related-list'), related, 'No other resident/related agent sessions.');
 }

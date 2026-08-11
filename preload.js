@@ -36,6 +36,7 @@ contextBridge.exposeInMainWorld('prime', {
   releasePane: (key, paneId, bindingEpoch) => ipcRenderer.invoke('pane:release', { key, paneId, bindingEpoch }),
 
   listSessions: () => ipcRenderer.invoke('sessions:list'),
+  listAgents: (request) => ipcRenderer.invoke('agents:list', request || {}),
   deleteSession: (sessionPath) => ipcRenderer.invoke('sessions:delete', sessionPath),
   sessionTail: (sessionPath, max) => ipcRenderer.invoke('sessions:tail', { path: sessionPath, max }),
 
