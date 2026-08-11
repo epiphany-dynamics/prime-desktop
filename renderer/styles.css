@@ -754,10 +754,11 @@ body.split .pane-split:disabled { max-width: none; }
 
 /* ---------- Agents dashboard ---------- */
 #agents-backdrop {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 90;
+  position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 200;
   display: flex; align-items: center; justify-content: center;
 }
-#agents-backdrop.hidden { display: none !important; }
+#agents-backdrop.hidden { display: none !important; visibility: hidden !important; }
+#agents-btn.active { color: var(--text); background: rgba(255,255,255,0.06); }
 #agents-panel {
   background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 12px;
   width: 720px; max-width: 94vw; height: 620px; max-height: 88vh;

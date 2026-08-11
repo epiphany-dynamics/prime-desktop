@@ -1483,7 +1483,7 @@ function renderSidebar() {
     const paneHere = G.panes.find((p) => p.sessionFile === s.path);
     const isActive = !!(activeSessionPath && s.path === activeSessionPath);
     const item = document.createElement('div');
-    item.className = 'session-item' + (s.isSubagent || (s.rlmDepth > 0 && s.parentSession) ? ' subagent-session' : '') + (isActive ? ' active' : '');
+    item.className = 'session-item' + (isActive ? ' active' : '');
     item.tabIndex = 0;
     item.draggable = true;
     item.addEventListener('dragstart', (e) => {
@@ -1708,6 +1708,13 @@ async function refreshLiveAgents(pane = G.focused) {
       const seen = new Set();
       G.liveAgents = list.filter((agent) => {
         if (!agent || typeof agent !== 'object') return false;
+        const status = String(agent.status || '').toLowerCase();
+        // Keep running/queued always. Keep finished for a few minutes so the panel isn't empty the second a child ends.
+        // Drop long-dead deleted rows so the panel matches Hermes "live spawn tree" feel.
+        if (status === 'deleted' && !agent.running) {
+          const age = Date.now() - (Date.parse(agent.updatedAt || 0) || 0);
+          if (age > 2 * 60 * 1000) return false;
+        }
         const key = String(agent.childId || agent.id || agent.sessionFile || agent.path || agent.name || '').slice(0, 300);
         if (!key || seen.has(key)) return false;
         seen.add(key);
@@ -1742,8 +1749,6 @@ function ensureLiveAgentPolling() {
     }
   }, 500);
 }
-// Always start polling once the app is up.
-ensureLiveAgentPolling();
 
 let subagentPoll = null;
 let currentViewerFile = null;
@@ -1891,62 +1896,108 @@ function renderAgentRows(host, rows, emptyText) {
   }
 }
 
-async function openAgentsDashboard() {
-  $('#agents-backdrop').classList.remove('hidden');
-  ensureLiveAgentPolling();
-  await refreshLiveAgents(G.focused);
-  renderAgentsDashboard();
+function agentsEls() {
+  return {
+    backdrop: document.getElementById('agents-backdrop'),
+    panel: document.getElementById('agents-panel'),
+    live: document.getElementById('agents-live-list'),
+    children: document.getElementById('agents-child-list'),
+    related: document.getElementById('agents-related-list'),
+    btn: document.getElementById('agents-btn'),
+    close: document.getElementById('agents-close'),
+    refresh: document.getElementById('agents-refresh'),
+  };
+}
+
+function openAgentsDashboard() {
+  // Open FIRST — never block the panel on data fetch (Hermes spawn-tree model).
+  const els = agentsEls();
+  if (!els.backdrop) {
+    console.error('Agents panel missing from DOM');
+    return;
+  }
+  els.backdrop.classList.remove('hidden');
+  els.backdrop.style.display = 'flex';
+  els.backdrop.setAttribute('aria-hidden', 'false');
+  if (els.btn) els.btn.classList.add('active');
+  try { ensureLiveAgentPolling(); } catch (err) { console.error(err); }
+  // Fill immediately from cache, then refresh.
+  try { renderAgentsDashboard(); } catch (err) { console.error(err); }
+  void refreshLiveAgents(G.focused).then(() => {
+    try { renderAgentsDashboard(); } catch (err) { console.error(err); }
+  }).catch((err) => console.error(err));
 }
 
 function closeAgentsDashboard() {
-  $('#agents-backdrop').classList.add('hidden');
+  const els = agentsEls();
+  if (!els.backdrop) return;
+  els.backdrop.classList.add('hidden');
+  els.backdrop.style.display = '';
+  els.backdrop.setAttribute('aria-hidden', 'true');
+  if (els.btn) els.btn.classList.remove('active');
 }
 
 function renderAgentsDashboard() {
-  if ($('#agents-backdrop').classList.contains('hidden')) return;
+  const els = agentsEls();
+  if (!els.backdrop || els.backdrop.classList.contains('hidden')) return;
   const focusedPath = (G.focused && G.focused.sessionFile) || null;
-  const sessionPath = focusedPath;
+  const bn = (typeof baseName === 'function')
+    ? baseName
+    : (value) => {
+      const text = String(value || '');
+      const parts = text.split(/[/\\]/);
+      return parts[parts.length - 1] || text || '—';
+    };
+
+  // Hermes-style: one primary list = live / recent sub-agents for this turn/chat.
   const live = (G.liveAgents || []).map((agent) => {
-    const running = !!(agent.running || agent.isStreaming || agent.busy || ['running', 'queued', 'streaming', 'starting'].includes(String(agent.status || '').toLowerCase()));
+    const status = String(agent.status || agent.state || '').toLowerCase();
+    const running = !!(agent.running || agent.isStreaming || agent.busy
+      || ['running', 'queued', 'streaming', 'starting'].includes(status));
     const metaParts = [
       agent.model,
       agent.recap || agent.detail || agent.prompt,
-      running ? null : agent.status,
-      agent.sessionFile || agent.path ? 'has transcript' : 'no transcript path',
+      status && status !== 'unknown' ? status : null,
     ].filter(Boolean).map(String);
     return {
-      name: agent.name || agent.label || agent.id || agent.role || 'worker',
+      name: agent.name || agent.label || agent.id || agent.role || 'sub-agent',
       meta: metaParts.join(' · ').slice(0, 160),
-      status: agent.status || agent.state || (running ? 'running' : 'idle'),
+      status: status || (running ? 'running' : 'idle'),
       running,
       path: agent.sessionFile || agent.path || null,
       source: agent,
       open: 'viewer',
     };
   });
-  // Sort running first
   live.sort((a, b) => Number(b.running) - Number(a.running));
+
+  // Secondary: disk-linked children only (same parent), not every random session.
   const children = collectChildSessions(focusedPath).map((s) => ({
     name: s.name || s.preview || s.id || 'child session',
-    meta: `${baseName(s.cwd)} · depth ${s.rlmDepth || 0} · ${s.messageCount} msgs`,
+    meta: `${bn(s.cwd)} · depth ${s.rlmDepth || 0} · ${s.messageCount || 0} msgs`,
     status: s.daemonStreaming ? 'running' : (s.daemonResident ? 'resident' : 'idle'),
     running: !!s.daemonStreaming,
     path: s.path,
     source: s,
     open: 'viewer',
   }));
-  const related = collectRelatedSessions(focusedPath).map((s) => ({
-    name: s.name || s.preview || s.id || 'session',
-    meta: `${baseName(s.cwd)} · ${s.messageCount} msgs${s.daemonResident ? ' · terminal' : ''}`,
-    status: s.daemonStreaming ? 'running' : (s.daemonResident ? 'resident' : 'idle'),
-    running: !!s.daemonStreaming,
-    path: s.path,
-    source: s,
-    open: 'session',
-  }));
-  renderAgentRows($('#agents-live-list'), live, sessionPath ? 'No sub-agents recorded for this chat yet. When the agent spawns children, they appear here.' : 'Focus a chat first — then sub-agents for that run show up here.');
-  renderAgentRows($('#agents-child-list'), children, 'No child sessions linked to this chat yet.');
-  renderAgentRows($('#agents-related-list'), related, 'No other resident/related agent sessions.');
+
+  if (els.live) {
+    renderAgentRows(
+      els.live,
+      live,
+      focusedPath
+        ? 'No live sub-agents on this chat yet. When the run spawns children, they appear here instantly.'
+        : 'Open a chat first. Sub-agents for that run show up here while they work.',
+    );
+  }
+  if (els.children) {
+    renderAgentRows(els.children, children, 'No linked child sessions for this chat.');
+  }
+  // Related list intentionally unused in the simplified Hermes-like panel.
+  if (els.related) {
+    els.related.innerHTML = '';
+  }
 }
 
 // ---------------- projects / worktrees ----------------
@@ -2657,15 +2708,35 @@ $('#save-defaults-btn').onclick = async () => {
   alert(r.ok ? 'Defaults saved.' : 'Save failed: ' + r.error);
 };
 
-if ($('#agents-btn')) {
-  $('#agents-btn').onclick = () => void openAgentsDashboard();
-  $('#agents-close').onclick = closeAgentsDashboard;
-  $('#agents-refresh').onclick = async () => { await refreshLiveAgents(G.focused); renderAgentsDashboard(); };
-  $('#agents-backdrop').onclick = (e) => { if (e.target === $('#agents-backdrop')) closeAgentsDashboard(); };
-}
-$('#capabilities-btn').onclick = openCapabilities;
-$('#capabilities-close').onclick = () => $('#capabilities-backdrop').classList.add('hidden');
-$('#capabilities-backdrop').onclick = (e) => { if (e.target === $('#capabilities-backdrop')) $('#capabilities-backdrop').classList.add('hidden'); };
+(function wireAgentsPanel() {
+  const els = agentsEls();
+  if (els.btn) {
+    els.btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openAgentsDashboard();
+    });
+  } else {
+    console.error('agents-btn missing — Agents panel cannot open');
+  }
+  if (els.close) els.close.addEventListener('click', (event) => { event.preventDefault(); closeAgentsDashboard(); });
+  if (els.refresh) {
+    els.refresh.addEventListener('click', async (event) => {
+      event.preventDefault();
+      await refreshLiveAgents(G.focused);
+      renderAgentsDashboard();
+    });
+  }
+  if (els.backdrop) {
+    els.backdrop.addEventListener('click', (event) => {
+      if (event.target === els.backdrop) closeAgentsDashboard();
+    });
+  }
+})();
+if ($('#capabilities-btn')) $('#capabilities-btn').onclick = openCapabilities;
+else console.error('capabilities-btn missing');
+if ($('#capabilities-close')) $('#capabilities-close').onclick = () => $('#capabilities-backdrop').classList.add('hidden');
+if ($('#capabilities-backdrop')) $('#capabilities-backdrop').onclick = (e) => { if (e.target === $('#capabilities-backdrop')) $('#capabilities-backdrop').classList.add('hidden'); };
 document.querySelectorAll('.ctab').forEach((b) => {
   b.onclick = () => {
     document.querySelectorAll('.ctab').forEach((x) => x.classList.toggle('active', x === b));

@@ -234,13 +234,12 @@
         </span>
       </div>
       <div class="panel-body" id="agents-body">
-        <p class="s-help">Every sub-agent and child run for the focused chat. Click a row to inspect the transcript. ⌘/Ctrl-click opens it as the main session.</p>
-        <div class="section-label">SUB-AGENTS / LIVE WORKERS</div>
+        <p class="s-help">Live sub-agent spawn tree for the focused chat (Hermes-style). Click a row to inspect; ⌘/Ctrl-click opens the child run.</p>
+        <div class="section-label">LIVE SUB-AGENTS</div>
         <div id="agents-live-list"></div>
         <div class="section-label" style="margin-top:14px">LINKED CHILD SESSIONS</div>
         <div id="agents-child-list"></div>
-        <div class="section-label" style="margin-top:14px">OTHER RESIDENT / RELATED</div>
-        <div id="agents-related-list"></div>
+        <div id="agents-related-list" class="hidden"></div>
       </div>
     </div>
   </div>
