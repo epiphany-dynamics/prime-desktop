@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.5 — 2026-08-11
+
+### Critical
+
+- Sessions keep running when Desktop quits/restarts (resident daemon workers)
+- Fixes false "not running" after UI reinstall/reopen
+- Live Agents panel path retained from 0.6.4 work
+
+
 ## 0.6.4 — 2026-08-11
 
 ### Critical: sessions survive Desktop quit
