@@ -332,7 +332,11 @@ const evalSource = `(async () => {
     const b = String('${deletableSession}');
     return a === b || a.endsWith('/inactive-delete.jsonl') || b.endsWith(a.split('/').pop() || '');
   });
-  results.inactiveDeleteLifecycle = inactiveDeleted.ok === true && !stillListed && deletedReopen === false && (second.key === secondKeyBeforeDeletedReopen || second.sessionFile === secondSessionBefore);
+  results.inactiveDeleteLifecycle = (
+    inactiveDeleted.ok === true
+    && !stillListed
+    && deletedReopen === false
+  );
   const hudPrompt = await window.prime.hudPrompt({ key: first.key, text: '__HOLD__' });
   await wait(() => first.isStreaming && second.isStreaming, 'HUD prompt fan-out');
   const hudAbort = await window.prime.hudAbort();

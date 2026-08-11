@@ -502,7 +502,7 @@ class Pane {
     this.hideSuggestions();
     // Prefer activation payload state first (covers daemon attach race before get_state).
     if (response.state) {
-      this.isStreaming = !!response.state.isStreaming;
+      this.isStreaming = !!(response.state.isStreaming || response.state.isRunningTools || response.state.hasRunningRlmChildren || response.state.streamingMessage);
       this.model = response.state.model || this.model;
       this.thinkingLevel = response.state.thinkingLevel || this.thinkingLevel;
       if (response.state.sessionFile) this.sessionFile = response.state.sessionFile;
@@ -510,13 +510,23 @@ class Pane {
     // Paint the shell immediately so clicks feel instant.
     this.chatEl.innerHTML = '';
     this.emptyEl.classList.add('hidden');
-    this.setAgentState('Loading…');
+    this.setAgentState(this.isStreaming ? 'working…' : 'Loading…');
     this.ready = true;
     this.updateTopbar();
     this.updateComposer();
     renderSidebar();
+    // Clear stale "agent stopped" banners when we successfully reattached to a live worker.
+    if (this.isStreaming) this.setBanner(null);
     if (response.warning) this.setBanner(response.warning, false);
-    else showHudShortcutWarning(this);
+    else if (!this.isStreaming) showHudShortcutWarning(this);
+
+    // If attach already included an in-flight assistant message, show it immediately.
+    const earlyStream = response.state && response.state.streamingMessage;
+    if (this.isStreaming && earlyStream && earlyStream.role === 'assistant') {
+      this.beginStream();
+      this.syncStreamFromMessage(earlyStream);
+      this.scheduleStreamRender();
+    }
 
     // Background hydrate: state + history + agents. Abort if user clicked away.
     const hydrateId = requestId;
@@ -2994,7 +3004,13 @@ prime.onRpcExit(({ key, code, error }) => {
     pane.isStreaming = false;
     pane.endStream();
     pane.updateComposer();
-    pane.setBanner(`${error || 'Agent connection closed'} (code ${code}). Click to restart.`, true);
+    // Desktop detach/quit should not look like a dead agent — user can reopen the session.
+    const msg = String(error || '');
+    if (/detach|Desktop detached|app-quit/i.test(msg)) {
+      pane.setBanner('Disconnected from agent UI — session may still be running. Click the session to reattach.', false);
+    } else {
+      pane.setBanner(`${error || 'Agent connection closed'} (code ${code}). Click to restart.`, true);
+    }
     pane.bannerEl.style.cursor = 'pointer';
     pane.bannerEl.onclick = recover;
   }

@@ -462,9 +462,14 @@ function describeActivation(context, state, options = {}) {
 async function stateForClient(client) {
   const response = await clientCommand(client, { type: 'get_state' });
   if (!response.success) throw new Error(response.error || 'Agent state is unavailable');
-  client.streaming = !!response.data.isStreaming;
-  client.sessionFile = response.data.sessionFile || client.sessionFile;
-  return response.data;
+  const data = response.data || {};
+  // If tools/children are running, surface as streaming so the UI rehydrates the live turn.
+  if (!data.isStreaming && (data.isRunningTools || data.hasRunningRlmChildren || data.isCompacting)) {
+    data.isStreaming = true;
+  }
+  client.streaming = !!data.isStreaming;
+  client.sessionFile = data.sessionFile || client.sessionFile;
+  return data;
 }
 async function requireIdleClient(client, action) {
   const state = await stateForClient(client);
@@ -729,7 +734,19 @@ async function listSessions() {
         const localClient = clients.get(session.path);
         if (!resident || (localClient && localClient.alive && localClient.transport === 'rpc-process')) continue;
         session.daemonResident = true;
-        session.daemonStreaming = !!resident.isStreaming;
+        // Prime may report work via several flags — treat any as "live" for the sidebar.
+        const liveWork = !!(
+          resident.isStreaming
+          || resident.isRunningTools
+          || resident.hasRunningRlmChildren
+          || resident.isCompacting
+          || resident.activity === 'working'
+          || resident.activity === 'streaming'
+          || (Number(resident.unfinishedActionCount) > 0 && resident.isSessionActive)
+        );
+        session.daemonStreaming = liveWork;
+        session.daemonActivity = resident.activity || null;
+        session.daemonIsSessionActive = !!resident.isSessionActive;
         const attachedClients = Number(resident.attachedClients || 0);
         session.daemonAttachedClients = Number.isSafeInteger(attachedClients) ? Math.max(0, Math.min(attachedClients, 10_000)) : 0;
       }
