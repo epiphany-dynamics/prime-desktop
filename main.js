@@ -21,6 +21,7 @@ const {
   normalizeLiveChild,
   canonicalPrimeSessionPath,
 } = require('./lib/subagent-roster');
+const { createSessionIndex } = require('./lib/session-index');
 const { tryAcquireFlag } = require('./lib/inflight-lock');
 const { classifyNavigation } = require('./lib/navigation-policy');
 const { SessionLifecycleRegistry } = require('./lib/session-lifecycle');
@@ -42,6 +43,11 @@ const WORKSPACE_STATE_PATH = path.join(app.getPath('userData'), 'workspaces.json
 const DAEMON_LAUNCH = primeDaemonLaunchConfig();
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
+const sessionIndex = createSessionIndex({
+  sessionsRoot: SESSIONS_DIR,
+  canonicalSessionPath: (root, candidate) => canonicalSessionPath(root, candidate),
+});
+
 
 // ---------- Agent binary resolution ----------
 
@@ -327,7 +333,8 @@ async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspa
     }
     const reported = ready.data && ready.data.sessionFile;
     if (typeof reported !== 'string') throw new Error('Agent did not report a session file');
-    const canonicalSession = await canonicalSessionPath(SESSIONS_DIR, reported);
+    // Allow top-level sessions and nested RLM child transcripts under session-artifacts.
+    const canonicalSession = await canonicalPrimeSessionPath(PRIME_AGENT_DIR, reported);
     if (sessionPath && canonicalSession !== sessionPath) throw new Error('Agent resumed a different session than requested');
     client.sessionFile = canonicalSession;
     client.key = canonicalSession;
@@ -581,16 +588,17 @@ secureHandle('rpc:activate', async (event, request = {}) => {
         const existingBefore = new Set(clients.values());
         client = await ensureClient({ sessionPath, cwd: targetCwd, ownerWin });
         clientWasExisting = existingBefore.has(client);
+        // Only re-check local pane locks; do not pay another get_state round-trip here.
+        if (priorContext) assertPaneLocallyIdle(priorContext, 'changing sessions');
         const state = await stateForClient(client);
-        await requirePaneProjectIdle(priorContext, 'changing sessions', { allowStreaming: allowStreamingLeave });
         const preserveDraft = !!(priorContext && priorContext.client.sessionFile === client.sessionFile);
         const context = bindPane(event, request.paneId, client, { preserveDraft });
         bound = true;
         if (priorContext && priorContext.client !== client) {
-          // Detach Desktop's view of the prior session; do not stop a live worker.
+          // Detach in the background. Waiting here made session clicks feel like 10–20s.
           // Process RPC clients keep running until idle eviction; daemon attachments
           // detach only when no pane/HUD still references them.
-          await releaseUnreferencedDaemonClient(priorContext.client, 'last desktop pane switched sessions');
+          void releaseUnreferencedDaemonClient(priorContext.client, 'last desktop pane switched sessions');
         }
         if (ownerWin) lastFocusedMainWin = ownerWin;
         return describeActivation(context, state, { preservedDraft: preserveDraft });
@@ -644,54 +652,17 @@ async function cleanupAutoCreatedSessions() {
 
 // ---------- Session listing ----------
 
+let residentSessionsCache = { at: 0, value: [] };
+async function getResidentSessionsCached(moduleEntry) {
+  const now = Date.now();
+  if (now - residentSessionsCache.at < 2000 && residentSessionsCache.value) return residentSessionsCache.value;
+  const residents = await getResidentSessionsCached(moduleEntry);
+  residentSessionsCache = { at: now, value: residents };
+  return residents;
+}
 async function listSessions() {
-  let files;
-  try { files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.jsonl')); }
-  catch { return []; }
-  const out = [];
-  for (const f of files) {
-    try {
-      const p = await canonicalSessionPath(SESSIONS_DIR, path.join(SESSIONS_DIR, f));
-      const stat = fs.statSync(p);
-      const content = fs.readFileSync(p, 'utf8');
-      const lines = content.split('\n');
-      let header = null, name = null, preview = null, messageCount = 0;
-      let lastTs = stat.mtimeMs;
-      for (const line of lines) {
-        if (!line || line[0] !== '{') continue;
-        let obj = null;
-        if (!header && line.includes('"type":"session"')) {
-          obj = JSON.parse(line);
-          if (obj.type === 'session') { header = obj; continue; }
-        }
-        if (line.includes('"type":"session_info"') && line.includes('"name"')) {
-          obj = obj || JSON.parse(line);
-          if (obj.type === 'session_info' && obj.name) { name = obj.name; continue; }
-        }
-        if (line.includes('"type":"message"')) {
-          obj = obj || JSON.parse(line);
-          if (obj.type !== 'message') continue;
-          messageCount++;
-          if (obj.timestamp) lastTs = Date.parse(obj.timestamp) || lastTs;
-          const m = obj.message;
-          if (!preview && m && m.role === 'user') {
-            const text = typeof m.content === 'string'
-              ? m.content
-              : (Array.isArray(m.content) ? (m.content.find((c) => c.type === 'text') || {}).text : '');
-            if (text) preview = parseFileTransport(String(text)).text.replace(/\s+/g, ' ').slice(0, 140);
-          }
-        }
-      }
-      if (!header) continue;
-      out.push({
-        path: p, id: header.id, cwd: header.cwd, name, preview, messageCount,
-        rlmDepth: header.rlmDepth || 0,
-        parentSession: header.parentSession || null,
-        createdAt: Date.parse(header.timestamp) || stat.birthtimeMs,
-        updatedAt: lastTs,
-      });
-    } catch { /* skip */ }
-  }
+  // Fast cached index: never slurp multi-MB JSONL files for the sidebar.
+  const out = (await sessionIndex.list()).map((entry) => ({ ...entry }));
   const moduleEntry = resolvePrimeAgentModuleEntry();
   if (moduleEntry) {
     try {
@@ -719,11 +690,28 @@ async function listSessions() {
 let watchTimer = null;
 function watchSessions() {
   try {
-    fs.watch(SESSIONS_DIR, () => {
+    fs.watch(SESSIONS_DIR, (_eventType, filename) => {
+      if (filename) sessionIndex.invalidate(filename);
+      else sessionIndex.invalidate();
       clearTimeout(watchTimer);
-      watchTimer = setTimeout(async () => broadcast('sessions-changed', await listSessions()), 400);
+      // Debounce rebuilds; first paint can use cache while rebuild runs.
+      watchTimer = setTimeout(async () => broadcast('sessions-changed', await listSessions()), 150);
     });
   } catch {}
+}
+
+let artifactWatchTimer = null;
+function watchArtifacts() {
+  try {
+    // Recursive watch so new rlm-subagents.jsonl rows surface quickly.
+    fs.watch(ARTIFACTS_DIR, { recursive: true }, (_eventType, filename) => {
+      if (filename && !String(filename).includes('rlm-subagents') && !String(filename).includes('sub-')) return;
+      clearTimeout(artifactWatchTimer);
+      artifactWatchTimer = setTimeout(() => broadcast('agents-changed', { at: Date.now() }), 100);
+    });
+  } catch {
+    // Fallback: poll flag only when recursive watch unsupported.
+  }
 }
 
 
@@ -741,8 +729,16 @@ async function listAgentsForFocusedSession(request = {}) {
   }
   if (!parentId && parentPath) {
     try {
-      const header = JSON.parse(fs.readFileSync(parentPath, 'utf8').split('\n').find((line) => line && line[0] === '{') || 'null');
-      if (header && header.id) parentId = header.id;
+      // Header-only read (first JSON line), never the whole session file.
+      const fd = fs.openSync(parentPath, 'r');
+      try {
+        const buf = Buffer.alloc(Math.min(64 * 1024, fs.fstatSync(fd).size || 0));
+        const n = fs.readSync(fd, buf, 0, buf.length, 0);
+        const head = buf.slice(0, n).toString('utf8');
+        const line = head.split('\n').find((row) => row && row[0] === '{');
+        const header = line ? JSON.parse(line) : null;
+        if (header && header.id) parentId = header.id;
+      } finally { fs.closeSync(fd); }
     } catch {}
   }
 
@@ -1869,6 +1865,7 @@ app.whenReady().then(async () => {
   if (TEST_MODE && process.env.PRIME_DESKTOP_WINDOW_LIFECYCLE_SMOKE === '1') toggleHud();
   const firstWindow = createWindow();
   watchSessions();
+watchArtifacts();
   app.on('activate', activateMainWindow);
   if (TEST_MODE && process.env.PRIME_DESKTOP_WINDOW_LIFECYCLE_SMOKE === '1') void runWindowLifecycleSmoke(firstWindow);
 });

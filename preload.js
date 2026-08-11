@@ -87,6 +87,7 @@ contextBridge.exposeInMainWorld('prime', {
   testWindowState: () => ipcRenderer.invoke('test:window-state'),
 
   onRpcEvent: (callback) => on('rpc-event', callback),
+  onAgentsChanged: (cb) => { const l = (_e, data) => cb(data); ipcRenderer.on('agents-changed', l); return () => ipcRenderer.removeListener('agents-changed', l); },
   onSessionsChanged: (callback) => on('sessions-changed', callback),
   onRpcExit: (callback) => on('rpc-exit', callback),
   onRpcError: (callback) => on('rpc-error', callback),

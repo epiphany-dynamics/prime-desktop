@@ -488,34 +488,55 @@ class Pane {
       this.thinkingLevel = response.state.thinkingLevel || this.thinkingLevel;
       if (response.state.sessionFile) this.sessionFile = response.state.sessionFile;
     }
-    await this.syncState();
-    if (requestId !== this.activationRequest || this.bindingEpoch !== response.bindingEpoch) return false;
-    const messages = await prime.command(this.key, { type: 'get_messages' });
-    if (requestId !== this.activationRequest || this.bindingEpoch !== response.bindingEpoch) return false;
-    if (messages.success) {
-      const streamingMessage = (messages.data && messages.data.streamingMessage)
-        || (response.state && response.state.streamingMessage)
-        || null;
-      this.renderHistory(messages.data.messages || [], { dropInFlight: this.isStreaming && !streamingMessage });
-      if (this.isStreaming) {
-        this.setAgentState('working…');
-        if (streamingMessage && streamingMessage.role === 'assistant') {
-          this.beginStream();
-          this.syncStreamFromMessage(streamingMessage);
-          this.scheduleStreamRender();
-        }
-      }
-    } else if (this.isStreaming) {
-      this.setAgentState('working…');
-    }
+    // Paint the shell immediately so clicks feel instant.
+    this.chatEl.innerHTML = '';
+    this.emptyEl.classList.add('hidden');
+    this.setAgentState('Loading…');
     this.ready = true;
     this.updateTopbar();
     this.updateComposer();
     renderSidebar();
-    void refreshLiveAgents(this);
-    if (treeVisible && G.focused === this) await renderTreeRoot();
     if (response.warning) this.setBanner(response.warning, false);
     else showHudShortcutWarning(this);
+
+    // Background hydrate: state + history + agents. Abort if user clicked away.
+    const hydrateId = requestId;
+    const hydrateEpoch = response.bindingEpoch;
+    void (async () => {
+      try {
+        await this.syncState();
+        if (hydrateId !== this.activationRequest || this.bindingEpoch !== hydrateEpoch) return;
+        const messages = await prime.command(this.key, { type: 'get_messages' });
+        if (hydrateId !== this.activationRequest || this.bindingEpoch !== hydrateEpoch) return;
+        if (messages.success) {
+          const streamingMessage = (messages.data && messages.data.streamingMessage)
+            || (response.state && response.state.streamingMessage)
+            || null;
+          this.renderHistory(messages.data.messages || [], { dropInFlight: this.isStreaming && !streamingMessage });
+          if (this.isStreaming) {
+            this.setAgentState('working…');
+            if (streamingMessage && streamingMessage.role === 'assistant') {
+              this.beginStream();
+              this.syncStreamFromMessage(streamingMessage);
+              this.scheduleStreamRender();
+            }
+          } else {
+            this.setAgentState('');
+          }
+        } else if (this.isStreaming) {
+          this.setAgentState('working…');
+        } else {
+          this.setAgentState('');
+        }
+        void refreshLiveAgents(this);
+        if (treeVisible && G.focused === this) void renderTreeRoot();
+      } catch {
+        if (hydrateId === this.activationRequest && this.bindingEpoch === hydrateEpoch) {
+          this.setAgentState('');
+          this.setBanner('Could not load chat history', true);
+        }
+      }
+    })();
     return true;
   }
 
@@ -576,11 +597,14 @@ class Pane {
     this.isStreaming = !!d.isStreaming;
     this.updateTopbar();
     this.updateComposer();
-    const st = await prime.command(this.key, { type: 'get_session_stats' });
-    if (st.success && st.data.contextUsage && st.data.contextUsage.percent != null) {
-      this.contextMeter.textContent = `${Math.round(st.data.contextUsage.percent)}% ctx · $${(st.data.cost || 0).toFixed(3)}`;
-    } else this.contextMeter.textContent = '';
     this.refreshGitPill();
+    // Stats are decorative — never block session switch on them.
+    void prime.command(this.key, { type: 'get_session_stats' }).then((st) => {
+      if (!st || !st.success) return;
+      if (st.data.contextUsage && st.data.contextUsage.percent != null) {
+        this.contextMeter.textContent = `${Math.round(st.data.contextUsage.percent)}% ctx · $${(st.data.cost || 0).toFixed(3)}`;
+      } else this.contextMeter.textContent = '';
+    }).catch(() => {});
   }
 
   async refreshGitPill() {
@@ -1370,12 +1394,10 @@ async function openSessionFromSidebar(sessionPath) {
   if (!pane) pane = await collapseToPrimaryPane();
   if (!pane) return false;
   setFocusedPane(pane);
-  if (pane.sessionFile === sessionPath && pane.ready) {
-    // Re-activate live sessions so daemon/stream hydration runs again after reopen.
-    if (pane.isStreaming) return true;
-    // Still re-bind when the session is marked live in the sidebar but this pane is quiet.
-    const meta = G.sessions.find((s) => s.path === sessionPath);
-    if (!(meta && (meta.daemonStreaming || meta.daemonResident))) return true;
+  // Already showing this session — never pay a full re-attach cost on a second click.
+  if (pane.sessionFile === sessionPath && pane.ready && pane.key) {
+    void refreshLiveAgents(pane);
+    return true;
   }
   return pane.activate(sessionPath, null, { allowStreaming: true });
 }
@@ -1489,6 +1511,10 @@ function renderSidebar() {
       // Split is explicit via the row's Split button only.
       if (e.shiftKey) { togglePin(s.path); return; }
       if (e.target.closest('.s-actions')) return;
+      // Instant visual selection — don't wait for attach/history.
+      const hostEl = item.parentElement;
+      if (hostEl) for (const el of hostEl.querySelectorAll('.session-item.active')) el.classList.remove('active');
+      item.classList.add('active');
       void openSessionFromSidebar(s.path);
     };
     item.onkeydown = (e) => {
@@ -1629,76 +1655,91 @@ function renderSubagents() {
   }
 }
 
+let liveAgentsInFlight = null;
+let liveAgentsQueued = null;
 async function refreshLiveAgents(pane = G.focused) {
-  const sessionPath = pane && (pane.sessionFile || (pane.state && pane.state.sessionFile)) || null;
-  if (!pane) {
-    G.liveAgents = [];
+  // Coalesce overlapping refreshes so polling never piles up behind a slow IPC.
+  if (liveAgentsInFlight) {
+    liveAgentsQueued = pane;
+    return liveAgentsInFlight;
+  }
+  const run = async () => {
+    const target = pane;
+    const sessionPath = target && (target.sessionFile || (target.state && target.state.sessionFile)) || null;
+    if (!target) {
+      G.liveAgents = [];
+      renderSubagents();
+      renderAgentsDashboard();
+      return;
+    }
+    try {
+      // One IPC: main merges disk roster + live daemon children.
+      const result = await prime.listAgents({ parentSessionPath: sessionPath }).catch(() => null);
+      let list = (result && result.ok && Array.isArray(result.agents)) ? result.agents.slice() : [];
+
+      // Only hit the live client if disk/live merge returned nothing while streaming.
+      if (!list.length && target.key && target.ready && target.isStreaming) {
+        try {
+          const agents = await prime.command(target.key, { type: 'list_agents' }).catch(() => ({ success: false }));
+          const raw = agents && agents.success ? agents.data : null;
+          const extra = Array.isArray(raw) ? raw
+            : (raw && Array.isArray(raw.agents) ? raw.agents
+              : (raw && Array.isArray(raw.children) ? raw.children : []));
+          for (const agent of extra) {
+            if (!agent || typeof agent !== 'object') continue;
+            list.push({
+              id: agent.id || agent.childId || agent.sessionName || agent.label,
+              childId: agent.id || agent.childId || null,
+              name: agent.sessionName || agent.label || agent.name || agent.id || 'sub-agent',
+              status: agent.status || 'unknown',
+              running: ['running', 'queued', 'streaming', 'starting'].includes(String(agent.status || '').toLowerCase()),
+              model: agent.model || null,
+              recap: agent.recap || agent.answerPreview || null,
+              sessionFile: agent.sessionFile || null,
+              path: agent.sessionFile || null,
+              sessionDir: agent.sessionDir || null,
+              source: 'live-client',
+            });
+          }
+        } catch {}
+      }
+
+      const seen = new Set();
+      G.liveAgents = list.filter((agent) => {
+        if (!agent || typeof agent !== 'object') return false;
+        const key = String(agent.childId || agent.id || agent.sessionFile || agent.path || agent.name || '').slice(0, 300);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    } catch {
+      G.liveAgents = [];
+    }
     renderSubagents();
     renderAgentsDashboard();
-    return;
-  }
-  try {
-    // Main process merges: (1) session-artifacts rlm-subagents.jsonl roster
-    // (2) live daemon snapshot / rlm_child_update children for the attached client.
-    const result = await prime.listAgents({ parentSessionPath: sessionPath }).catch(() => null);
-    let list = (result && result.ok && Array.isArray(result.agents)) ? result.agents : [];
+  };
 
-    // Also ask the live client directly so mid-run updates still surface if disk lags.
-    if (pane.key && pane.ready) {
-      try {
-        const [agents, active] = await Promise.all([
-          prime.command(pane.key, { type: 'list_agents' }).catch(() => ({ success: false })),
-          prime.command(pane.key, { type: 'get_active_subagents' }).catch(() => ({ success: false })),
-        ]);
-        const extra = [];
-        const pushAll = (value) => {
-          if (!value) return;
-          if (Array.isArray(value)) extra.push(...value);
-          else if (Array.isArray(value.agents)) extra.push(...value.agents);
-          else if (Array.isArray(value.subagents)) extra.push(...value.subagents);
-          else if (Array.isArray(value.children)) extra.push(...value.children);
-        };
-        if (agents && agents.success) pushAll(agents.data);
-        if (active && active.success) pushAll(active.data);
-        for (const agent of extra) {
-          if (!agent || typeof agent !== 'object') continue;
-          list.push({
-            id: agent.id || agent.childId || agent.sessionName || agent.label,
-            childId: agent.id || agent.childId || null,
-            name: agent.sessionName || agent.label || agent.name || agent.id || 'sub-agent',
-            status: agent.status || 'unknown',
-            running: ['running', 'queued', 'streaming', 'starting'].includes(String(agent.status || '').toLowerCase()),
-            model: agent.model || null,
-            recap: agent.recap || agent.answerPreview || null,
-            sessionFile: agent.sessionFile || null,
-            path: agent.sessionFile || null,
-            sessionDir: agent.sessionDir || null,
-            source: 'live-client',
-          });
-        }
-      } catch {}
+  liveAgentsInFlight = run().finally(() => {
+    liveAgentsInFlight = null;
+    if (liveAgentsQueued !== null) {
+      const next = liveAgentsQueued;
+      liveAgentsQueued = null;
+      void refreshLiveAgents(next);
     }
-
-    const seen = new Set();
-    G.liveAgents = list.filter((agent) => {
-      if (!agent || typeof agent !== 'object') return false;
-      const key = String(agent.childId || agent.id || agent.sessionFile || agent.path || agent.name || '').slice(0, 300);
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  } catch {
-    G.liveAgents = [];
-  }
-  renderSubagents();
-  renderAgentsDashboard();
+  });
+  return liveAgentsInFlight;
 }
 
 function ensureLiveAgentPolling() {
   if (liveAgentPoll) return;
   liveAgentPoll = setInterval(() => {
-    if (G.focused && G.focused.ready) void refreshLiveAgents(G.focused);
-  }, 2500);
+    if (!G.focused || !G.focused.ready) return;
+    const dashOpen = !$('#agents-backdrop').classList.contains('hidden');
+    // Fast while Agents panel is open or the focused chat is streaming children.
+    if (dashOpen || G.focused.isStreaming || (G.liveAgents && G.liveAgents.some((a) => a.running))) {
+      void refreshLiveAgents(G.focused);
+    }
+  }, 800);
 }
 
 let subagentPoll = null;
@@ -2739,6 +2780,9 @@ prime.onRpcEvent(({ key, event }) => {
   for (const pane of G.panes.filter((p) => p.key === key)) pane.handleEvent(event);
 });
 prime.onSessionsChanged((list) => refreshSessions(list));
+if (typeof prime.onAgentsChanged === 'function') {
+  prime.onAgentsChanged(() => { if (G.focused) void refreshLiveAgents(G.focused); });
+}
 prime.onWorkspaceInvalidated(({ key, degraded }) => {
   if (degraded) {
     for (const pane of G.panes.filter((candidate) => candidate.key === key)) pane.setBanner('Automatic project watching stopped. Refresh Files manually to see later changes.', false);

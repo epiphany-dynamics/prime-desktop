@@ -11,7 +11,8 @@
     "test": "node --test test/*.test.js",
     "ui-smoke": "node scripts/ui-smoke.js && node scripts/window-smoke.js",
     "doctor": "node scripts/doctor.js",
-    "postinstall": "node -e \"console.log('\\nPrime Desktop: run npm run doctor   then npm start\\nDocs: docs/INSTALL.md\\n')\""
+    "postinstall": "node -e \"console.log('\\nPrime Desktop: run npm run doctor   then npm start\\nDocs: docs/INSTALL.md\\n')\"",
+    "lint": "node scripts/lint.js"
   },
   "dependencies": {
     "dompurify": "^3.2.4",

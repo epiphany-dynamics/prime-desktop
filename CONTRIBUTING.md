@@ -25,6 +25,7 @@ npm run doctor
 ## Checks you should run
 
 ```bash
+npm run lint
 npm test
 npm run smoke
 npm run ui-smoke
