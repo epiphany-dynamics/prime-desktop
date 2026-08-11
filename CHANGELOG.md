@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.4 — 2026-08-11
+
+### Critical
+
+- Sub-agents appear in the **Agents** panel in near-real-time (no more ~60s wait)
+- `rlm_child_update` events no longer buffered behind chat send
+- Live child rows win over stale disk "deleted" roster rows
+- 250ms poll while streaming / panel open + direct roster mtime watch
+
 ## 0.6.3 — 2026-08-11
 
 ### Ship readiness

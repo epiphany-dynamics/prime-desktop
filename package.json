@@ -1,6 +1,6 @@
 {
   "name": "prime-desktop",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "Early public macOS desktop client for Prime Agent \u2014 split chats, live attach, Agents panel. Built by Epiphany Dynamics.",
   "main": "main.js",
   "scripts": {

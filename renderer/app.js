@@ -1184,6 +1184,11 @@ class Pane {
   handleEvent(ev) {
     switch (ev.type) {
       case 'rlm_child_update': {
+        // Paint immediately from the event payload, then refresh for full roster.
+        if (ev.child) upsertLiveAgent({ ...ev.child, source: 'live-event' });
+        if (Array.isArray(ev.children)) {
+          for (const child of ev.children) upsertLiveAgent({ ...child, source: 'live-event' });
+        }
         if (G.focused === this) void refreshLiveAgents(this);
         break;
       }
@@ -1207,6 +1212,7 @@ class Pane {
         break;
       }
       case 'agent_start':
+        ensureLiveAgentPolling();
         void refreshLiveAgents(this);
         this.isStreaming = true;
         this.setAgentState('working…');
@@ -1707,6 +1713,44 @@ function renderSubagents() {
 
 let liveAgentsInFlight = null;
 let liveAgentsQueued = null;
+function normalizeAgentFromEvent(agent) {
+  if (!agent || typeof agent !== 'object') return null;
+  const status = String(agent.status || agent.state || 'unknown').toLowerCase();
+  const running = !!(agent.running || agent.isStreaming || agent.busy
+    || ['running', 'queued', 'streaming', 'starting'].includes(status));
+  return {
+    id: agent.id || agent.childId || agent.sessionName || agent.label || agent.name,
+    childId: agent.childId || agent.id || null,
+    name: agent.sessionName || agent.label || agent.name || agent.id || 'sub-agent',
+    status,
+    running,
+    model: agent.model || null,
+    recap: agent.recap || agent.answerPreview || null,
+    prompt: agent.prompt || null,
+    sessionFile: agent.sessionFile || agent.path || null,
+    path: agent.sessionFile || agent.path || null,
+    sessionDir: agent.sessionDir || null,
+    updatedAt: agent.updatedAt || new Date().toISOString(),
+    source: agent.source || 'live-event',
+  };
+}
+
+/** Instant panel update from a live rlm_child_update — no disk wait. */
+function upsertLiveAgent(agentLike) {
+  const agent = normalizeAgentFromEvent(agentLike);
+  if (!agent) return;
+  const keyOf = (a) => String(a.childId || a.id || a.sessionFile || a.path || a.name || '').slice(0, 300);
+  const key = keyOf(agent);
+  if (!key) return;
+  const list = Array.isArray(G.liveAgents) ? G.liveAgents.slice() : [];
+  const idx = list.findIndex((a) => keyOf(a) === key);
+  if (idx >= 0) list[idx] = { ...list[idx], ...agent, running: agent.running || list[idx].running };
+  else list.unshift(agent);
+  G.liveAgents = list;
+  renderSubagents();
+  renderAgentsDashboard();
+}
+
 async function refreshLiveAgents(pane = G.focused) {
   // Coalesce overlapping refreshes so polling never piles up behind a slow IPC.
   if (liveAgentsInFlight) {
@@ -1723,12 +1767,18 @@ async function refreshLiveAgents(pane = G.focused) {
       return;
     }
     try {
-      // One IPC: main merges disk roster + live daemon children.
-      const result = await prime.listAgents({ parentSessionPath: sessionPath }).catch(() => null);
+      // Main merges disk roster + live daemon/RPC children. Always pass client key.
+      const result = await prime.listAgents({
+        parentSessionPath: sessionPath,
+        clientKey: target.key || undefined,
+      }).catch(() => null);
       let list = (result && result.ok && Array.isArray(result.agents)) ? result.agents.slice() : [];
 
-      // Only hit the live client if disk/live merge returned nothing while streaming.
-      if (!list.length && target.key && target.ready && target.isStreaming) {
+      // ALWAYS also query the live client while streaming / panel open.
+      // Disk roster can lag tens of seconds behind rlm_child_update.
+      const dashOpen = !!(document.getElementById('agents-backdrop')
+        && !document.getElementById('agents-backdrop').classList.contains('hidden'));
+      if (target.key && target.ready && (target.isStreaming || dashOpen || !list.some((a) => a.running))) {
         try {
           const agents = await prime.command(target.key, { type: 'list_agents' }).catch(() => ({ success: false }));
           const raw = agents && agents.success ? agents.data : null;
@@ -1736,41 +1786,46 @@ async function refreshLiveAgents(pane = G.focused) {
             : (raw && Array.isArray(raw.agents) ? raw.agents
               : (raw && Array.isArray(raw.children) ? raw.children : []));
           for (const agent of extra) {
-            if (!agent || typeof agent !== 'object') continue;
-            list.push({
-              id: agent.id || agent.childId || agent.sessionName || agent.label,
-              childId: agent.id || agent.childId || null,
-              name: agent.sessionName || agent.label || agent.name || agent.id || 'sub-agent',
-              status: agent.status || 'unknown',
-              running: ['running', 'queued', 'streaming', 'starting'].includes(String(agent.status || '').toLowerCase()),
-              model: agent.model || null,
-              recap: agent.recap || agent.answerPreview || null,
-              sessionFile: agent.sessionFile || null,
-              path: agent.sessionFile || null,
-              sessionDir: agent.sessionDir || null,
-              source: 'live-client',
-            });
+            const normalized = normalizeAgentFromEvent({ ...agent, source: 'live-client' });
+            if (normalized) list.push(normalized);
           }
         } catch {}
       }
 
       const seen = new Set();
-      G.liveAgents = list.filter((agent) => {
-        if (!agent || typeof agent !== 'object') return false;
+      const merged = [];
+      for (const agent of list) {
+        if (!agent || typeof agent !== 'object') continue;
         const status = String(agent.status || '').toLowerCase();
-        // Keep running/queued always. Keep finished for a few minutes so the panel isn't empty the second a child ends.
-        // Drop long-dead deleted rows so the panel matches Hermes "live spawn tree" feel.
         if (status === 'deleted' && !agent.running) {
           const age = Date.now() - (Date.parse(agent.updatedAt || 0) || 0);
-          if (age > 2 * 60 * 1000) return false;
+          if (age > 2 * 60 * 1000) continue;
         }
         const key = String(agent.childId || agent.id || agent.sessionFile || agent.path || agent.name || '').slice(0, 300);
-        if (!key || seen.has(key)) return false;
+        if (!key || seen.has(key)) {
+          // Prefer running/live row when duplicate keys collide.
+          if (key && seen.has(key) && agent.running) {
+            const idx = merged.findIndex((a) => String(a.childId || a.id || a.sessionFile || a.path || a.name || '').slice(0, 300) === key);
+            if (idx >= 0) merged[idx] = { ...merged[idx], ...agent, running: true };
+          }
+          continue;
+        }
         seen.add(key);
-        return true;
-      });
+        merged.push(agent);
+      }
+      // Keep any event-upserted running agents that a slow poll missed.
+      for (const prev of (G.liveAgents || [])) {
+        const key = String(prev.childId || prev.id || prev.sessionFile || prev.path || prev.name || '').slice(0, 300);
+        if (!key || seen.has(key)) continue;
+        if (prev.running) {
+          seen.add(key);
+          merged.push(prev);
+        }
+      }
+      merged.sort((a, b) => Number(!!b.running) - Number(!!a.running));
+      G.liveAgents = merged;
     } catch {
-      G.liveAgents = [];
+      // Keep prior liveAgents on transient failure.
     }
     renderSubagents();
     renderAgentsDashboard();
@@ -1791,12 +1846,13 @@ function ensureLiveAgentPolling() {
   if (liveAgentPoll) return;
   liveAgentPoll = setInterval(() => {
     if (!G.focused || !G.focused.ready) return;
-    const dashOpen = !$('#agents-backdrop').classList.contains('hidden');
-    // Hermes model: while a turn is live, keep the spawn tree fresh.
+    const backdrop = document.getElementById('agents-backdrop');
+    const dashOpen = !!(backdrop && !backdrop.classList.contains('hidden'));
+    // While streaming or Agents panel is open, poll hard (Hermes spawn-tree feel).
     if (dashOpen || G.focused.isStreaming || (G.liveAgents && G.liveAgents.some((a) => a.running))) {
       void refreshLiveAgents(G.focused);
     }
-  }, 500);
+  }, 250);
 }
 
 let subagentPoll = null;

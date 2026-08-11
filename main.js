@@ -202,6 +202,10 @@ function handleClientMessage(client, obj) {
     client.streaming = false;
     if (client.workspace) client.workspace.refresh('agent');
   }
+  if (obj.type === 'rlm_child_update') {
+    // Instant Agents panel refresh — do not wait for disk roster flush.
+    bumpAgentsChanged();
+  }
   sendToClientWindows(client, 'rpc-event', { key: client.key, event: obj });
   const assistantEvent = (obj.type === 'message_update' || obj.type === 'message_end') && (!obj.message || obj.message.role === 'assistant');
   const errorEvent = obj.type === 'error' || (obj.type === 'message_update' && obj.assistantMessageEvent && obj.assistantMessageEvent.type === 'error');
@@ -745,19 +749,56 @@ function watchSessions() {
 }
 
 let artifactWatchTimer = null;
+const rosterWatchers = new Map(); // parentSessionPath -> FSWatcher/interval
+function bumpAgentsChanged() {
+  clearTimeout(artifactWatchTimer);
+  artifactWatchTimer = setTimeout(() => {
+    broadcast('agents-changed', { at: Date.now() });
+  }, 25);
+}
 function watchArtifacts() {
   try {
     // Recursive watch so new rlm-subagents.jsonl rows surface quickly.
     fs.watch(ARTIFACTS_DIR, { recursive: true }, (_eventType, filename) => {
-      if (filename && !String(filename).includes('rlm-subagents') && !String(filename).includes('sub-')) return;
-      clearTimeout(artifactWatchTimer);
-      artifactWatchTimer = setTimeout(() => {
-        broadcast('agents-changed', { at: Date.now() });
-      }, 50);
+      const name = String(filename || '');
+      if (name && !name.includes('rlm-subagents') && !name.includes(`${path.sep}sub-`) && !name.startsWith('sub-')) return;
+      bumpAgentsChanged();
     });
   } catch {
-    // Fallback: poll flag only when recursive watch unsupported.
+    // Fallback below via watchParentRoster.
   }
+}
+/** Pin a cheap mtime poll on the exact roster file for an open parent session. */
+function watchParentRoster(parentSessionPath, parentSessionId) {
+  if (!parentSessionPath && !parentSessionId) return;
+  const key = parentSessionPath || parentSessionId;
+  if (rosterWatchers.has(key)) return;
+  const { readSessionHeaderId } = require('./lib/subagent-roster');
+  let headerId = parentSessionId;
+  try { if (!headerId && parentSessionPath) headerId = readSessionHeaderId(parentSessionPath); } catch {}
+  const candidates = [];
+  if (headerId) candidates.push(path.join(ARTIFACTS_DIR, headerId, 'rlm-subagents.jsonl'));
+  if (parentSessionPath) {
+    const stem = path.basename(parentSessionPath, '.jsonl');
+    candidates.push(path.join(ARTIFACTS_DIR, stem, 'rlm-subagents.jsonl'));
+  }
+  let lastSig = '';
+  const timer = setInterval(() => {
+    for (const file of candidates) {
+      try {
+        const st = fs.statSync(file);
+        const sig = `${file}:${st.mtimeMs}:${st.size}`;
+        if (sig !== lastSig) {
+          lastSig = sig;
+          bumpAgentsChanged();
+        }
+        return;
+      } catch {}
+    }
+  }, 250);
+  // Unref so this never keeps the app alive alone.
+  if (typeof timer.unref === 'function') timer.unref();
+  rosterWatchers.set(key, timer);
 }
 
 
@@ -788,17 +829,29 @@ async function listAgentsForFocusedSession(request = {}) {
   });
 
   let fromLive = [];
-  if (parentPath) {
-    const client = clients.get(parentPath);
-    if (client && client.alive && client.rpc && typeof client.rpc.command === 'function') {
+  // Find the live client for this parent even if path canonicalization differs.
+  let client = parentPath ? clients.get(parentPath) : null;
+  if (!client && parentPath) {
+    for (const value of clients.values()) {
+      if (!value || !value.sessionFile) continue;
       try {
-        const response = await clientCommand(client, { type: 'list_agents' });
-        const data = response && response.success ? response.data : null;
-        const raw = data && (data.agents || data.children || data.subagents || data);
-        const list = Array.isArray(raw) ? raw : [];
-        fromLive = list.map((item) => normalizeLiveChild(item)).filter(Boolean);
-      } catch {}
+        if (fs.realpathSync(value.sessionFile) === parentPath) { client = value; break; }
+      } catch {
+        if (path.resolve(value.sessionFile) === parentPath) { client = value; break; }
+      }
     }
+  }
+  // Also accept focused key from renderer when path lookup fails.
+  if (!client && request.clientKey && clients.get(request.clientKey)) client = clients.get(request.clientKey);
+
+  if (client && client.alive && client.rpc && typeof client.rpc.command === 'function') {
+    try {
+      const response = await clientCommand(client, { type: 'list_agents' }, 2_500);
+      const data = response && response.success ? response.data : null;
+      const raw = data && (Array.isArray(data) ? data : (data.agents || data.children || data.subagents || []));
+      const list = Array.isArray(raw) ? raw : [];
+      fromLive = list.map((item) => normalizeLiveChild(item)).filter(Boolean);
+    } catch {}
   }
 
   const agents = mergeAgentLists(fromDisk, fromLive).map((agent) => ({
@@ -824,12 +877,15 @@ async function listAgentsForFocusedSession(request = {}) {
     kind: 'subagent',
   }));
 
+  try { watchParentRoster(parentPath, parentId); } catch {}
   return {
     ok: true,
     parentSessionPath: parentPath,
     parentSessionId: parentId,
     agents,
     runningCount: agents.filter((agent) => agent.running).length,
+    liveCount: fromLive.length,
+    diskCount: fromDisk.length,
   };
 }
 

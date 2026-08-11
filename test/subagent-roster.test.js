@@ -107,3 +107,14 @@ test("listSubagentsForParent finds roster when artifact dir uses header id not f
   assert.equal(agents[0].name, "live-child");
   assert.equal(agents[0].running, true);
 });
+
+test("mergeAgentLists does not let disk deleted clobber live running", () => {
+  const merged = mergeAgentLists(
+    [{ id: "1", childId: "1", name: "A", status: "deleted", running: false, sessionFile: "/tmp/a.jsonl", source: "artifact-roster" }],
+    [{ id: "1", childId: "1", name: "A", status: "running", running: true, recap: "working", source: "live-snapshot" }],
+  );
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].running, true);
+  assert.equal(merged[0].status, "running");
+  assert.equal(merged[0].recap, "working");
+});
