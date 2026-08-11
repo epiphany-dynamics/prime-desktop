@@ -37,8 +37,23 @@ function fixture(t, { resident = true, streaming = true } = {}) {
     async waitForHello() { return { protocol: { name: "prime-agent.daemon", version: 7 }, appVersion: "0.7.1" }; }
     async request(command) {
       backend.commands.push(command);
-      if (command.type !== "list") throw new Error("unexpected raw command");
-      return { type: "response", command: "list", success: true, data: { sessions: resident ? [{ ...backend.worker }] : [] } };
+      if (command.type === "list") {
+        return { type: "response", command: "list", success: true, data: { sessions: resident ? [{ ...backend.worker }] : [] } };
+      }
+      if (command.type === "create") {
+        // Desktop now creates resident workers when none match.
+        assert.equal(command.lifecycle, "resident");
+        backend.worker = {
+          activeSessionId: "active-created",
+          sessionFile: command.sessionPath || sessionFile,
+          attachedClients: 0,
+          leaseWriters: 1,
+          stopped: false,
+        };
+        resident = true;
+        return { type: "response", command: "create", success: true, data: { ...backend.worker } };
+      }
+      throw new Error("unexpected raw command: " + command.type);
     }
     close() { this.closed = true; }
   }
@@ -184,12 +199,16 @@ test("live event fan-out reaches every desktop pane listener through one shared 
   await adapter.stop();
 });
 
-test("only an inactive saved session produces the RPC fallback sentinel", async (t) => {
-  const f = fixture(t, { resident: false });
+test("missing resident session creates a resident daemon worker instead of failing closed", async (t) => {
+  const f = fixture(t, { resident: false, streaming: false });
   const adapter = new DaemonRpcAdapter({ socketPath: "/fake/daemon.sock", sessionPath: f.sessionFile, primeModule: f.primeModule });
-  await assert.rejects(adapter.start(), (error) => error instanceof NoResidentSessionError && error.code === "NO_RESIDENT_SESSION");
-  assert.equal(f.backend.clients[0].closed, true);
-  assert.equal(f.backend.connections.length, 0);
+  const ready = await adapter.start({ cwd: f.root });
+  assert.equal(ready.success, true);
+  assert.equal(f.backend.commands.some((c) => c.type === "create" && c.lifecycle === "resident"), true);
+  assert.equal(f.backend.connections.length, 1);
+  assert.equal(f.backend.connections[0].options.ownedSession, false);
+  await adapter.stop();
+  assert.equal(f.backend.worker.stopped, false, "create+detach must not stop the resident worker");
 });
 
 test("Prime Agent module discovery accepts an explicit packaged ESM entry", (t) => {

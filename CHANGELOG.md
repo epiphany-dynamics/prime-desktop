@@ -2,6 +2,13 @@
 
 ## 0.6.4 — 2026-08-11
 
+### Critical: sessions survive Desktop quit
+
+- Desktop now creates **resident** daemon workers (not client-owned RPC)
+- client_owned RPC was cleaned up ~30s after UI disconnect — that made sessions look "stopped"
+- Quit still detaches only; workers stay under the Prime Agent daemon
+
+
 ### Critical
 
 - Sub-agents appear in the **Agents** panel in near-real-time (no more ~60s wait)

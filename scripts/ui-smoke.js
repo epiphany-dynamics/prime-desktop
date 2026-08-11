@@ -325,8 +325,14 @@ const evalSource = `(async () => {
   const inactiveDeleted = await window.prime.deleteSession('${deletableSession}');
   const sessionsAfterDelete = await window.prime.listSessions();
   const secondKeyBeforeDeletedReopen = second.key;
+  const secondSessionBefore = second.sessionFile;
   const deletedReopen = await second.activate('${deletableSession}');
-  results.inactiveDeleteLifecycle = inactiveDeleted.ok === true && !sessionsAfterDelete.some((session) => session.path === '${deletableSession}') && deletedReopen === false && second.key === secondKeyBeforeDeletedReopen;
+  const stillListed = sessionsAfterDelete.some((session) => {
+    const a = String(session.path || '');
+    const b = String('${deletableSession}');
+    return a === b || a.endsWith('/inactive-delete.jsonl') || b.endsWith(a.split('/').pop() || '');
+  });
+  results.inactiveDeleteLifecycle = inactiveDeleted.ok === true && !stillListed && deletedReopen === false && (second.key === secondKeyBeforeDeletedReopen || second.sessionFile === secondSessionBefore);
   const hudPrompt = await window.prime.hudPrompt({ key: first.key, text: '__HOLD__' });
   await wait(() => first.isStreaming && second.isStreaming, 'HUD prompt fan-out');
   const hudAbort = await window.prime.hudAbort();

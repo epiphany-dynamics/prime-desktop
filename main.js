@@ -273,11 +273,12 @@ function resolvePrimeAgentModuleEntry() {
   });
 }
 
-function createDaemonAdapter(sessionPath) {
-  if (!sessionPath) return null;
+function createDaemonAdapter(sessionPath = null) {
   const moduleEntry = resolvePrimeAgentModuleEntry();
   if (!moduleEntry) return null;
-  return new DaemonRpcAdapter({ socketPath: DAEMON_LAUNCH.socketPath, sessionPath, moduleEntry });
+  // Always prefer daemon resident workers (attach or create). RPC process path
+  // is client_owned and gets cleaned up ~30s after Desktop disconnects.
+  return new DaemonRpcAdapter({ socketPath: DAEMON_LAUNCH.socketPath, sessionPath: sessionPath || null, moduleEntry });
 }
 
 function wireClientRpc(client, rpc) {
@@ -299,6 +300,12 @@ function wireClientRpc(client, rpc) {
 async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspace = null }) {
   const targetCwd = canonicalDirectory(cwd || HOME);
   const temporaryKey = `new:${++tempSeq}`;
+  // Missing/deleted session files must fail closed — never recreate via RPC fallback.
+  if (sessionPath) {
+    try { await fsp.access(sessionPath); }
+    catch { throw new Error('That session is no longer available'); }
+  }
+  // Prefer resident daemon sessions so quit/detach never kills work.
   let rpc = createDaemonAdapter(sessionPath) || createRpcManager(targetCwd);
   const client = {
     key: temporaryKey,

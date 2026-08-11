@@ -22,8 +22,39 @@ export class DaemonClient {
   async connect() { this.connected = true; }
   async waitForHello() { return { protocol: { name: "prime-agent.daemon", version: 7 }, appVersion: "0.7.1" }; }
   async request(command) {
-    if (command.type !== "list" || command.includeClientOwned !== true) throw new Error("fake daemon expected client-owned-aware list");
-    return { type: "response", command: "list", success: true, data: { sessions: rows.map((row) => ({ ...row })) } };
+    if (command.type === "list") {
+      if (command.includeClientOwned !== true) throw new Error("fake daemon expected client-owned-aware list");
+      return { type: "response", command: "list", success: true, data: { sessions: rows.map((row) => ({ ...row })) } };
+    }
+    if (command.type === "create") {
+      if (command.lifecycle !== "resident") throw new Error("fake daemon expected resident create");
+      const index = rows.length + 1;
+      const sessionDir = process.env.PRIME_DESKTOP_TEST_HOME
+        ? path.join(process.env.PRIME_DESKTOP_TEST_HOME, ".prime", "agent", "sessions")
+        : path.join(process.cwd(), ".prime-sessions-fake");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      let sessionFile = command.sessionPath;
+      if (!sessionFile) {
+        sessionFile = path.join(sessionDir, `fake-created-${index}.jsonl`);
+        const cwd = (command.config && command.config.cwd) || process.cwd();
+        fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", version: 1, id: `fake-created-${index}`, cwd }) + "\n");
+      }
+      sessionFile = fs.realpathSync(sessionFile);
+      const row = {
+        activeSessionId: `fake-created-${index}`,
+        sessionFile,
+        sessionId: `fake-created-session-${index}`,
+        cwd: JSON.parse(fs.readFileSync(sessionFile, "utf8").split("\n")[0]).cwd,
+        attachedClients: 0,
+        isStreaming: false,
+        isCompacting: false,
+        activity: "idle",
+        lifecycle: "live",
+      };
+      rows.push(row);
+      return { type: "response", command: "create", success: true, data: { ...row } };
+    }
+    throw new Error("fake daemon unexpected command: " + command.type);
   }
   close() { this.closed = true; }
 }
@@ -69,6 +100,11 @@ class Connection {
   async getCommands() { return []; }
   async getAvailableModels() { return [this.state.model]; }
   async prompt(message, options) {
+    if (String(message || "").includes("__REJECT__")) {
+      const err = new Error("Synthetic prompt rejection");
+      err.code = "PROMPT_REJECTED";
+      throw err;
+    }
     this.messages.push({ role: "user", content: options && options.images && options.images.length ? [{ type: "text", text: message }, ...options.images] : message });
     this.state.messageCount = this.messages.length;
     this.state.isStreaming = true;
