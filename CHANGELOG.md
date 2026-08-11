@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- README media: hero screenshot + short demo recording (`docs/media/`)
+
+
 ## 0.6.5 — 2026-08-11
 
 ### Critical

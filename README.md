@@ -28,6 +28,25 @@
 
 > **Early public build.** macOS only. Needs [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent). The download is **unsigned** until Apple signing is ready — Gatekeeper will warn. Read [docs/KNOWN_LIMITS.md](docs/KNOWN_LIMITS.md) before you share this widely.
 
+
+## Look at it
+
+<p align="center">
+  <img src="docs/media/prime-desktop-hero.png" alt="Prime Desktop — multi-pane chat UI" width="100%">
+</p>
+
+<p align="center"><em>Native macOS shell: sessions, live agent work, project-aware chats.</em></p>
+
+### Demo (short screen recording)
+
+<p align="center">
+  <a href="docs/media/prime-desktop-demo.mp4">
+    <img src="docs/media/prime-desktop-demo-poster.jpg" alt="Play Prime Desktop demo" width="100%">
+  </a>
+</p>
+
+<p align="center"><a href="docs/media/prime-desktop-demo.mp4"><strong>▶ Play demo video</strong></a> · ~17s · MP4</p>
+
 ## Why Prime Desktop
 
 Prime Agent is excellent in the terminal. **Prime Desktop** gives it a real Mac UI without taking ownership of the agent process.
