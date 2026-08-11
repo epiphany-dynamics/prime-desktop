@@ -488,14 +488,17 @@ function assertPaneLocallyIdle(context, action) {
 }
 async function requirePaneProjectIdle(context, action, { allowStreaming = false } = {}) {
   if (!context) return null;
+  // Dead/restarted clients are not "busy" — allow navigation to rebind immediately.
+  const client = context.client;
+  const clientLive = !!(client && client.alive && !client.disposePromise && clientIsCurrent(client));
+  if (!clientLive) {
+    assertPaneLocallyIdle(context, action);
+    return { isStreaming: false };
+  }
   assertPaneLocallyIdle(context, action);
   let state = { isStreaming: false };
-  if (context.client.alive && !context.client.disposePromise && clientIsCurrent(context.client)) {
-    // Session navigation can leave a live response running in the background
-    // (Hermes model). Project changes / destructive actions still require idle.
-    if (allowStreaming) state = await stateForClient(context.client);
-    else state = await requireIdleClient(context.client, action);
-  }
+  if (allowStreaming) state = await stateForClient(client);
+  else state = await requireIdleClient(client, action);
   assertPaneLocallyIdle(context, action);
   return state;
 }
@@ -558,7 +561,14 @@ secureHandle('rpc:activate', async (event, request = {}) => {
       let sourceContext = null;
       if (currentContext) {
         if (request.sourcePaneId != null || request.sourceBindingEpoch != null) throw new Error('Invalid split source');
-        priorContext = paneContextFor(event, { paneId: request.paneId, key: request.sourceKey, bindingEpoch: request.bindingEpoch }, { cap: 8 * 1024 });
+        const dead = !currentContext.client || !currentContext.client.alive || currentContext.client.disposePromise || !clientIsCurrent(currentContext.client);
+        if (dead) {
+          // Stale binding after restart/crash. Keep the context object so drafts can
+          // be preserved when the same session is reopened on this pane.
+          priorContext = currentContext;
+        } else {
+          priorContext = paneContextFor(event, { paneId: request.paneId, key: request.sourceKey, bindingEpoch: request.bindingEpoch }, { cap: 8 * 1024 });
+        }
       } else if (request.sourcePaneId != null) {
         if (request.bindingEpoch != null) throw new Error('Invalid split source');
         sourceContext = paneContextFor(event, {
@@ -671,13 +681,27 @@ async function cleanupAutoCreatedSessions() {
 
 // ---------- Session listing ----------
 
-let residentSessionsCache = { at: 0, value: [] };
+let residentSessionsCache = { at: 0, value: null };
+let residentSessionsInflight = null;
 async function getResidentSessionsCached(moduleEntry) {
   const now = Date.now();
-  if (now - residentSessionsCache.at < 2000 && residentSessionsCache.value) return residentSessionsCache.value;
-  const residents = await getResidentSessionsCached(moduleEntry);
-  residentSessionsCache = { at: now, value: residents };
-  return residents;
+  if (residentSessionsCache.value && (now - residentSessionsCache.at) < 2000) {
+    return residentSessionsCache.value;
+  }
+  if (residentSessionsInflight) return residentSessionsInflight;
+  residentSessionsInflight = (async () => {
+    try {
+      const residents = await listResidentDaemonSessions({
+        socketPath: DAEMON_LAUNCH.socketPath,
+        moduleEntry,
+      });
+      residentSessionsCache = { at: Date.now(), value: residents };
+      return residents;
+    } finally {
+      residentSessionsInflight = null;
+    }
+  })();
+  return residentSessionsInflight;
 }
 async function listSessions() {
   // Fast cached index: never slurp multi-MB JSONL files for the sidebar.
@@ -905,6 +929,20 @@ secureHandle('agent:kill-all', async (_event, request = {}) => {
         }
         await Promise.all(unique.map((client) => disposeClient(client, request.preserveDrafts ? 'draft-preserving restart' : 'manual restart')));
         clients.clear();
+        // Keep paneContexts when preserveDrafts so composer drafts survive restart.
+        // Mark clients dead; rpc:activate treats dead clients as rebindable.
+        for (const context of contexts) {
+          if (context.client) {
+            context.client.alive = false;
+            context.client.committed = false;
+          }
+          if (!request.preserveDrafts) {
+            try {
+              if (context.attachmentService && context.draft) context.attachmentService.deleteDraft(context.draft.id);
+            } catch {}
+            paneContexts.delete(context.id);
+          }
+        }
         return { ok: true };
       } finally {
         for (const context of contexts) context.lifecycleLocked = false;

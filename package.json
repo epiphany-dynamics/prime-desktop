@@ -1,7 +1,7 @@
 {
   "name": "prime-desktop",
-  "version": "0.6.2",
-  "description": "Native macOS desktop client for Prime Agent \u2014 multi-pane chats, daemon attach, projects, and a locked-down Electron shell. Built by Epiphany Dynamics.",
+  "version": "0.6.3",
+  "description": "Early public macOS desktop client for Prime Agent \u2014 split chats, live attach, Agents panel. Built by Epiphany Dynamics.",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -12,7 +12,8 @@
     "ui-smoke": "node scripts/ui-smoke.js && node scripts/window-smoke.js",
     "doctor": "node scripts/doctor.js",
     "postinstall": "node -e \"console.log('\\nPrime Desktop: run npm run doctor   then npm start\\nDocs: docs/INSTALL.md\\n')\"",
-    "lint": "node scripts/lint.js"
+    "lint": "node scripts/lint.js",
+    "ship-check": "node scripts/ship-check.js"
   },
   "dependencies": {
     "dompurify": "^3.2.4",
@@ -41,9 +42,22 @@
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
       "target": [
-        "dir"
-      ]
-    }
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "identity": null
+    },
+    "artifactName": "${productName}-${version}-${arch}.${ext}"
   },
   "license": "MIT",
   "author": {

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.3 — 2026-08-11
+
+### Ship readiness
+
+- Sticky session-switch lock fixed (no more “wait for session change” brick)
+- **Agents** button opens the panel immediately; sub-agents stay in the panel (not dumped into the main sidebar)
+- Sub-agent lookup uses session **header id** (filename stem is often different)
+- Faster session list (cached index) + progressive history load
+- `npm run ship-check` full local gate
+- Honest ship docs: `docs/KNOWN_LIMITS.md`, `docs/SHIP.md`
+- Unsigned arm64 zip release artifact path
+
+### Verification
+
+- `npm run ship-check` (lint, tests, doctor, smoke, ui-smoke)
+
 ## 0.6.2 — 2026-08-10
 
 ### Highlights

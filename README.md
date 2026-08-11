@@ -4,7 +4,7 @@
 
 <p align="center">
   <strong>Native macOS desktop client for <a href="https://primeintellect.ai">Prime Agent</a></strong><br>
-  Multi-pane chats · live daemon attach · projects · locked-down Electron shell<br>
+  Early public macOS build · multi-pane chats · live attach · Agents panel<br>
   Built by <a href="https://epiphanydynamics.ai">Epiphany Dynamics</a>
 </p>
 
@@ -26,6 +26,8 @@
 
 ---
 
+> **Early public build.** macOS only. Needs [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent). The download is **unsigned** until Apple signing is ready — Gatekeeper will warn. Read [docs/KNOWN_LIMITS.md](docs/KNOWN_LIMITS.md) before you share this widely.
+
 ## Why Prime Desktop
 
 Prime Agent is excellent in the terminal. **Prime Desktop** gives it a real Mac UI without taking ownership of the agent process.
@@ -44,7 +46,21 @@ No voice features. That is a product rule, not a missing checkbox.
 
 ---
 
+
+## Download the Mac app (unsigned)
+
+1. Open the latest [GitHub Release](https://github.com/epiphany-dynamics/prime-desktop/releases)
+2. Download the **arm64 zip** (Apple Silicon)
+3. Unzip → right-click **Prime Agent.app** → **Open** (Gatekeeper)
+4. Install Prime Agent if needed: `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh`
+
+Intel Macs: run from source for now.
+
 ## Install in 2 minutes
+
+**Option A — from source (recommended for builders)**
+
+
 
 ### 1. Install Prime Agent (the brain)
 
@@ -78,7 +94,7 @@ npm start
 ```
 
 macOS may Gatekeeper-block unsigned apps → right-click → **Open**.  
-Full notes: [docs/INSTALL.md](docs/INSTALL.md)
+Full notes: [docs/INSTALL.md](docs/INSTALL.md) · [Known limits](docs/KNOWN_LIMITS.md)
 
 </details>
 

@@ -2274,7 +2274,10 @@ async function restartAllAgents() {
     let restored = true;
     for (const { pane, sessionFile } of snapshot) {
       pane.bindingChangePending = false;
-      pane.ready = false; pane.isStreaming = false;
+      pane.ready = false;
+      pane.isStreaming = false;
+      // Keep paneId/key/epoch so main can find the pane context and preserve drafts.
+      // Main treats dead clients as rebindable.
       try { if (!await pane.activate(sessionFile || null, null, { allowStreaming: true })) restored = false; }
       catch { restored = false; }
     }
@@ -2294,7 +2297,7 @@ async function recoverPanesForKey(key) {
     for (const pane of targets) {
       pane.bindingChangePending = false;
       pane.ready = false;
-      try { if (!await pane.activate(pane.sessionFile || null)) recovered = false; }
+      try { if (!await pane.activate(pane.sessionFile || null, null, { allowStreaming: true })) recovered = false; }
       catch { recovered = false; }
     }
     return recovered;

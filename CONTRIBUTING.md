@@ -29,6 +29,8 @@ npm run lint
 npm test
 npm run smoke
 npm run ui-smoke
+# full pre-release gate:
+npm run ship-check
 ```
 
 - `npm test` — fast unit tests

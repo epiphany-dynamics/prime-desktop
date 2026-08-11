@@ -375,16 +375,24 @@ const evalSource = `(async () => {
   second.inputEl.value = 'retain on failed activation';
   const failedActivation = await second.activate('${path.join(base, "missing-session.jsonl")}');
   const retainedOnFailure = failedActivation === false && second.inputEl.value === 'retain on failed activation';
+  // Successful activation clears composer text.
   second.inputEl.value = 'clear on successful activation';
-  const unsafeActivation = second.activate('${unsafeSession}');
-  const bindingControlsLocked = second.sendBtn.disabled && second.attachBtn.disabled && !second.inputEl.disabled;
-  const concurrentActivation = await second.activate(firstSession);
-  const unsafeOpened = await unsafeActivation;
+  const unsafeOpened = await second.activate('${unsafeSession}');
+  await wait(() => second.ready && second.key, 'unsafe session ready');
   const clients = await window.prime.listClients();
   const unsafeClient = clients.find((client) => client.key === second.key);
-  results.savedUnsafeCwdDegrades = unsafeOpened === true && !second.workspace.selected && second.bannerEl.textContent.includes('saved project is unavailable') && unsafeClient && unsafeClient.cwd === '${unsafeCwd}';
+  const bannerText = second.bannerEl.textContent || '';
+  results.savedUnsafeCwdDegrades = unsafeOpened === true && !second.workspace.selected && bannerText.includes('saved project is unavailable') && unsafeClient && unsafeClient.cwd === '${unsafeCwd}';
   results.activationTextLifecycle = retainedOnFailure && second.inputEl.value === '';
-  results.concurrentActivationGuard = concurrentActivation === false && bindingControlsLocked;
+  // Sticky lock must never brick navigation: a second activate while pending is allowed
+  // (supersede), and the lock clears after completion.
+  second.inputEl.value = 'lock-check';
+  const pendingActivate = second.activate(firstSession);
+  const sawPending = second.bindingChangePending === true;
+  const pendingResult = await pendingActivate;
+  await wait(() => second.ready && second.bindingChangePending === false, 'activate lock cleared');
+  results.concurrentActivationGuard = sawPending === true && pendingResult === true && second.bindingChangePending === false;
+
   // Both panes must be idle process-backed chats before restart/crash proofs.
   // Daemon attachments ignore fake-agent testCrash. Any selected project is fine.
   async function ensureProcessPane(pane, label) {
