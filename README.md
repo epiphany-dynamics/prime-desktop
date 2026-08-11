@@ -1,12 +1,10 @@
-<p align="center">
-  <img src="docs/assets/hero-banner.svg" alt="Prime Desktop by Epiphany Dynamics" width="100%">
-</p>
+# Prime Desktop
 
-<p align="center">
-  <strong>Native macOS desktop client for <a href="https://primeintellect.ai">Prime Agent</a></strong><br>
-  Early public macOS build · multi-pane chats · live attach · Agents panel<br>
-  Built by <a href="https://epiphanydynamics.ai">Epiphany Dynamics</a>
-</p>
+**Native macOS desktop client for [Prime Agent](https://primeintellect.ai)**  
+Early public build · multi-pane chats · live attach · Agents panel  
+
+Built by [Epiphany Dynamics](https://epiphanydynamics.ai)
+
 
 <p align="center">
   <a href="https://github.com/epiphany-dynamics/prime-desktop/releases"><img src="https://img.shields.io/github/v/release/epiphany-dynamics/prime-desktop?style=flat-square&color=6e56cf" alt="Release"></a>
