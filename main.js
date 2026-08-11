@@ -369,15 +369,28 @@ async function spawnClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspa
 }
 
 async function ensureClient({ sessionPath = null, cwd, ownerWin, inspectedWorkspace = null }) {
+  const withBound = (promise, ms, label) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
+  ]);
   const activate = async () => {
-    if (sessionPath) await sessionLifecycle.waitForDisposal(sessionPath);
+    if (sessionPath) {
+      try { await withBound(sessionLifecycle.waitForDisposal(sessionPath), 4_000, 'Previous session close timed out'); }
+      catch { /* proceed — never block forever on a stuck disposal tombstone */ }
+    }
     const existing = sessionPath && getClient(sessionPath);
     if (existing && existing.alive && !existing.disposePromise) {
       existing.lastUsed = Date.now();
       return existing;
     }
-    if (existing) await disposeClient(existing, 'dead client replacement');
-    if (sessionPath) await sessionLifecycle.waitForDisposal(sessionPath);
+    if (existing) {
+      try { await withBound(disposeClient(existing, 'dead client replacement'), 4_000, 'Client replacement timed out'); }
+      catch { /* fall through to spawn */ }
+    }
+    if (sessionPath) {
+      try { await withBound(sessionLifecycle.waitForDisposal(sessionPath), 2_000, 'Session disposal wait timed out'); }
+      catch { /* proceed */ }
+    }
     return spawnClient({ sessionPath, cwd, ownerWin, inspectedWorkspace });
   };
   return sessionPath ? sessionLifecycle.run(sessionPath, activate) : activate();
@@ -486,10 +499,16 @@ async function requirePaneProjectIdle(context, action, { allowStreaming = false 
   assertPaneLocallyIdle(context, action);
   return state;
 }
-function runPaneTransition(task) {
+function runPaneTransition(task, timeoutMs = 20_000) {
   const run = paneTransitionTail.then(task, task);
-  paneTransitionTail = run.catch(() => {});
-  return run;
+  // Bound every transition so a hung attach cannot queue session clicks forever.
+  const bounded = Promise.race([
+    run,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Session change timed out — try again')), Math.max(1_000, timeoutMs))),
+  ]);
+  // Keep the queue moving even when a transition times out.
+  paneTransitionTail = bounded.catch(() => {});
+  return bounded;
 }
 
 const GENERIC_RPC_COMMANDS = new Set([

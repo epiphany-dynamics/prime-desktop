@@ -7,6 +7,15 @@ marked.setOptions({ breaks: false, gfm: true });
 const $ = (sel, rootEl) => (rootEl || document).querySelector(sel);
 const $$ = (sel, rootEl) => [...(rootEl || document).querySelectorAll(sel)];
 
+function withTimeout(promise, ms, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message || `Timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -435,13 +444,14 @@ class Pane {
   }
 
   // ---------- activation ----------
-  canChangeBinding(action = 'changing sessions', { allowStreaming = false } = {}) {
-    if (this.bindingChangePending) {
+  canChangeBinding(action = 'changing sessions', { allowStreaming = false, allowSupersede = false } = {}) {
+    // Session switches may supersede an in-flight switch. Project changes stay exclusive.
+    if (this.bindingChangePending && !allowSupersede) {
       this.setBanner(`Wait for the current project or session change before ${action}.`, true);
       return false;
     }
     // Session navigation is allowed while streaming (in-place switch). Project
-    // changes and pane close still require a quiet response.
+    // changes still require a quiet response unless explicitly allowed.
     if (this.isStreaming && !allowStreaming) {
       this.setBanner(`Stop the current response before ${action}.`, true);
       return false;
@@ -455,6 +465,15 @@ class Pane {
       return false;
     }
     return true;
+  }
+
+  /** Force-clear sticky navigation locks so the UI can never soft-brick. */
+  clearBindingLock(reason = '') {
+    this.bindingChangePending = false;
+    this.sending = false;
+    if (this.draftState && this.draftState.sending) this.draftState.clearSending();
+    this.updateComposer();
+    if (reason) this.setBanner(reason, true);
   }
 
   async applyActivation(response, sessionPath, requestId) {
@@ -547,12 +566,23 @@ class Pane {
     // held stream or a draft send that already returned from main.
     this.sending = false;
     if (this.draftState && this.draftState.sending) this.draftState.clearSending();
-    if (!this.canChangeBinding(sessionPath ? 'changing sessions' : 'starting a new chat', { allowStreaming })) return false;
+    // Session navigation ALWAYS supersedes an in-flight switch. Never soft-brick.
+    if (!this.canChangeBinding(sessionPath ? 'changing sessions' : 'starting a new chat', {
+      allowStreaming,
+      allowSupersede: true,
+    })) return false;
     // Persist unsent composer text for the session we are leaving.
     this.saveComposerDraft();
+    // Invalidate any previous in-flight activate for this pane.
+    const requestId = ++this.activationRequest;
     this.bindingChangePending = true;
     this.updateComposer();
-    const requestId = ++this.activationRequest;
+    // Hard safety: if main never answers, unlock so the product remains usable.
+    const lockWatchdog = setTimeout(() => {
+      if (this.activationRequest === requestId && this.bindingChangePending) {
+        this.clearBindingLock('Session switch timed out — try again.');
+      }
+    }, 12_000);
     // Leaving a streaming session: clear local stream chrome before the new binding loads.
     if (this.isStreaming || this.stream) {
       this.isStreaming = false;
@@ -563,7 +593,7 @@ class Pane {
     try {
       this.setBanner(null);
       this.commandCache = null;
-      const response = await prime.activate({
+      const response = await withTimeout(prime.activate({
         sessionPath: sessionPath || undefined,
         paneId: this.paneId || undefined,
         bindingEpoch: this.bindingEpoch || undefined,
@@ -571,13 +601,26 @@ class Pane {
         sourcePaneId: !this.paneId && sourcePane ? sourcePane.paneId : undefined,
         sourceBindingEpoch: !this.paneId && sourcePane ? sourcePane.bindingEpoch : undefined,
         allowStreamingLeave: allowStreaming,
-      });
+      }), 12_000, 'Session switch timed out');
       if (requestId !== this.activationRequest) return false;
-      if (!response.ok) { this.setBanner('Could not start session: ' + (response.error || 'unknown'), true); return false; }
-      return this.applyActivation(response, sessionPath, requestId);
+      if (!response || !response.ok) {
+        this.setBanner('Could not start session: ' + ((response && response.error) || 'unknown'), true);
+        return false;
+      }
+      return await this.applyActivation(response, sessionPath, requestId);
+    } catch (error) {
+      if (requestId === this.activationRequest) {
+        const message = (error && error.message) ? error.message : 'Session switch failed';
+        this.setBanner(message, true);
+      }
+      return false;
     } finally {
-      this.bindingChangePending = false;
-      this.updateComposer();
+      clearTimeout(lockWatchdog);
+      // Only the latest activate owns the lock.
+      if (requestId === this.activationRequest) {
+        this.bindingChangePending = false;
+        this.updateComposer();
+      }
     }
   }
 
@@ -1389,17 +1432,23 @@ async function openSessionFromSidebar(sessionPath) {
   // HARD RULE: sidebar session click NEVER opens split view. Ever.
   // Collapse any existing split, then replace the single center pane in place.
   if (G.panes.length > 1 || document.body.classList.contains('split')) {
-    await collapseToPrimaryPane();
+    try { await withTimeout(collapseToPrimaryPane(), 5_000, 'Could not leave split view'); }
+    catch { /* continue with best-effort primary pane */ }
   }
   let pane = G.panes[0] || G.focused;
-  if (!pane) pane = await collapseToPrimaryPane();
+  if (!pane) {
+    try { pane = await withTimeout(collapseToPrimaryPane(), 5_000, 'No pane available'); }
+    catch { return false; }
+  }
   if (!pane) return false;
   setFocusedPane(pane);
   // Already showing this session — never pay a full re-attach cost on a second click.
-  if (pane.sessionFile === sessionPath && pane.ready && pane.key) {
+  if (pane.sessionFile === sessionPath && pane.ready && pane.key && !pane.bindingChangePending) {
     void refreshLiveAgents(pane);
     return true;
   }
+  // Never let a sticky lock brick session clicks.
+  if (pane.bindingChangePending) pane.clearBindingLock();
   return pane.activate(sessionPath, null, { allowStreaming: true });
 }
 
