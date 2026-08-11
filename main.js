@@ -666,7 +666,7 @@ async function listSessions() {
   const moduleEntry = resolvePrimeAgentModuleEntry();
   if (moduleEntry) {
     try {
-      const residents = await listResidentDaemonSessions({ socketPath: DAEMON_LAUNCH.socketPath, moduleEntry });
+      const residents = await getResidentSessionsCached(moduleEntry);
       const byPath = new Map(residents.map((resident) => {
         try { return [fs.realpathSync(resident.sessionFile), resident]; } catch { return [path.resolve(resident.sessionFile), resident]; }
       }));
@@ -683,6 +683,57 @@ async function listSessions() {
       console.warn('PRIME_DAEMON_DISCOVERY_FAILED', boundedText(error && error.message, 300));
     }
   }
+
+  // Inject recent/running RLM children into the sidebar immediately from artifact rosters
+  // so users don't wait for slow session-index discovery of nested files.
+  try {
+    const { readSessionHeaderId } = require('./lib/subagent-roster');
+    const seenChild = new Set(out.map((s) => s.path));
+    // Only for currently open/focused parents + a few newest top-level sessions.
+    const parentCandidates = [];
+    for (const client of clients.values()) {
+      if (client && client.sessionFile) parentCandidates.push(client.sessionFile);
+    }
+    for (const session of out.slice(0, 12)) parentCandidates.push(session.path);
+    const uniqueParents = [...new Set(parentCandidates.filter(Boolean))].slice(0, 20);
+    for (const parentPath of uniqueParents) {
+      let parentId = null;
+      try { parentId = readSessionHeaderId(parentPath); } catch {}
+      const children = listSubagentsForParent(PRIME_AGENT_DIR, {
+        parentSessionPath: parentPath,
+        parentSessionId: parentId,
+      });
+      for (const child of children) {
+        const childPath = child.sessionFile || child.path;
+        if (!childPath || seenChild.has(childPath)) continue;
+        // Skip fully deleted noise unless very recent.
+        if (String(child.status || '').toLowerCase() === 'deleted') {
+          const age = Date.now() - (Date.parse(child.updatedAt || 0) || 0);
+          if (age > 5 * 60 * 1000) continue;
+        }
+        seenChild.add(childPath);
+        out.push({
+          path: childPath,
+          id: child.id || child.childId || path.basename(childPath, '.jsonl'),
+          cwd: null,
+          name: child.name || child.label || 'sub-agent',
+          preview: child.recap || child.prompt || null,
+          messageCount: 0,
+          rlmDepth: child.rlmDepth || 1,
+          parentSession: parentPath,
+          createdAt: Date.parse(child.updatedAt || 0) || Date.now(),
+          updatedAt: Date.parse(child.updatedAt || 0) || Date.now(),
+          daemonResident: !!child.running,
+          daemonStreaming: !!child.running,
+          isSubagent: true,
+          subagentStatus: child.status || null,
+        });
+      }
+    }
+  } catch (error) {
+    console.warn('PRIME_SUBAGENT_SIDEBAR_FAILED', boundedText(error && error.message, 300));
+  }
+
   out.sort((a, b) => b.updatedAt - a.updatedAt);
   return out;
 }
@@ -707,7 +758,11 @@ function watchArtifacts() {
     fs.watch(ARTIFACTS_DIR, { recursive: true }, (_eventType, filename) => {
       if (filename && !String(filename).includes('rlm-subagents') && !String(filename).includes('sub-')) return;
       clearTimeout(artifactWatchTimer);
-      artifactWatchTimer = setTimeout(() => broadcast('agents-changed', { at: Date.now() }), 100);
+      artifactWatchTimer = setTimeout(async () => {
+        broadcast('agents-changed', { at: Date.now() });
+        // Sidebar child rows come from artifact rosters — push a fresh session list too.
+        try { broadcast('sessions-changed', await listSessions()); } catch {}
+      }, 75);
     });
   } catch {
     // Fallback: poll flag only when recursive watch unsupported.
@@ -727,18 +782,12 @@ async function listAgentsForFocusedSession(request = {}) {
       catch { parentPath = null; }
     }
   }
-  if (!parentId && parentPath) {
+  // Always resolve header.id — filename stem is often a different UUID.
+  if (parentPath) {
     try {
-      // Header-only read (first JSON line), never the whole session file.
-      const fd = fs.openSync(parentPath, 'r');
-      try {
-        const buf = Buffer.alloc(Math.min(64 * 1024, fs.fstatSync(fd).size || 0));
-        const n = fs.readSync(fd, buf, 0, buf.length, 0);
-        const head = buf.slice(0, n).toString('utf8');
-        const line = head.split('\n').find((row) => row && row[0] === '{');
-        const header = line ? JSON.parse(line) : null;
-        if (header && header.id) parentId = header.id;
-      } finally { fs.closeSync(fd); }
+      const { readSessionHeaderId } = require('./lib/subagent-roster');
+      const headerId = readSessionHeaderId(parentPath);
+      if (headerId) parentId = headerId;
     } catch {}
   }
 

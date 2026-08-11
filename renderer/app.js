@@ -1164,6 +1164,7 @@ class Pane {
         break;
       }
       case 'agent_start':
+        void refreshLiveAgents(this);
         this.isStreaming = true;
         this.setAgentState('working…');
         this.updateComposer();
@@ -1482,7 +1483,7 @@ function renderSidebar() {
     const paneHere = G.panes.find((p) => p.sessionFile === s.path);
     const isActive = !!(activeSessionPath && s.path === activeSessionPath);
     const item = document.createElement('div');
-    item.className = 'session-item' + (isActive ? ' active' : '');
+    item.className = 'session-item' + (s.isSubagent || (s.rlmDepth > 0 && s.parentSession) ? ' subagent-session' : '') + (isActive ? ' active' : '');
     item.tabIndex = 0;
     item.draggable = true;
     item.addEventListener('dragstart', (e) => {
@@ -1735,12 +1736,14 @@ function ensureLiveAgentPolling() {
   liveAgentPoll = setInterval(() => {
     if (!G.focused || !G.focused.ready) return;
     const dashOpen = !$('#agents-backdrop').classList.contains('hidden');
-    // Fast while Agents panel is open or the focused chat is streaming children.
+    // Hermes model: while a turn is live, keep the spawn tree fresh.
     if (dashOpen || G.focused.isStreaming || (G.liveAgents && G.liveAgents.some((a) => a.running))) {
       void refreshLiveAgents(G.focused);
     }
-  }, 800);
+  }, 500);
 }
+// Always start polling once the app is up.
+ensureLiveAgentPolling();
 
 let subagentPoll = null;
 let currentViewerFile = null;

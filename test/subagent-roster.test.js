@@ -83,3 +83,27 @@ test("mergeAgentLists prefers live status and keeps roster session file", () => 
   assert.equal(merged[0].sessionFile, "/tmp/a.jsonl");
   assert.equal(merged[0].recap, "finished");
 });
+
+test("listSubagentsForParent finds roster when artifact dir uses header id not filename stem", () => {
+  const prime = fs.mkdtempSync(path.join(os.tmpdir(), "prime-agent-dir-"));
+  const parent = path.join(prime, "sessions", "file-stem-aaaa.jsonl");
+  write(parent, JSON.stringify({ type: "session", id: "header-id-bbbb", cwd: prime }) + "\n");
+  const childFile = path.join(prime, "session-artifacts", "header-id-bbbb", "sub-abc", "child.jsonl");
+  write(childFile, JSON.stringify({ type: "session", id: "child-id", cwd: prime, parentSession: parent, rlmDepth: 1 }) + "\n");
+  const roster = path.join(prime, "session-artifacts", "header-id-bbbb", "rlm-subagents.jsonl");
+  write(roster, JSON.stringify({
+    type: "rlm_subagent",
+    childId: "sub-abc",
+    sessionName: "live-child",
+    status: "running",
+    sessionFile: childFile,
+    parentSessionFile: parent,
+    parentSessionId: "header-id-bbbb",
+  }) + "\n");
+
+  // Caller only knows the file path (stem differs from id) — must still find children.
+  const agents = listSubagentsForParent(prime, { parentSessionPath: parent });
+  assert.equal(agents.length, 1);
+  assert.equal(agents[0].name, "live-child");
+  assert.equal(agents[0].running, true);
+});

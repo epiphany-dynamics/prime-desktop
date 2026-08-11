@@ -802,3 +802,13 @@ body.split .pane-split:disabled { max-width: none; }
   color: var(--text-faint);
   opacity: 0.9;
 }
+
+.session-item.subagent-session .s-name::before {
+  content: "↳ ";
+  color: var(--text-faint);
+}
+.session-item.subagent-session {
+  opacity: 0.95;
+  border-left: 2px solid rgba(91, 157, 255, 0.35);
+  margin-left: 6px;
+}
