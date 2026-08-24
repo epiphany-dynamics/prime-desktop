@@ -203,11 +203,20 @@ Report issues privately: [`SECURITY.md`](SECURITY.md) · **security@epiphanydyna
 
 ## Contributing & support
 
-- [CONTRIBUTING.md](CONTRIBUTING.md) — setup, rules, PR bar  
+Want to help? Start here:
+
+1. [`docs/GOOD_FIRST_ISSUES.md`](docs/GOOD_FIRST_ISSUES.md) — pick a starter task  
+2. [Open `good first issue` tickets](https://github.com/epiphany-dynamics/prime-desktop/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)  
+3. [CONTRIBUTING.md](CONTRIBUTING.md) — setup, rules, PR bar  
+
+Also:
+
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)  
 - [SUPPORT.md](SUPPORT.md)  
 - [docs/ROADMAP.md](docs/ROADMAP.md)  
-- [CHANGELOG.md](CHANGELOG.md)
+- [CHANGELOG.md](CHANGELOG.md)  
+
+This is an early public Mac client. Focused docs/UX/export/notification slices are more useful than giant rewrites.
 
 ---
 
