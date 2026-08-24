@@ -4,16 +4,21 @@ Thanks for helping with Prime Desktop.
 
 Built by [Epiphany Dynamics](https://epiphanydynamics.ai).
 
+## Fast path
+
+1. Read [`docs/GOOD_FIRST_ISSUES.md`](docs/GOOD_FIRST_ISSUES.md)
+2. Pick an open issue with the `good first issue` or `help wanted` label
+3. Comment that you are taking it
+4. Open a focused PR that links the issue
+
 ## Before you start
 
 - macOS is the supported platform right now
 - You need Node.js 20+ and npm
 - Optional: a local [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) install if you want to run against a real agent
+- Stranger install path: [`docs/INSTALL.md`](docs/INSTALL.md)
 
 ## Setup
-
-Stranger install path: [`docs/INSTALL.md`](docs/INSTALL.md).
-
 
 ```bash
 git clone https://github.com/epiphany-dynamics/prime-desktop.git
@@ -49,15 +54,28 @@ No GitHub Actions on this org for this repo. **Green local checks are the gate.*
 
 ## Good first work
 
-Look at rows marked `next` or `partial` in [`PARITY.md`](PARITY.md). Small, tested slices beat large untested rewrites.
+Start with [`docs/GOOD_FIRST_ISSUES.md`](docs/GOOD_FIRST_ISSUES.md).
+
+Also useful:
+
+- open issues labeled [`good first issue`](https://github.com/epiphany-dynamics/prime-desktop/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+- rows marked `next` or `partial` in [`PARITY.md`](PARITY.md)
+- install and empty-state polish in [`docs/ROADMAP.md`](docs/ROADMAP.md)
+
+Small, tested slices beat large untested rewrites.
 
 ## Pull requests
 
-1. Keep the change focused
+1. Keep the change focused on one issue
 2. Add or update tests when behavior changes
 3. Update `PARITY.md` / `README.md` when user-visible behavior changes
 4. Include the commands you ran and the results
+5. Prefer `Fixes #N` in the PR body when the issue is fully done
+
+AI-assisted PRs are welcome when a human owns the result: you read the diff, ran the checks, and can answer review comments.
 
 ## Code of conduct
 
 Be respectful. No harassment, no spam, no drive-by secret dumping.
+
+See [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
